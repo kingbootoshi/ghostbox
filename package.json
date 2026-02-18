@@ -1,0 +1,26 @@
+{
+  "name": "ghostbox",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "ghostbox": "./dist/cli.js"
+  },
+  "scripts": {
+    "build:ghost": "bun build src/ghost-server.ts --target=node --outfile=docker/ghost-server.js --external @anthropic-ai/claude-agent-sdk",
+    "build:cli": "bun build src/cli.ts --outfile=dist/cli.js --target=bun",
+    "build:image": "docker build -t ghostbox-agent docker/",
+    "build": "bun run build:ghost && bun run build:image && bun run build:cli",
+    "dev": "bun run src/cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "grammy": "^1.39.0",
+    "dockerode": "^4.0.5",
+    "chalk": "^5.4.1"
+  },
+  "devDependencies": {
+    "@types/dockerode": "^4.0.1",
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  }
+}
