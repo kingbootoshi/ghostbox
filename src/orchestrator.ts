@@ -328,7 +328,9 @@ export const spawnGhost = async (
       Env: [
         `GHOSTBOX_MODEL=${resolvedModel.fullModel}`,
         `GHOSTBOX_SYSTEM_PROMPT=${systemPrompt || ''}`,
+        `GHOSTBOX_GHOST_NAME=${name}`,
         `GHOSTBOX_GITHUB_TOKEN=${state.config.githubToken || ''}`,
+        `GHOSTBOX_GITHUB_REMOTE=${state.config.githubRemote || ''}`,
         `GHOSTBOX_HOST_BASE_PORT=${portBase}`,
         `GHOSTBOX_USER_PORTS=8001-8009`,
         getGhostboxApiKeysEnv(ghost),
@@ -402,7 +404,9 @@ export const wakeGhost = async (name: string): Promise<void> => {
       Env: [
         `GHOSTBOX_MODEL=${resolvedModel.fullModel}`,
         `GHOSTBOX_SYSTEM_PROMPT=${ghost.systemPrompt || ''}`,
+        `GHOSTBOX_GHOST_NAME=${name}`,
         `GHOSTBOX_GITHUB_TOKEN=${state.config.githubToken || ''}`,
+        `GHOSTBOX_GITHUB_REMOTE=${state.config.githubRemote || ''}`,
         `GHOSTBOX_HOST_BASE_PORT=${ghost.portBase}`,
         `GHOSTBOX_USER_PORTS=8001-8009`,
         getGhostboxApiKeysEnv(ghost),

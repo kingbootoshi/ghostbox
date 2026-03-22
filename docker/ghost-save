@@ -1,0 +1,42 @@
+#!/bin/bash
+set -euo pipefail
+
+VAULT_DIR="/vault"
+GHOST_NAME="${GHOSTBOX_GHOST_NAME:-}"
+GITHUB_TOKEN="${GHOSTBOX_GITHUB_TOKEN:-}"
+GITHUB_REMOTE="${GHOSTBOX_GITHUB_REMOTE:-}"
+COMMIT_MSG="${1:-Ghost auto-save}"
+
+if [ -z "$GHOST_NAME" ]; then
+  echo "Error: GHOSTBOX_GHOST_NAME not set" >&2
+  exit 1
+fi
+
+BRANCH="ghost/${GHOST_NAME}"
+
+cd "$VAULT_DIR"
+
+git add -A
+
+if git diff --cached --quiet; then
+  echo "Nothing to commit"
+  exit 0
+fi
+
+git commit -m "$COMMIT_MSG"
+echo "Committed: $(git rev-parse --short HEAD)"
+
+if [ -n "$GITHUB_TOKEN" ] && [ -n "$GITHUB_REMOTE" ]; then
+  REMOTE_URL=$(echo "$GITHUB_REMOTE" | sed "s|https://|https://${GITHUB_TOKEN}@|")
+
+  if git remote | grep -q ghostbox; then
+    git remote set-url ghostbox "$REMOTE_URL"
+  else
+    git remote add ghostbox "$REMOTE_URL"
+  fi
+
+  git push ghostbox "$BRANCH"
+  echo "Pushed to ${BRANCH}"
+else
+  echo "GitHub not configured - committed locally only"
+fi

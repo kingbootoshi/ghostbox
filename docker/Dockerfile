@@ -27,7 +27,9 @@ RUN mkdir -p /vault /root/.pi/agent /node_modules/@mariozechner && \
 
 COPY ghost-server.js /ghost-server.js
 COPY entrypoint.sh /entrypoint.sh
+COPY ghost-save /usr/local/bin/ghost-save
 RUN chmod +x /entrypoint.sh
+RUN chmod +x /usr/local/bin/ghost-save
 
 WORKDIR /vault
 EXPOSE 3000 8001-8009

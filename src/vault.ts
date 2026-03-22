@@ -38,6 +38,8 @@ Your extensions ARE your growth - they compound over sessions.
 - Write important findings to /vault/knowledge/
 - Keep this CLAUDE.md updated with your purpose and learned context
 - Create reusable tools as Pi extensions, not bash scripts
+- Run \`ghost-save "description"\` to commit and push your work to GitHub
+- Save at meaningful milestones, not every file change
 - Everything in /vault persists. Everything else is throwaway.
 `;
 
