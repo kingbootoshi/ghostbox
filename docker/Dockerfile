@@ -1,0 +1,35 @@
+FROM node:22-slim
+
+RUN npm install -g @mariozechner/pi-coding-agent@latest && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+      git \
+      ripgrep \
+      python3 \
+      python3-pip \
+      python3-venv \
+      curl \
+      wget \
+      jq \
+      build-essential \
+      ca-certificates \
+      unzip && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:$PATH"
+ENV NODE_PATH="/usr/local/lib/node_modules"
+
+RUN mkdir -p /vault /root/.pi/agent /node_modules/@mariozechner && \
+    ln -s /usr/local/lib/node_modules/@mariozechner/pi-coding-agent /node_modules/@mariozechner/pi-coding-agent
+
+# auth.json is mounted at runtime and not baked into the image.
+
+COPY ghost-server.js /ghost-server.js
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+WORKDIR /vault
+EXPOSE 3000 8001-8009
+
+CMD ["/entrypoint.sh"]
