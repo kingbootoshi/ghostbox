@@ -56,6 +56,7 @@ struct HotkeyHelpOverlay: View {
 enum ShortcutItem: String, CaseIterable, Identifiable {
     case toggleGhostbox
     case toggleChatFiles
+    case toggleFullscreen
     case showHelp
     case closePanel
     case autocompleteSlashCommand
@@ -69,6 +70,8 @@ enum ShortcutItem: String, CaseIterable, Identifiable {
             return "Cmd+Shift+G"
         case .toggleChatFiles:
             return "Cmd+\\"
+        case .toggleFullscreen:
+            return "Cmd+F"
         case .showHelp:
             return "Cmd+/"
         case .closePanel:
@@ -86,6 +89,8 @@ enum ShortcutItem: String, CaseIterable, Identifiable {
             return "Toggle Ghostbox"
         case .toggleChatFiles:
             return "Switch to Chat / Files"
+        case .toggleFullscreen:
+            return "Toggle fullscreen"
         case .showHelp:
             return "Show this help"
         case .closePanel:

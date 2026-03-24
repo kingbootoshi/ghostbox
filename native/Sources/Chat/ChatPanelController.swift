@@ -22,6 +22,8 @@ final class ChatPanelController: NSObject, NSWindowDelegate {
     private var lastKnownFrame: NSRect?
     private var isAnimatingPanel = false
     private var isShowingVaultBrowser = false
+    private var isFullscreen = false
+    private var preFullscreenFrame: NSRect?
     private var chatModeWidth: CGFloat?
 
     init(
@@ -43,6 +45,13 @@ final class ChatPanelController: NSObject, NSWindowDelegate {
             self,
             selector: #selector(handlePanelResizeRequest(_:)),
             name: .resizeGhostChatPanel,
+            object: nil
+        )
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleFullscreenToggle(_:)),
+            name: .toggleGhostChatFullscreen,
             object: nil
         )
     }
@@ -217,6 +226,46 @@ final class ChatPanelController: NSObject, NSWindowDelegate {
             ?? (requestedWidth > defaultPanelSize.width)
 
         animatePanelWidth(to: requestedWidth, showsVaultBrowser: showsVaultBrowser)
+    }
+
+    @objc private func handleFullscreenToggle(_ notification: Notification) {
+        guard let notificationGhostName = notification.userInfo?["ghostName"] as? String,
+              notificationGhostName == ghostName,
+              let panel else { return }
+
+        isAnimatingPanel = true
+
+        if isFullscreen {
+            guard let restoreFrame = preFullscreenFrame else {
+                isAnimatingPanel = false
+                return
+            }
+
+            panel.setFrame(restoreFrame, display: true, animate: false)
+            isFullscreen = false
+            isAnimatingPanel = false
+            saveFrame(panel.frame)
+        } else {
+            preFullscreenFrame = panel.frame
+
+            guard let screen = panel.screen ?? NSScreen.main else {
+                isAnimatingPanel = false
+                return
+            }
+
+            let visibleFrame = screen.visibleFrame
+            let padding: CGFloat = 16
+            let targetFrame = NSRect(
+                x: visibleFrame.origin.x + padding,
+                y: visibleFrame.origin.y + padding,
+                width: visibleFrame.width - (padding * 2),
+                height: visibleFrame.height - (padding * 2)
+            )
+
+            panel.setFrame(targetFrame, display: true, animate: false)
+            isFullscreen = true
+            isAnimatingPanel = false
+        }
     }
 
     private func animatePanelWidth(to requestedWidth: CGFloat, showsVaultBrowser: Bool) {

@@ -24,6 +24,7 @@ struct AgentChatView: View {
                     showsVaultBrowser: $showsVaultBrowser,
                     statusColor: statusColor,
                     toggleVaultBrowser: toggleVaultBrowser,
+                    toggleFullscreen: toggleFullscreen,
                     closeCurrentPanel: closeCurrentPanel
                 )
 
@@ -222,6 +223,14 @@ struct AgentChatView: View {
         withAnimation(.easeOut(duration: 0.18)) {
             showsVaultBrowser.toggle()
         }
+    }
+
+    private func toggleFullscreen() {
+        NotificationCenter.default.post(
+            name: .toggleGhostChatFullscreen,
+            object: nil,
+            userInfo: ["ghostName": viewModel.ghostName]
+        )
     }
 
     private func closeCurrentPanel() {

@@ -71,6 +71,27 @@ final class AgentChatViewModel: ObservableObject {
         isStreaming = false
     }
 
+    func switchModel(to model: GhostModel) {
+        let command = "/model \(model.provider)/\(model.modelId)"
+        messages.append(ChatMessage(role: .system, content: "Switching to \(model.displayName)..."))
+
+        Task { [weak self] in
+            guard let self else { return }
+
+            do {
+                let stream = client.sendMessage(ghostName: ghostName, prompt: command, model: nil)
+                for try await event in stream {
+                    if event.type == .result || event.type == .assistant, let text = event.text, !text.isEmpty {
+                        self.messages.append(ChatMessage(role: .system, content: text))
+                    }
+                }
+                await loadGhost()
+            } catch {
+                self.messages.append(ChatMessage(role: .system, content: "Model switch failed: \(error.localizedDescription)"))
+            }
+        }
+    }
+
     func compact() {
         guard !isStreaming, !isLoadingHistory, !isCompacting else { return }
 

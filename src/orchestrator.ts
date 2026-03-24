@@ -1,6 +1,8 @@
 import Docker from 'dockerode';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
+import { copyFile, mkdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -22,6 +24,25 @@ import { createLogger } from './logger';
 const defaultImageName = 'ghostbox-agent';
 const defaultProvider = 'anthropic';
 const getHomeDirectory = (): string => process.env.HOME ?? homedir();
+const getGhostPiAgentPath = (name: string): string =>
+  join(getHomeDirectory(), '.ghostbox', 'ghosts', name, 'pi-agent');
+const getSharedPiAgentPath = (): string =>
+  join(getHomeDirectory(), '.pi', 'agent');
+
+const ensureGhostPiAgent = async (name: string): Promise<void> => {
+  const ghostPiPath = getGhostPiAgentPath(name);
+  await mkdir(ghostPiPath, { recursive: true });
+
+  const sharedPath = getSharedPiAgentPath();
+  for (const file of ['auth.json', 'settings.json']) {
+    const source = join(sharedPath, file);
+    const dest = join(ghostPiPath, file);
+    if (existsSync(source) && !existsSync(dest)) {
+      await copyFile(source, dest);
+    }
+  }
+};
+
 const log = createLogger('orchestrator');
 
 const docker = new Docker();
@@ -314,6 +335,7 @@ export const spawnGhost = async (
   }
 
   await initVault(name);
+  await ensureGhostPiAgent(name);
 
   const portBase = getNextPortBase(state);
   const resolvedModel = resolveProviderModel(
@@ -336,7 +358,7 @@ export const spawnGhost = async (
     apiKeys: [createGhostApiKey('default')],
   };
   const vaultPath = getVaultPath(name);
-  const piAgentPath = join(getHomeDirectory(), '.pi', 'agent');
+  const piAgentPath = getGhostPiAgentPath(name);
   let containerId = '';
 
   try {
@@ -406,8 +428,10 @@ export const wakeGhost = async (name: string): Promise<void> => {
     throw new Error(`Ghost "${name}" is not stopped.`);
   }
 
+  await ensureGhostPiAgent(name);
+
   const vaultPath = getVaultPath(name);
-  const piAgentPath = join(getHomeDirectory(), '.pi', 'agent');
+  const piAgentPath = getGhostPiAgentPath(name);
   const resolvedModel = resolveProviderModel(
     ghost.provider,
     ghost.model,

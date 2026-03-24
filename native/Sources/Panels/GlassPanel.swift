@@ -29,7 +29,11 @@ class GlassPanel: NSPanel {
         animationBehavior = .none
         collectionBehavior = [.fullScreenAuxiliary]
         minSize = NSSize(width: 320, height: 400)
-        maxSize = NSSize(width: 900, height: 900)
+        if let screen = NSScreen.main {
+            maxSize = screen.frame.size
+        } else {
+            maxSize = NSSize(width: 3840, height: 2160)
+        }
 
         standardWindowButton(.closeButton)?.isHidden = true
         standardWindowButton(.miniaturizeButton)?.isHidden = true
@@ -180,6 +184,15 @@ class GlassPanel: NSPanel {
         if flags == [.command], event.charactersIgnoringModifiers == "/" {
             NotificationCenter.default.post(
                 name: .toggleGhostHotkeyHelp,
+                object: nil,
+                userInfo: ["ghostName": title]
+            )
+            return true
+        }
+
+        if flags == [.command], event.charactersIgnoringModifiers == "f" {
+            NotificationCenter.default.post(
+                name: .toggleGhostChatFullscreen,
                 object: nil,
                 userInfo: ["ghostName": title]
             )

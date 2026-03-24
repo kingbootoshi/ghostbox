@@ -62,12 +62,19 @@ final class HubViewModel: ObservableObject {
                 systemPrompt: trimmedPrompt.isEmpty ? nil : trimmedPrompt
             )
 
+            let ghostName = trimmedName
             spawnName = ""
             spawnModel = ""
             spawnSystemPrompt = ""
             showSpawnForm = false
             error = nil
             await loadGhosts()
+
+            NotificationCenter.default.post(
+                name: .openGhostChat,
+                object: nil,
+                userInfo: ["ghostName": ghostName]
+            )
         } catch {
             self.error = error.localizedDescription
         }
