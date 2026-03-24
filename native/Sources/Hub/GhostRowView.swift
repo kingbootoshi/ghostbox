@@ -11,47 +11,65 @@ struct GhostRow: View {
     @State private var showRemoveConfirm = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Button(action: onOpen) {
-                HStack(alignment: .top, spacing: 12) {
-                    statusDot
+        Button(action: onOpen) {
+            HStack(alignment: .center, spacing: 12) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 8, height: 8)
 
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(ghost.name)
-                            .font(Theme.Typography.display())
-                            .foregroundColor(Theme.Colors.accentLight)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(ghost.name)
+                        .font(Theme.Typography.display())
+                        .foregroundColor(Theme.Colors.accentLight)
 
-                        HStack(spacing: 6) {
-                            Text(ghost.status.rawValue.capitalized)
-                            Text("·")
-                            Text("\(ghost.provider) / \(ghost.model)")
+                    HStack(spacing: 6) {
+                        Text(ghost.status.rawValue.capitalized)
+                        Text("·")
+                        Text(ghost.model)
+                    }
+                    .font(Theme.Typography.label(weight: .regular))
+                    .foregroundColor(Color.white.opacity(0.35))
+                }
+
+                Spacer(minLength: 0)
+
+                Menu {
+                    if ghost.status == .running {
+                        Button(role: .destructive) {
+                            showKillConfirm = true
+                        } label: {
+                            Label("Kill", systemImage: "stop.circle")
                         }
-                        .font(Theme.Typography.label(weight: .regular))
-                        .foregroundColor(Color.white.opacity(0.35))
                     }
 
-                    Spacer(minLength: 0)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            HStack(spacing: 8) {
-                if ghost.status == .running {
-                    actionButton(title: "Kill", tint: Color.red.opacity(0.9)) {
-                        showKillConfirm = true
+                    if ghost.status == .stopped {
+                        Button {
+                            onWake()
+                        } label: {
+                            Label("Wake", systemImage: "play.circle")
+                        }
                     }
-                }
 
-                if ghost.status == .stopped {
-                    actionButton(title: "Wake", tint: Color.green.opacity(0.9), action: onWake)
-                }
+                    Divider()
 
-                actionButton(title: "Remove", tint: Color.red.opacity(0.5)) {
-                    showRemoveConfirm = true
+                    Button(role: .destructive) {
+                        showRemoveConfirm = true
+                    } label: {
+                        Label("Remove", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: Theme.FontSize.sm, weight: .medium))
+                        .foregroundColor(Color.white.opacity(Theme.Text.quaternary))
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
                 }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
             }
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .padding(16)
         .background(Color.white.opacity(0.02))
         .clipShape(RoundedRectangle(cornerRadius: 22))
@@ -69,13 +87,6 @@ struct GhostRow: View {
         }
     }
 
-    private var statusDot: some View {
-        Circle()
-            .fill(statusColor)
-            .frame(width: 8, height: 8)
-            .padding(.top, 5)
-    }
-
     private var statusColor: Color {
         switch ghost.status {
         case .running:
@@ -85,18 +96,5 @@ struct GhostRow: View {
         case .error:
             return Color.orange.opacity(0.95)
         }
-    }
-
-    private func actionButton(title: String, tint: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(Theme.Typography.label())
-                .foregroundColor(tint)
-                .padding(.horizontal, 11)
-                .padding(.vertical, 7)
-                .background(Color.white.opacity(0.03))
-                .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
     }
 }
