@@ -35,17 +35,40 @@ enum Theme {
         static let quaternary = 0.15
     }
 
+    enum FontSize {
+        /// Timestamp, metadata - smallest readable
+        static let xs: CGFloat = 12
+        /// Labels, subtitles, secondary info
+        static let sm: CGFloat = 13
+        /// Body text, chat messages, file names
+        static let md: CGFloat = 14
+        /// Section headers, input fields
+        static let lg: CGFloat = 15
+        /// Panel titles, ghost names
+        static let xl: CGFloat = 16
+        /// Display headings
+        static let xxl: CGFloat = 18
+    }
+
     enum Typography {
-        static func display(_ size: CGFloat, weight: Font.Weight = .semibold) -> Font {
+        static func display(_ size: CGFloat = FontSize.xl, weight: Font.Weight = .semibold) -> Font {
             .custom("DM Sans", size: size).weight(weight)
         }
 
-        static func body(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        static func body(_ size: CGFloat = FontSize.md, weight: Font.Weight = .regular) -> Font {
             .custom("DM Sans", size: size).weight(weight)
         }
 
-        static func label(_ size: CGFloat, weight: Font.Weight = .medium) -> Font {
+        static func label(_ size: CGFloat = FontSize.sm, weight: Font.Weight = .medium) -> Font {
             .custom("DM Sans", size: size).weight(weight)
+        }
+
+        static func caption(_ size: CGFloat = FontSize.xs, weight: Font.Weight = .regular) -> Font {
+            .custom("DM Sans", size: size).weight(weight)
+        }
+
+        static func mono(_ size: CGFloat = FontSize.sm) -> Font {
+            .system(size: size, weight: .regular, design: .monospaced)
         }
     }
 

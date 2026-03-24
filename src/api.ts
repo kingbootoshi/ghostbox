@@ -14,15 +14,23 @@ import {
   killGhost,
   listApiKeys,
   listGhosts,
+  loadState,
   mergeGhosts,
   reloadGhost,
   removeGhost,
+  saveState,
   revokeApiKey,
   sendMessage,
   spawnGhost,
   wakeGhost,
 } from './orchestrator';
-import type { GhostboxConfig, VaultEntry } from './types';
+import type {
+  GhostboxConfig,
+  GhostboxConfigResponse,
+  GhostboxConfigSensitiveStatus,
+  GhostboxConfigUpdate,
+  VaultEntry,
+} from './types';
 import { commitVault, getVaultPath } from './vault';
 import { createLogger } from './logger';
 
@@ -70,6 +78,8 @@ type VaultWriteBody = {
 type VaultDeleteBody = {
   path?: unknown;
 };
+
+type ConfigUpdateBody = GhostboxConfigUpdate & Record<string, unknown>;
 
 type LegacyConfig = GhostboxConfig & {
   defaultProvider?: string | null;
@@ -195,6 +205,89 @@ const getDefaultProvider = (config: LegacyConfig): string => {
       .trim()
       .toLowerCase()
   );
+};
+
+const hasConfigValue = (value: string | null | undefined): boolean => {
+  return typeof value === 'string' && value.length > 0;
+};
+
+const maskSensitiveConfigValue = (value: string | null | undefined): string => {
+  if (!hasConfigValue(value)) {
+    return '';
+  }
+
+  const sensitiveValue = value as string;
+  const prefix = sensitiveValue.slice(0, 12);
+  const suffix = sensitiveValue.slice(-4);
+  return `${prefix}...${suffix}`;
+};
+
+const toConfigSensitiveStatus = (config: GhostboxConfig): GhostboxConfigSensitiveStatus => {
+  return {
+    githubToken: hasConfigValue(config.githubToken),
+    telegramToken: hasConfigValue(config.telegramToken),
+  };
+};
+
+const toConfigResponse = (config: GhostboxConfig): GhostboxConfigResponse => {
+  return {
+    ...config,
+    githubToken: maskSensitiveConfigValue(config.githubToken),
+    telegramToken: maskSensitiveConfigValue(config.telegramToken),
+    hasSensitive: toConfigSensitiveStatus(config),
+  };
+};
+
+const normalizeRequiredConfigValue = (value: unknown, field: string): string => {
+  if (typeof value !== 'string') {
+    throw new ApiError(400, `Invalid ${field}`);
+  }
+
+  const trimmed = value.trim();
+
+  if (!trimmed) {
+    throw new ApiError(400, `Missing ${field}`);
+  }
+
+  return trimmed;
+};
+
+const normalizeNullableConfigValue = (value: unknown, field: string): string | null => {
+  if (value === null) {
+    return null;
+  }
+
+  if (typeof value !== 'string') {
+    throw new ApiError(400, `Invalid ${field}`);
+  }
+
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+};
+
+const normalizeSensitiveConfigValue = (
+  value: unknown,
+  field: 'githubToken' | 'telegramToken',
+): string | null | undefined => {
+  if (value === null) {
+    return null;
+  }
+
+  if (typeof value !== 'string') {
+    throw new ApiError(400, `Invalid ${field}`);
+  }
+
+  const trimmed = value.trim();
+
+  if (!trimmed) {
+    return null;
+  }
+
+  if (trimmed.includes('...')) {
+    return undefined;
+  }
+
+  return trimmed;
 };
 
 const getErrorStatus = (error: unknown): ApiStatusCode => {
@@ -549,7 +642,53 @@ app.post('/api/ghosts/:name/merge', (c) =>
 
 app.get('/api/config', (c) =>
   handleRoute(c, async () => {
-    return c.json(await getConfig());
+    return c.json(toConfigResponse(await getConfig()));
+  }));
+
+app.put('/api/config', (c) =>
+  handleRoute(c, async () => {
+    const body = await parseJsonBody<ConfigUpdateBody>(c);
+    const state = await loadState();
+    const nextConfig = { ...state.config };
+
+    if ('defaultProvider' in body) {
+      nextConfig.defaultProvider = normalizeRequiredConfigValue(body.defaultProvider, 'defaultProvider');
+    }
+
+    if ('defaultModel' in body) {
+      nextConfig.defaultModel = normalizeRequiredConfigValue(body.defaultModel, 'defaultModel');
+    }
+
+    if ('imageName' in body) {
+      nextConfig.imageName = normalizeRequiredConfigValue(body.imageName, 'imageName');
+    }
+
+    if ('githubRemote' in body) {
+      nextConfig.githubRemote = normalizeNullableConfigValue(body.githubRemote, 'githubRemote');
+    }
+
+    if ('githubToken' in body) {
+      const githubToken = normalizeSensitiveConfigValue(body.githubToken, 'githubToken');
+      if (githubToken === null) {
+        nextConfig.githubToken = null;
+      } else if (typeof githubToken === 'string') {
+        nextConfig.githubToken = githubToken;
+      }
+    }
+
+    if ('telegramToken' in body) {
+      const telegramToken = normalizeSensitiveConfigValue(body.telegramToken, 'telegramToken');
+      if (telegramToken === null) {
+        nextConfig.telegramToken = '';
+      } else if (typeof telegramToken === 'string') {
+        nextConfig.telegramToken = telegramToken;
+      }
+    }
+
+    state.config = nextConfig;
+    await saveState(state);
+
+    return c.json(toConfigResponse(nextConfig));
   }));
 
 app.post('/api/ghosts/:name/reload', (c) =>

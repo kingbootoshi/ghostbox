@@ -9,20 +9,60 @@ struct AgentChatView: View {
     @ObservedObject var viewModel: AgentChatViewModel
     @FocusState private var isInputFocused: Bool
     @State private var expandedToolMessages: Set<UUID> = []
+    @State private var fullscreenToolGroupID: UUID?
     @State private var showsVaultBrowser = false
+    @State private var showHotkeyHelp = false
+    @State private var slashCommands = Self.fallbackSlashCommands
+    @State private var didAttemptSlashCommandFetch = false
+    @State private var isSlashCommandPopupVisible = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
+        ZStack(alignment: .bottom) {
+            VStack(spacing: 0) {
+                header
 
-            if showsVaultBrowser {
-                VaultBrowserView(
-                    ghostName: viewModel.ghostName,
-                    client: viewModel.ghostboxClient
+                if showsVaultBrowser {
+                    VaultBrowserView(
+                        ghostName: viewModel.ghostName,
+                        client: viewModel.ghostboxClient
+                    )
+                } else {
+                    chatContent
+                    inputArea
+                }
+            }
+
+            if let fullscreenToolGroup {
+                ToolCallFullscreenOverlay(
+                    group: fullscreenToolGroup,
+                    onClose: closeFullscreenToolGroup
                 )
-            } else {
-                chatContent
-                inputArea
+                .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                .zIndex(1)
+            }
+
+            if showsSlashCommandPopup {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        dismissSlashCommandPopup()
+                    }
+            }
+
+            if showsSlashCommandPopup {
+                slashCommandPopup
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 84)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    .zIndex(2)
+            }
+
+            if showHotkeyHelp {
+                HotkeyHelpOverlay {
+                    dismissHotkeyHelp()
+                }
+                .transition(.opacity)
+                .zIndex(3)
             }
         }
         .background(Color.clear)
@@ -31,6 +71,7 @@ struct AgentChatView: View {
         }
         .onChange(of: showsVaultBrowser) {
             isInputFocused = !showsVaultBrowser
+            dismissSlashCommandPopup()
             NotificationCenter.default.post(
                 name: .resizeGhostChatPanel,
                 object: nil,
@@ -40,6 +81,13 @@ struct AgentChatView: View {
                     "width": showsVaultBrowser ? ChatPanelLayout.vaultBrowserWidth : ChatPanelLayout.defaultWidth,
                 ]
             )
+        }
+        .onChange(of: viewModel.inputText) {
+            handleInputTextChanged()
+        }
+        .onKeyPress(.escape, action: handleEscapeKey)
+        .onKeyPress(phases: [.down]) { keyPress in
+            handlePanelShortcut(keyPress)
         }
     }
 
@@ -53,7 +101,7 @@ struct AgentChatView: View {
                             .tint(Theme.Colors.accentLight)
 
                         Text("Loading chat history...")
-                            .font(.custom("DM Sans", size: 12))
+                            .font(Theme.Typography.body())
                             .foregroundColor(Color.white.opacity(Theme.Text.secondary))
                     }
                     .frame(maxWidth: .infinity)
@@ -61,45 +109,43 @@ struct AgentChatView: View {
                 } else if viewModel.messages.isEmpty {
                     VStack(spacing: 8) {
                         Text("No messages yet.")
-                            .font(.custom("DM Sans", size: 14).weight(.medium))
+                            .font(Theme.Typography.body(weight: .medium))
                             .foregroundColor(Color.white.opacity(Theme.Text.secondary))
 
                         Text("Send a message to start the thread.")
-                            .font(.custom("DM Sans", size: 12))
+                            .font(Theme.Typography.body())
                             .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.top, 40)
                 } else {
                     LazyVStack(spacing: 20) {
-                        ForEach(Array(viewModel.messages.enumerated()), id: \.element.id) { index, message in
-                            if message.role == .toolUse || message.role == .toolResult {
-                                ToolMessageBlock(
-                                    message: message,
-                                    isExpanded: expandedToolMessages.contains(message.id),
-                                    onToggle: { toggleToolMessage(message.id) }
-                                )
-                            } else {
-                                AgentMessageBlock(message: message, ghostName: viewModel.ghostName)
-                            }
-
-                            if index < viewModel.messages.count - 1 {
-                                ExchangeBreak()
-                            }
+                        if !viewModel.preCompactionMessages.isEmpty {
+                            olderMessagesToggle
                         }
+
+                        if viewModel.showingPreCompactionMessages {
+                            chatItemsSection(preCompactionDisplayItems)
+                            CompactionDivider()
+                        }
+
+                        chatItemsSection(displayItems)
 
                         if viewModel.isStreaming {
                             GhostTypingBlock(name: viewModel.ghostName)
                         }
+
+                        Color.clear
+                            .frame(height: 1)
+                            .id(ChatScrollAnchor.bottom)
                     }
                     .padding(.top, 20)
                     .padding(.bottom, 16)
                 }
             }
             .onChange(of: viewModel.messages.count) {
-                guard let last = viewModel.messages.last else { return }
                 withAnimation(.easeOut(duration: 0.2)) {
-                    proxy.scrollTo(last.id, anchor: .bottom)
+                    proxy.scrollTo(ChatScrollAnchor.bottom, anchor: .bottom)
                 }
             }
         }
@@ -113,11 +159,11 @@ struct AgentChatView: View {
                     .frame(width: 8, height: 8)
 
                 Text(viewModel.ghostName)
-                    .font(.custom("DM Sans", size: 16).weight(.semibold))
+                    .font(Theme.Typography.display())
                     .foregroundColor(Theme.Colors.accentLight)
 
                 Text(viewModel.ghost?.model ?? "Loading...")
-                    .font(.custom("DM Sans", size: 11))
+                    .font(Theme.Typography.label(weight: .regular))
                     .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
 
                 Spacer(minLength: 0)
@@ -126,7 +172,7 @@ struct AgentChatView: View {
                     Button("Stop") {
                         viewModel.cancelStream()
                     }
-                    .font(.custom("DM Sans", size: 11).weight(.medium))
+                    .font(Theme.Typography.label())
                     .foregroundColor(Color.white.opacity(Theme.Text.secondary))
                     .buttonStyle(.plain)
                 }
@@ -135,20 +181,14 @@ struct AgentChatView: View {
                     title: showsVaultBrowser ? "Chat" : "Files",
                     systemImage: showsVaultBrowser ? "bubble.left.and.bubble.right" : "folder"
                 ) {
-                    withAnimation(.easeOut(duration: 0.18)) {
-                        showsVaultBrowser.toggle()
-                    }
+                    toggleVaultBrowser()
                 }
 
                 Button {
-                    NotificationCenter.default.post(
-                        name: .closeGhostChat,
-                        object: nil,
-                        userInfo: ["ghostName": viewModel.ghostName]
-                    )
+                    closeCurrentPanel()
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: Theme.FontSize.xs, weight: .semibold))
                         .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
                         .frame(width: 24, height: 24)
                         .background(Color.white.opacity(0.05))
@@ -159,11 +199,11 @@ struct AgentChatView: View {
 
             if let error = viewModel.error {
                 Text(error)
-                    .font(.custom("DM Sans", size: 11))
+                    .font(Theme.Typography.label(weight: .regular))
                     .foregroundColor(Color.orange.opacity(0.9))
             } else if viewModel.isLoadingHistory {
                 Text("Loading saved messages...")
-                    .font(.custom("DM Sans", size: 11))
+                    .font(Theme.Typography.label(weight: .regular))
                     .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
             }
         }
@@ -176,11 +216,19 @@ struct AgentChatView: View {
         VStack(spacing: 8) {
             TextField(inputPlaceholder, text: $viewModel.inputText)
                 .textFieldStyle(.plain)
-                .font(.custom("DM Sans", size: 14))
+                .font(Theme.Typography.body(Theme.FontSize.lg))
                 .foregroundColor(Color.white.opacity(Theme.Text.primary))
                 .focused($isInputFocused)
                 .disabled(viewModel.isLoadingHistory || viewModel.isCompacting)
-                .onSubmit { viewModel.send() }
+                .onSubmit { submitInput() }
+                .onKeyPress(.tab) {
+                    guard showsSlashCommandPopup, let firstCommand = filteredSlashCommands.first else {
+                        return .ignored
+                    }
+
+                    viewModel.inputText = "/\(firstCommand.name) "
+                    return .handled
+                }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 14)
                 .background(Color.white.opacity(0.02))
@@ -188,10 +236,58 @@ struct AgentChatView: View {
                 .padding(.horizontal, 18)
 
             Text(footerHint)
-                .font(.custom("DM Sans", size: 10))
+                .font(Theme.Typography.caption())
                 .foregroundColor(Color.white.opacity(0.08))
                 .padding(.bottom, 12)
         }
+    }
+
+    private var slashCommandPopup: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Slash commands")
+                .font(Theme.Typography.label(weight: .semibold))
+                .foregroundColor(Theme.Colors.accentLightest)
+
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(filteredSlashCommands) { command in
+                    Button {
+                        selectSlashCommand(command)
+                    } label: {
+                        HStack(alignment: .top, spacing: 10) {
+                            Text("/\(command.name)")
+                                .font(Theme.Typography.label(weight: .semibold))
+                                .foregroundColor(Theme.Colors.accentLightest)
+                                .frame(width: 92, alignment: .leading)
+
+                            Text(command.description)
+                                .font(Theme.Typography.body())
+                                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(Color.white.opacity(0.04))
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14)
+                                .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 20)
+                .fill(Theme.Colors.surfaceElevated.opacity(0.96))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 20)
+                .strokeBorder(Theme.Colors.accentLight.opacity(0.22), lineWidth: 0.6)
+        )
+        .shadow(color: Theme.Colors.accent.opacity(0.18), radius: 22, x: 0, y: 12)
     }
 
     private var inputPlaceholder: String {
@@ -218,6 +314,32 @@ struct AgentChatView: View {
         return "Press return to send"
     }
 
+    private var showsSlashCommandPopup: Bool {
+        !showsVaultBrowser &&
+        isSlashCommandPopupVisible &&
+        fullscreenToolGroup == nil &&
+        slashAutocompleteQuery != nil &&
+        !filteredSlashCommands.isEmpty
+    }
+
+    private var slashAutocompleteQuery: String? {
+        guard viewModel.inputText.hasPrefix("/") else { return nil }
+
+        let remainder = String(viewModel.inputText.dropFirst())
+        guard !remainder.contains(where: \.isWhitespace) else { return nil }
+
+        return remainder.lowercased()
+    }
+
+    private var filteredSlashCommands: [GhostSlashCommand] {
+        guard let query = slashAutocompleteQuery else { return [] }
+        guard !query.isEmpty else { return slashCommands }
+
+        return slashCommands.filter { command in
+            command.name.range(of: query, options: [.anchored, .caseInsensitive]) != nil
+        }
+    }
+
     private var statusColor: Color {
         switch viewModel.ghost?.status {
         case .running:
@@ -232,11 +354,411 @@ struct AgentChatView: View {
     }
 
     private func toggleToolMessage(_ id: UUID) {
-        if expandedToolMessages.contains(id) {
-            expandedToolMessages.remove(id)
-        } else {
-            expandedToolMessages.insert(id)
+        withAnimation(.easeOut(duration: 0.15)) {
+            if expandedToolMessages.contains(id) {
+                expandedToolMessages.remove(id)
+            } else {
+                expandedToolMessages.insert(id)
+            }
         }
+    }
+
+    private func submitInput() {
+        dismissSlashCommandPopup()
+        viewModel.send()
+    }
+
+    private func toggleVaultBrowser() {
+        withAnimation(.easeOut(duration: 0.18)) {
+            showsVaultBrowser.toggle()
+        }
+    }
+
+    private func closeCurrentPanel() {
+        NotificationCenter.default.post(
+            name: .closeGhostChat,
+            object: nil,
+            userInfo: ["ghostName": viewModel.ghostName]
+        )
+    }
+
+    private func toggleHotkeyHelp() {
+        withAnimation(.easeOut(duration: 0.18)) {
+            showHotkeyHelp.toggle()
+        }
+    }
+
+    private func dismissHotkeyHelp() {
+        guard showHotkeyHelp else { return }
+
+        withAnimation(.easeOut(duration: 0.18)) {
+            showHotkeyHelp = false
+        }
+    }
+
+    private func handleEscapeKey() -> KeyPress.Result {
+        if showHotkeyHelp {
+            dismissHotkeyHelp()
+        } else {
+            closeCurrentPanel()
+        }
+
+        return .handled
+    }
+
+    private func handlePanelShortcut(_ keyPress: KeyPress) -> KeyPress.Result {
+        guard keyPress.modifiers == [.command] else { return .ignored }
+
+        switch keyPress.characters {
+        case "\\":
+            toggleVaultBrowser()
+            return .handled
+        case "/":
+            toggleHotkeyHelp()
+            return .handled
+        default:
+            return .ignored
+        }
+    }
+
+    private func handleInputTextChanged() {
+        isSlashCommandPopupVisible = slashAutocompleteQuery != nil
+
+        guard isSlashCommandPopupVisible else { return }
+        loadSlashCommandsIfNeeded()
+    }
+
+    private func selectSlashCommand(_ command: GhostSlashCommand) {
+        viewModel.inputText = "/\(command.name) "
+        dismissSlashCommandPopup()
+        isInputFocused = true
+    }
+
+    private func dismissSlashCommandPopup() {
+        isSlashCommandPopupVisible = false
+    }
+
+    private func loadSlashCommandsIfNeeded() {
+        guard !didAttemptSlashCommandFetch else { return }
+
+        didAttemptSlashCommandFetch = true
+
+        Task {
+            do {
+                let fetchedCommands = try await viewModel.ghostboxClient.fetchCommands(ghostName: viewModel.ghostName)
+                await MainActor.run {
+                    slashCommands = mergedSlashCommands(with: fetchedCommands)
+                }
+            } catch {
+                await MainActor.run {
+                    slashCommands = Self.fallbackSlashCommands
+                }
+            }
+        }
+    }
+
+    private func mergedSlashCommands(with fetchedCommands: [GhostSlashCommand]) -> [GhostSlashCommand] {
+        var commandsByName = Dictionary(uniqueKeysWithValues: Self.fallbackSlashCommands.map {
+            ($0.name.lowercased(), $0)
+        })
+
+        for command in fetchedCommands {
+            commandsByName[command.name.lowercased()] = command
+        }
+
+        let orderedNames = Self.fallbackSlashCommands.map(\.name) + fetchedCommands.map(\.name)
+        var seenNames = Set<String>()
+
+        return orderedNames.compactMap { name in
+            let normalizedName = name.lowercased()
+            guard seenNames.insert(normalizedName).inserted else { return nil }
+            return commandsByName[normalizedName]
+        }
+    }
+
+    private static let fallbackSlashCommands = [
+        GhostSlashCommand(name: "compact", description: "Condense the current chat into a shorter summary."),
+        GhostSlashCommand(name: "history", description: "Show the recent conversation history."),
+        GhostSlashCommand(name: "model", description: "Check or change the model for this ghost."),
+        GhostSlashCommand(name: "help", description: "List the available slash commands.")
+    ]
+
+    private func showFullscreenToolGroup(_ id: UUID) {
+        withAnimation(.easeOut(duration: 0.15)) {
+            fullscreenToolGroupID = id
+        }
+    }
+
+    private func closeFullscreenToolGroup() {
+        withAnimation(.easeOut(duration: 0.15)) {
+            fullscreenToolGroupID = nil
+        }
+    }
+
+    private var displayItems: [ChatDisplayItem] {
+        displayItems(for: viewModel.messages)
+    }
+
+    private var preCompactionDisplayItems: [ChatDisplayItem] {
+        displayItems(for: viewModel.preCompactionMessages)
+    }
+
+    private var fullscreenToolGroup: ToolCallGroup? {
+        guard let fullscreenToolGroupID else { return nil }
+
+        for item in displayItems {
+            if case .toolGroup(let group) = item, group.id == fullscreenToolGroupID {
+                return group
+            }
+        }
+
+        return nil
+    }
+
+    @ViewBuilder
+    private func chatItemsSection(_ items: [ChatDisplayItem]) -> some View {
+        ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+            switch item {
+            case .message(let message):
+                AgentMessageBlock(message: message, ghostName: viewModel.ghostName)
+            case .toolGroup(let group):
+                ToolCallGroupBlock(
+                    group: group,
+                    isExpanded: expandedToolMessages.contains(group.id),
+                    onToggle: { toggleToolMessage(group.id) },
+                    onShowFullscreen: { showFullscreenToolGroup(group.id) }
+                )
+            }
+
+            if index < items.count - 1 {
+                ExchangeBreak()
+            }
+        }
+    }
+
+    private func displayItems(for messages: [ChatMessage]) -> [ChatDisplayItem] {
+        ChatDisplayItem.build(from: messages)
+    }
+
+    private var olderMessagesToggle: some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.18)) {
+                viewModel.showingPreCompactionMessages.toggle()
+            }
+        } label: {
+            Text(
+                viewModel.showingPreCompactionMessages
+                    ? "Hide \(viewModel.preCompactionMessages.count) older messages"
+                    : "Show \(viewModel.preCompactionMessages.count) older messages"
+            )
+            .font(Theme.Typography.label())
+            .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private enum ChatScrollAnchor {
+    static let bottom = "chat-bottom-anchor"
+}
+
+struct HotkeyHelpOverlay: View {
+    let onDismiss: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.7)
+                .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 18) {
+                Text("Keyboard Shortcuts")
+                    .font(Theme.Typography.display(Theme.FontSize.xxl, weight: .semibold))
+                    .foregroundColor(Theme.Colors.accentLightest)
+
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(ShortcutItem.allCases) { item in
+                        HStack(alignment: .top, spacing: 16) {
+                            Text(item.shortcut)
+                                .font(Theme.Typography.label(Theme.FontSize.md, weight: .semibold))
+                                .foregroundColor(Theme.Colors.accentLight)
+                                .frame(width: 120, alignment: .leading)
+
+                            Text(item.description)
+                                .font(Theme.Typography.body())
+                                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+
+                Text("Click anywhere or press Escape to dismiss.")
+                    .font(Theme.Typography.caption())
+                    .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 22)
+            .frame(maxWidth: 420, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 24)
+                    .fill(Theme.Colors.surfaceElevated.opacity(0.96))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 24)
+                    .strokeBorder(Theme.Colors.accentLight.opacity(0.28), lineWidth: 0.8)
+            )
+            .shadow(color: Theme.Colors.accent.opacity(0.2), radius: 30, x: 0, y: 16)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            onDismiss()
+        }
+    }
+}
+
+private enum ShortcutItem: String, CaseIterable, Identifiable {
+    case toggleGhostbox
+    case toggleChatFiles
+    case showHelp
+    case closePanel
+    case autocompleteSlashCommand
+    case sendMessage
+
+    var id: String { rawValue }
+
+    var shortcut: String {
+        switch self {
+        case .toggleGhostbox:
+            return "Cmd+Shift+G"
+        case .toggleChatFiles:
+            return "Cmd+\\"
+        case .showHelp:
+            return "Cmd+/"
+        case .closePanel:
+            return "Esc"
+        case .autocompleteSlashCommand:
+            return "Tab"
+        case .sendMessage:
+            return "Return"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .toggleGhostbox:
+            return "Toggle Ghostbox"
+        case .toggleChatFiles:
+            return "Toggle Chat/Files"
+        case .showHelp:
+            return "Show this help"
+        case .closePanel:
+            return "Close panel"
+        case .autocompleteSlashCommand:
+            return "Autocomplete slash command"
+        case .sendMessage:
+            return "Send message"
+        }
+    }
+}
+
+private enum ChatDisplayItem: Identifiable {
+    case message(ChatMessage)
+    case toolGroup(ToolCallGroup)
+
+    var id: UUID {
+        switch self {
+        case .message(let message):
+            return message.id
+        case .toolGroup(let group):
+            return group.id
+        }
+    }
+
+    static func build(from messages: [ChatMessage]) -> [ChatDisplayItem] {
+        var items: [ChatDisplayItem] = []
+        var index = 0
+
+        while index < messages.count {
+            let message = messages[index]
+
+            if message.role == .toolUse {
+                let result: ChatMessage?
+                if index + 1 < messages.count, messages[index + 1].role == .toolResult {
+                    result = messages[index + 1]
+                    index += 1
+                } else {
+                    result = nil
+                }
+
+                items.append(.toolGroup(ToolCallGroup(toolUse: message, toolResult: result)))
+            } else if message.role == .toolResult {
+                items.append(.message(message))
+            } else {
+                items.append(.message(message))
+            }
+
+            index += 1
+        }
+
+        return items
+    }
+}
+
+private struct ToolCallGroup: Identifiable {
+    let toolUse: ChatMessage
+    let toolResult: ChatMessage?
+
+    var id: UUID { toolUse.id }
+
+    var toolName: String {
+        toolUse.resolvedToolName
+    }
+
+    var toolKind: String {
+        toolUse.normalizedToolKind
+    }
+
+    var iconName: String {
+        switch toolKind {
+        case "bash":
+            return "terminal.fill"
+        case "read":
+            return "doc.text"
+        case "write":
+            return "pencil"
+        default:
+            return "wrench"
+        }
+    }
+
+    var collapsedPreview: String {
+        let inputPreview = cleaned(toolUse.toolInputPreview)
+
+        guard let toolResult else {
+            return truncated(inputPreview, limit: 80)
+        }
+
+        if toolKind == "read", let subject = toolUse.toolPrimarySubject {
+            return truncated("\(cleaned(subject)) -> \(toolResult.contentSizeSummary)", limit: 80)
+        }
+
+        let outputPreview = cleaned(toolResult.toolOutputPreview)
+        guard !outputPreview.isEmpty else {
+            return truncated(inputPreview, limit: 80)
+        }
+
+        return truncated("\(inputPreview) -> \(outputPreview)", limit: 80)
+    }
+
+    private func cleaned(_ text: String) -> String {
+        text.replacingOccurrences(of: "\t", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func truncated(_ text: String, limit: Int) -> String {
+        guard text.count > limit else { return text }
+        let endIndex = text.index(text.startIndex, offsetBy: limit)
+        return String(text[..<endIndex]) + "..."
     }
 }
 
@@ -253,10 +775,10 @@ private struct ChatHeaderButton: View {
         Button(action: action) {
             HStack(spacing: 6) {
                 Image(systemName: systemImage)
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.system(size: Theme.FontSize.xs, weight: .semibold))
 
                 Text(title)
-                    .font(.custom("DM Sans", size: 11).weight(.medium))
+                    .font(Theme.Typography.label())
             }
             .foregroundColor(Theme.Colors.accentLightest)
             .padding(.horizontal, 10)
@@ -269,6 +791,25 @@ private struct ChatHeaderButton: View {
             .clipShape(Capsule())
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct CompactionDivider: View {
+    var body: some View {
+        HStack(spacing: 12) {
+            Rectangle()
+                .fill(Color.white.opacity(0.15))
+                .frame(height: 1)
+
+            Text("Compacted")
+                .font(Theme.Typography.caption(weight: .medium))
+                .foregroundColor(Color.white.opacity(0.15))
+
+            Rectangle()
+                .fill(Color.white.opacity(0.15))
+                .frame(height: 1)
+        }
+        .padding(.horizontal, 20)
     }
 }
 
@@ -285,18 +826,18 @@ private struct AgentMessageBlock: View {
     var body: some View {
         VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
             Text(senderName)
-                .font(.custom("DM Sans", size: 11).weight(.semibold))
+                .font(Theme.Typography.label(weight: .semibold))
                 .foregroundColor(senderColor)
 
             Text(message.content)
-                .font(.custom("DM Sans", size: 14))
+                .font(Theme.Typography.body())
                 .foregroundColor(contentColor)
                 .textSelection(.enabled)
                 .lineSpacing(5.6)
                 .fixedSize(horizontal: false, vertical: true)
 
             Text(Self.formatter.string(from: message.timestamp))
-                .font(.custom("DM Sans", size: 9.5))
+                .font(Theme.Typography.caption())
                 .foregroundColor(Color.white.opacity(0.1))
                 .padding(.top, 1)
         }
@@ -348,66 +889,181 @@ private struct AgentMessageBlock: View {
     }
 }
 
-private struct ToolMessageBlock: View {
-    let message: ChatMessage
+private struct ToolCallGroupBlock: View {
+    let group: ToolCallGroup
     let isExpanded: Bool
     let onToggle: () -> Void
-
-    private static let formatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "h:mm a"
-        return formatter
-    }()
+    let onShowFullscreen: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 8) {
             Button(action: onToggle) {
-                HStack(spacing: 8) {
-                    Text(message.role == .toolUse ? "Tool" : "Result")
-                        .font(.custom("DM Sans", size: 11).weight(.semibold))
-                        .foregroundColor(message.role == .toolUse ? Theme.Colors.accentLightest : Color.white.opacity(Theme.Text.tertiary))
+                HStack(spacing: 10) {
+                    Image(systemName: group.iconName)
+                        .font(.system(size: Theme.FontSize.sm, weight: .medium))
+                        .foregroundColor(Theme.Colors.accentLight)
+                        .frame(width: 14)
 
-                    Text(message.toolName ?? fallbackName)
-                        .font(.custom("DM Sans", size: 11))
+                    Text(group.toolName)
+                        .font(Theme.Typography.label(weight: .semibold))
+                        .foregroundColor(Theme.Colors.accentLightest)
+
+                    Text(group.collapsedPreview)
+                        .font(Theme.Typography.label(weight: .regular))
                         .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                        .lineLimit(1)
 
                     Spacer(minLength: 0)
 
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.system(size: Theme.FontSize.xs, weight: .medium))
                         .foregroundColor(Color.white.opacity(Theme.Text.quaternary))
                 }
             }
             .buttonStyle(.plain)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 11)
+            .background(Color.white.opacity(0.03))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-            Text(displayContent)
-                .font(.custom("DM Sans", size: 13))
-                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
-                .lineSpacing(4.8)
-                .fixedSize(horizontal: false, vertical: true)
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(alignment: .top, spacing: 8) {
+                        Text("Input")
+                            .font(Theme.Typography.caption(weight: .semibold))
+                            .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
 
-            Text(Self.formatter.string(from: message.timestamp))
-                .font(.custom("DM Sans", size: 9.5))
-                .foregroundColor(Color.white.opacity(0.1))
-                .padding(.top, 1)
+                        Spacer(minLength: 0)
+
+                        Button(action: onShowFullscreen) {
+                            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                .font(.system(size: Theme.FontSize.xs, weight: .semibold))
+                                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                                .frame(width: 24, height: 24)
+                                .background(Color.white.opacity(0.04))
+                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    ToolCallContentView(content: group.toolUse.content)
+
+                    if let toolResult = group.toolResult {
+                        Rectangle()
+                            .fill(Color.white.opacity(0.06))
+                            .frame(height: 1)
+
+                        Text("Output")
+                            .font(Theme.Typography.caption(weight: .semibold))
+                            .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+
+                        ToolCallContentView(content: toolResult.content)
+                    }
+                }
+                .padding(12)
+                .background(Color.white.opacity(0.05))
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 20)
     }
+}
 
-    private var fallbackName: String {
-        message.role == .toolUse ? "Tool Call" : "Tool Result"
+private struct ToolCallContentView: View {
+    let content: String
+
+    var body: some View {
+        ScrollView(.vertical, showsIndicators: true) {
+            Text(content)
+                .font(Theme.Typography.mono())
+                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                .textSelection(.enabled)
+                .lineSpacing(4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxHeight: 220)
     }
+}
 
-    private var displayContent: String {
-        guard !isExpanded else { return message.content }
-        return truncated(message.content, limit: 160)
-    }
+private struct ToolCallFullscreenOverlay: View {
+    let group: ToolCallGroup
+    let onClose: () -> Void
 
-    private func truncated(_ text: String, limit: Int) -> String {
-        guard text.count > limit else { return text }
-        let endIndex = text.index(text.startIndex, offsetBy: limit)
-        return String(text[..<endIndex]) + "..."
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Color.black.opacity(0.62)
+                .onTapGesture(perform: onClose)
+
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 10) {
+                    Image(systemName: group.iconName)
+                        .font(.system(size: Theme.FontSize.sm, weight: .medium))
+                        .foregroundColor(Theme.Colors.accentLight)
+
+                    Text(group.toolName)
+                        .font(Theme.Typography.label(weight: .semibold))
+                        .foregroundColor(Theme.Colors.accentLightest)
+
+                    Text(group.collapsedPreview)
+                        .font(Theme.Typography.label(weight: .regular))
+                        .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                        .lineLimit(1)
+
+                    Spacer(minLength: 0)
+
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: Theme.FontSize.sm, weight: .semibold))
+                            .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                            .frame(width: 28, height: 28)
+                            .background(Color.white.opacity(0.05))
+                            .clipShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text("Input")
+                            .font(Theme.Typography.caption(weight: .semibold))
+                            .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+
+                        Text(group.toolUse.content)
+                            .font(Theme.Typography.mono())
+                            .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                            .textSelection(.enabled)
+                            .lineSpacing(4)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        if let toolResult = group.toolResult {
+                            Rectangle()
+                                .fill(Color.white.opacity(0.06))
+                                .frame(height: 1)
+
+                            Text("Output")
+                                .font(Theme.Typography.caption(weight: .semibold))
+                                .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+
+                            Text(toolResult.content)
+                                .font(Theme.Typography.mono())
+                                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                                .textSelection(.enabled)
+                                .lineSpacing(4)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .padding(18)
+                }
+                .background(Color.white.opacity(0.05))
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            }
+            .padding(18)
+        }
     }
 }
 
@@ -429,7 +1085,7 @@ private struct GhostTypingBlock: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(name)
-                .font(.custom("DM Sans", size: 11).weight(.semibold))
+                .font(Theme.Typography.label(weight: .semibold))
                 .foregroundColor(Theme.Colors.accentLight)
 
             HStack(spacing: 5) {
@@ -484,11 +1140,11 @@ private struct VaultBrowserView: View {
 
             if let error = viewModel.error {
                 Text(error)
-                    .font(.custom("DM Sans", size: 11))
+                    .font(Theme.Typography.label(weight: .regular))
                     .foregroundColor(Color.orange.opacity(0.9))
             }
 
-            if viewModel.isLoadingEntries {
+            if viewModel.isLoadingEntries, viewModel.entries.isEmpty {
                 ProgressView()
                     .controlSize(.small)
                     .tint(Theme.Colors.accentLight)
@@ -508,7 +1164,7 @@ private struct VaultBrowserView: View {
 
                     if viewModel.entries.isEmpty, !viewModel.isLoadingEntries {
                         Text("This folder is empty.")
-                            .font(.custom("DM Sans", size: 12))
+                            .font(Theme.Typography.body())
                             .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
                             .padding(.top, 8)
                     } else {
@@ -544,11 +1200,11 @@ private struct VaultBrowserView: View {
             HStack(alignment: .center, spacing: 10) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(viewModel.viewerTitle)
-                        .font(.custom("DM Sans", size: 16).weight(.semibold))
+                        .font(Theme.Typography.display())
                         .foregroundColor(Color.white.opacity(Theme.Text.primary))
 
                     Text(viewModel.viewerSubtitle)
-                        .font(.custom("DM Sans", size: 11))
+                        .font(Theme.Typography.label(weight: .regular))
                         .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
                 }
 
@@ -577,14 +1233,14 @@ private struct VaultBrowserView: View {
                             .tint(Theme.Colors.accentLight)
 
                         Text("Loading file...")
-                            .font(.custom("DM Sans", size: 12))
+                            .font(Theme.Typography.body())
                             .foregroundColor(Color.white.opacity(Theme.Text.secondary))
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if let file = viewModel.loadedFile {
                     if viewModel.isEditing {
                         TextEditor(text: $viewModel.draftContent)
-                            .font(.custom("DM Sans", size: 13))
+                            .font(Theme.Typography.body())
                             .foregroundColor(Color.white.opacity(Theme.Text.primary))
                             .scrollContentBackground(.hidden)
                             .padding(16)
@@ -593,7 +1249,7 @@ private struct VaultBrowserView: View {
                     } else {
                         ScrollView {
                             Text(file.content)
-                                .font(.custom("DM Sans", size: 13))
+                                .font(Theme.Typography.body())
                                 .foregroundColor(Color.white.opacity(Theme.Text.primary))
                                 .kerning(0.1)
                                 .lineSpacing(4.8)
@@ -611,11 +1267,11 @@ private struct VaultBrowserView: View {
                             .foregroundColor(Theme.Colors.accentLight.opacity(0.9))
 
                         Text("Choose a file to read it here.")
-                            .font(.custom("DM Sans", size: 14).weight(.medium))
+                            .font(Theme.Typography.body(weight: .medium))
                             .foregroundColor(Color.white.opacity(Theme.Text.secondary))
 
                         Text("Folders open in the browser on the left.")
-                            .font(.custom("DM Sans", size: 12))
+                            .font(Theme.Typography.body())
                             .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -653,18 +1309,18 @@ private struct VaultEntryRow: View {
         Button(action: action) {
             HStack(spacing: 10) {
                 Image(systemName: systemImage)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: Theme.FontSize.xs, weight: .medium))
                     .foregroundColor(isSelected ? Theme.Colors.accentLightest : Theme.Colors.accentLight.opacity(0.9))
                     .frame(width: 16)
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title)
-                        .font(.custom("DM Sans", size: 12.5).weight(.medium))
+                        .font(Theme.Typography.body(weight: .medium))
                         .foregroundColor(Color.white.opacity(Theme.Text.primary))
                         .lineLimit(1)
 
                     Text(subtitle)
-                        .font(.custom("DM Sans", size: 10.5))
+                        .font(Theme.Typography.caption())
                         .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
                         .lineLimit(1)
                 }
@@ -701,12 +1357,12 @@ private struct VaultBreadcrumbs: View {
                         onSelect(segment.path)
                     }
                     .buttonStyle(.plain)
-                    .font(.custom("DM Sans", size: 11).weight(index == segments.count - 1 ? .semibold : .medium))
+                    .font(Theme.Typography.label(weight: index == segments.count - 1 ? .semibold : .medium))
                     .foregroundColor(index == segments.count - 1 ? Theme.Colors.accentLightest : Color.white.opacity(Theme.Text.secondary))
 
                     if index < segments.count - 1 {
                         Image(systemName: "chevron.right")
-                            .font(.system(size: 8, weight: .medium))
+                            .font(.system(size: Theme.FontSize.xs, weight: .medium))
                             .foregroundColor(Color.white.opacity(Theme.Text.quaternary))
                     }
                 }
@@ -849,21 +1505,29 @@ private final class VaultBrowserViewModel: ObservableObject {
     private func loadEntries() async {
         isLoadingEntries = true
         error = nil
+        let requestedPath = currentPath
 
         defer {
             isLoadingEntries = false
         }
 
         do {
-            let fetchedEntries = try await client.listVault(ghostName: ghostName, path: currentPath)
-            entries = fetchedEntries.sorted { lhs, rhs in
+            let fetchedEntries = try await client.listVault(ghostName: ghostName, path: requestedPath)
+            let sortedEntries = fetchedEntries.sorted { lhs, rhs in
                 if lhs.isDirectory != rhs.isDirectory {
                     return lhs.isDirectory && !rhs.isDirectory
                 }
 
                 return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
             }
+
+            guard requestedPath == currentPath else { return }
+
+            withAnimation(.easeOut(duration: 0.15)) {
+                entries = sortedEntries
+            }
         } catch {
+            guard requestedPath == currentPath else { return }
             self.error = error.localizedDescription
         }
     }

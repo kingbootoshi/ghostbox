@@ -35,6 +35,27 @@ export interface GhostboxConfig {
   imageName: string;
 }
 
+export interface GhostboxConfigSensitiveStatus {
+  githubToken: boolean;
+  telegramToken: boolean;
+}
+
+export interface GhostboxConfigResponse
+  extends Omit<GhostboxConfig, 'githubToken' | 'telegramToken'> {
+  githubToken: string;
+  telegramToken: string;
+  hasSensitive: GhostboxConfigSensitiveStatus;
+}
+
+export type GhostboxConfigUpdate = Partial<{
+  telegramToken: string | null;
+  githubToken: string | null;
+  githubRemote: string | null;
+  defaultModel: string;
+  defaultProvider: string;
+  imageName: string;
+}>;
+
 export interface TelegramState {
   activeChatGhosts: Record<string, string>;
 }

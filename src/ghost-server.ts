@@ -47,6 +47,17 @@ type PiAgentEvent = {
   messages?: unknown[];
 };
 
+type SlashCommandHandler = (
+  res: ServerResponse,
+  args: string,
+) => Promise<void> | void;
+
+type SlashCommand = {
+  name: string;
+  description: string;
+  handler: SlashCommandHandler;
+};
+
 const isMessageUpdateEvent = (event: PiAgentEvent): boolean => event.type === 'message_update';
 
 const isMessageEndEvent = (event: PiAgentEvent): boolean => event.type === 'message_end';
@@ -107,6 +118,31 @@ const log = {
 
 const sendJsonLine = (res: ServerResponse, payload: GhostMessage): void => {
   res.write(`${JSON.stringify(payload)}\n`);
+};
+
+const startNdjsonResponse = (res: ServerResponse): void => {
+  res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+};
+
+const sendAssistantResult = (
+  res: ServerResponse,
+  text: string,
+  options?: { end?: boolean },
+): void => {
+  sendJsonLine(res, {
+    type: 'assistant',
+    text,
+  });
+
+  sendJsonLine(res, {
+    type: 'result',
+    text: '',
+    sessionId: session.sessionId,
+  });
+
+  if (options?.end !== false) {
+    res.end();
+  }
 };
 
 const getRequestBody = (req: IncomingMessage): Promise<string> =>
@@ -275,6 +311,29 @@ const getHistoryMessages = (messages: PiAgentMessage[]): HistoryMessage[] => {
   });
 };
 
+const parseSlashCommandPrompt = (prompt: string): { command: string; args: string } | null => {
+  const trimmed = prompt.trim();
+  if (!trimmed.startsWith('/')) {
+    return null;
+  }
+
+  const firstSpaceIndex = trimmed.indexOf(' ');
+  const rawCommand =
+    firstSpaceIndex === -1
+      ? trimmed.slice(1)
+      : trimmed.slice(1, firstSpaceIndex);
+  const command = rawCommand.trim().toLowerCase();
+
+  if (!command) {
+    return null;
+  }
+
+  return {
+    command,
+    args: firstSpaceIndex === -1 ? '' : trimmed.slice(firstSpaceIndex + 1).trim(),
+  };
+};
+
 const parseModelRef = (value: string): { provider: string; modelId: string } => {
   const trimmed = value.trim();
   const separatorIndex = trimmed.indexOf('/');
@@ -339,6 +398,8 @@ log.info('Pi session ready', {
   apiKeyCount: configuredApiKeys.length,
 });
 
+let currentModelValue = startupModelValue ?? 'default';
+
 let requestQueue: Promise<void> = Promise.resolve();
 
 const runQueued = async <T>(task: () => Promise<T>): Promise<T> => {
@@ -355,11 +416,12 @@ const streamPrompt = async (
   prompt: string,
   modelValue?: string,
 ): Promise<void> => {
-  res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+  startNdjsonResponse(res);
 
   if (modelValue) {
     const nextModel = resolveModel(session.modelRegistry, modelValue);
     await session.setModel(nextModel);
+    currentModelValue = `${nextModel.provider}/${nextModel.id}`;
     log.info('Pi model switched', { model: `${nextModel.provider}/${nextModel.id}` });
   }
 
@@ -460,6 +522,104 @@ const streamPrompt = async (
   }
 };
 
+const slashCommands = new Map<string, SlashCommand>();
+
+const registerSlashCommand = (command: SlashCommand): void => {
+  const key = command.name.startsWith('/') ? command.name.slice(1) : command.name;
+  slashCommands.set(key, command);
+};
+
+registerSlashCommand({
+  name: '/compact',
+  description: 'Compact the current session and reduce context.',
+  handler: async (res) => {
+    try {
+      log.info('Pi slash compact start', { sessionId: session.sessionId });
+      await session.compact();
+      log.info('Pi slash compact complete', { sessionId: session.sessionId });
+      sendAssistantResult(res, 'Session compacted. Context reduced.');
+    } catch (error) {
+      log.error('Pi slash compact failed', serializeError(error));
+      sendAssistantResult(
+        res,
+        error instanceof Error ? error.message : 'Compaction failed.',
+      );
+    }
+  },
+});
+
+registerSlashCommand({
+  name: '/history',
+  description: 'Show session history counts and session details.',
+  handler: (res) => {
+    const historyMessages = getHistoryMessages(session.messages);
+    const lines = [
+      `Session ID: ${session.sessionId}`,
+      `Current model: ${currentModelValue}`,
+      `Message count: ${session.messages.length}`,
+      `History entries: ${historyMessages.length}`,
+      `Session file: ${session.sessionFile ?? 'none'}`,
+    ];
+    sendAssistantResult(res, lines.join('\n'));
+  },
+});
+
+registerSlashCommand({
+  name: '/model',
+  description: 'Show the current model or switch to /model <provider/id>.',
+  handler: async (res, args) => {
+    const nextModelValue = args.trim();
+
+    if (!nextModelValue) {
+      sendAssistantResult(res, `Current model: ${currentModelValue}`);
+      return;
+    }
+
+    try {
+      const nextModel = resolveModel(session.modelRegistry, nextModelValue);
+      await session.setModel(nextModel);
+      currentModelValue = `${nextModel.provider}/${nextModel.id}`;
+      log.info('Pi slash model switched', { model: currentModelValue });
+      sendAssistantResult(res, `Model switched to ${currentModelValue}.`);
+    } catch (error) {
+      log.error('Pi slash model switch failed', serializeError(error));
+      sendAssistantResult(
+        res,
+        error instanceof Error ? error.message : 'Model switch failed.',
+      );
+    }
+  },
+});
+
+registerSlashCommand({
+  name: '/help',
+  description: 'List available slash commands.',
+  handler: (res) => {
+    const commandList = Array.from(slashCommands.values())
+      .map((command) => `${command.name} - ${command.description}`)
+      .join('\n');
+    sendAssistantResult(res, commandList);
+  },
+});
+
+const streamSlashCommand = async (
+  res: ServerResponse,
+  command: SlashCommand,
+  args: string,
+): Promise<void> => {
+  startNdjsonResponse(res);
+
+  try {
+    await command.handler(res, args);
+  } catch (error) {
+    log.error('Slash command processing failed', {
+      command: command.name,
+      ...serializeError(error),
+    });
+    sendAssistantResult(res, 'Ghost server failed while processing command.');
+  }
+};
+
 const handleMessage = async (
   req: IncomingMessage,
   res: ServerResponse,
@@ -486,6 +646,15 @@ const handleMessage = async (
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Missing prompt' }));
     return;
+  }
+
+  const slashCommand = parseSlashCommandPrompt(prompt);
+  if (slashCommand) {
+    const handler = slashCommands.get(slashCommand.command);
+    if (handler) {
+      await runQueued(() => streamSlashCommand(res, handler, slashCommand.args));
+      return;
+    }
   }
 
   await runQueued(() => streamPrompt(res, prompt, model));
@@ -579,6 +748,20 @@ const handleRequest = async (
 
   if (req.method === 'GET' && req.url === '/history') {
     handleHistory(res);
+    log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
+    return;
+  }
+
+  if (req.method === 'GET' && req.url === '/commands') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify(
+        Array.from(slashCommands.values()).map(({ name, description }) => ({
+          name,
+          description,
+        })),
+      ),
+    );
     log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
     return;
   }

@@ -12,7 +12,7 @@ struct SpawnFormView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Spawn Ghost")
-                .font(.custom("DM Sans", size: 12).weight(.semibold))
+                .font(Theme.Typography.display())
                 .foregroundColor(Color.white.opacity(0.82))
 
             VStack(alignment: .leading, spacing: 10) {
@@ -33,7 +33,7 @@ struct SpawnFormView: View {
 
                 fieldLabel("System Prompt")
                 TextEditor(text: $systemPrompt)
-                    .font(.custom("DM Sans", size: 13))
+                    .font(Theme.Typography.body(Theme.FontSize.lg))
                     .foregroundColor(Color.white.opacity(0.82))
                     .scrollContentBackground(.hidden)
                     .frame(minHeight: 76, maxHeight: 76)
@@ -46,7 +46,7 @@ struct SpawnFormView: View {
             HStack(spacing: 10) {
                 Button(action: onCancel) {
                     Text("Cancel")
-                        .font(.custom("DM Sans", size: 12).weight(.medium))
+                        .font(Theme.Typography.label())
                         .foregroundColor(Color.white.opacity(0.6))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 11)
@@ -65,7 +65,7 @@ struct SpawnFormView: View {
                         }
 
                         Text(isLoading ? "Spawning..." : "Spawn")
-                            .font(.custom("DM Sans", size: 12).weight(.semibold))
+                            .font(Theme.Typography.label(weight: .semibold))
                     }
                     .foregroundColor(.white)
                     .frame(maxWidth: .infinity)
@@ -84,7 +84,7 @@ struct SpawnFormView: View {
 
     private func fieldLabel(_ title: String) -> some View {
         Text(title)
-            .font(.custom("DM Sans", size: 10).weight(.semibold))
+            .font(Theme.Typography.label(weight: .semibold))
             .foregroundColor(Color.white.opacity(0.35))
             .tracking(0.8)
     }
@@ -92,7 +92,7 @@ struct SpawnFormView: View {
     private func formField(_ placeholder: String, text: Binding<String>) -> some View {
         TextField(placeholder, text: text)
             .textFieldStyle(.plain)
-            .font(.custom("DM Sans", size: 13))
+            .font(Theme.Typography.body(Theme.FontSize.lg))
             .foregroundColor(Color.white.opacity(0.82))
             .padding(.horizontal, 14)
             .padding(.vertical, 12)

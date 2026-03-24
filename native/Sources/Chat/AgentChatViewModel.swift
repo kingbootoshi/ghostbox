@@ -5,6 +5,8 @@ final class AgentChatViewModel: ObservableObject {
     let ghostName: String
 
     @Published var messages: [ChatMessage] = []
+    @Published var preCompactionMessages: [ChatMessage] = []
+    @Published var showingPreCompactionMessages = false
     @Published var inputText = ""
     @Published var isStreaming = false
     @Published private(set) var isLoadingHistory = false
@@ -93,6 +95,8 @@ final class AgentChatViewModel: ObservableObject {
     private func consumeStream(prompt: String, ghostName: String) async {
         var currentAssistantText = ""
         var currentAssistantIndex: Int?
+        let isCompactCommand = Self.isCompactCommand(prompt)
+        var compactResponseMessageID: UUID?
 
         defer {
             isStreaming = false
@@ -114,10 +118,23 @@ final class AgentChatViewModel: ObservableObject {
                     currentAssistantText += chunk
 
                     if let index = currentAssistantIndex, messages.indices.contains(index) {
-                        messages[index] = ChatMessage(role: .ghost, content: currentAssistantText)
+                        let existingMessage = messages[index]
+                        messages[index] = ChatMessage(
+                            id: existingMessage.id,
+                            role: .ghost,
+                            content: currentAssistantText,
+                            timestamp: existingMessage.timestamp
+                        )
+                        if isCompactCommand {
+                            compactResponseMessageID = existingMessage.id
+                        }
                     } else {
-                        messages.append(ChatMessage(role: .ghost, content: currentAssistantText))
+                        let assistantMessage = ChatMessage(role: .ghost, content: currentAssistantText)
+                        messages.append(assistantMessage)
                         currentAssistantIndex = messages.count - 1
+                        if isCompactCommand {
+                            compactResponseMessageID = assistantMessage.id
+                        }
                     }
 
                 case .tool_use:
@@ -135,7 +152,11 @@ final class AgentChatViewModel: ObservableObject {
 
                 case .result:
                     if let text = event.text, !text.isEmpty, currentAssistantText.isEmpty {
-                        messages.append(ChatMessage(role: .ghost, content: text))
+                        let resultMessage = ChatMessage(role: .ghost, content: text)
+                        messages.append(resultMessage)
+                        if isCompactCommand {
+                            compactResponseMessageID = resultMessage.id
+                        }
                     }
                 }
             }
@@ -147,6 +168,10 @@ final class AgentChatViewModel: ObservableObject {
                 ChatMessage(role: .system, content: "Error: \(error.localizedDescription)")
             )
             return
+        }
+
+        if isCompactCommand, let compactResponseMessageID {
+            await handleCompaction(compactResponseMessageID: compactResponseMessageID)
         }
 
         await loadGhost()
@@ -178,6 +203,19 @@ final class AgentChatViewModel: ObservableObject {
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    func handleCompaction() async {
+        await handleCompaction(compactResponseMessageID: nil)
+    }
+
+    private func handleCompaction(compactResponseMessageID: UUID?) async {
+        preCompactionMessages = messages.filter { message in
+            message.id != compactResponseMessageID
+        }
+        showingPreCompactionMessages = false
+        messages = [ChatMessage(role: .system, content: "Session compacted")]
+        await loadHistory()
     }
 
     private func loadGhost() async {
@@ -219,5 +257,12 @@ final class AgentChatViewModel: ObservableObject {
         }
 
         return Date()
+    }
+
+    private static func isCompactCommand(_ prompt: String) -> Bool {
+        prompt
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .hasPrefix("/compact")
     }
 }

@@ -24,6 +24,28 @@ struct VaultFile: Decodable {
     let size: Int
 }
 
+struct GhostSlashCommand: Decodable, Identifiable, Hashable {
+    let name: String
+    let description: String
+
+    var id: String { name }
+}
+
+struct GhostboxConfigSensitiveStatus: Decodable {
+    let githubToken: Bool
+    let telegramToken: Bool
+}
+
+struct GhostboxConfig: Decodable {
+    let githubRemote: String?
+    let githubToken: String
+    let telegramToken: String
+    let defaultModel: String
+    let defaultProvider: String
+    let imageName: String
+    let hasSensitive: GhostboxConfigSensitiveStatus
+}
+
 final class GhostboxClient {
     private let baseURL: URL
     private let session: URLSession
@@ -137,6 +159,32 @@ final class GhostboxClient {
             body: body
         )
         _ = try await decodeResponse(for: request, as: VaultWriteResponse.self)
+    }
+
+    func fetchCommands(ghostName: String) async throws -> [GhostSlashCommand] {
+        let request = makeRequest(path: ["api", "ghosts", ghostName, "commands"])
+        return try await decodeResponse(for: request, as: [GhostSlashCommand].self)
+    }
+
+    func fetchConfig() async throws -> GhostboxConfig {
+        let request = makeRequest(path: ["api", "config"])
+        return try await decodeResponse(for: request, as: GhostboxConfig.self)
+    }
+
+    func updateConfig(changes: [String: Any]) async throws -> GhostboxConfig {
+        guard JSONSerialization.isValidJSONObject(changes) else {
+            throw GhostboxClientError.invalidRequestPayload
+        }
+
+        let body: Data
+        do {
+            body = try JSONSerialization.data(withJSONObject: changes, options: [])
+        } catch {
+            throw GhostboxClientError.encodingFailed(error)
+        }
+
+        let request = makeRequest(path: ["api", "config"], method: "PUT", body: body)
+        return try await decodeResponse(for: request, as: GhostboxConfig.self)
     }
 
     func sendMessage(
@@ -260,7 +308,7 @@ final class GhostboxClient {
     }
 
     private func decodeResponse<T: Decodable>(for request: URLRequest, as type: T.Type) async throws -> T {
-        let (data, response) = try await perform(request)
+        let (data, _) = try await perform(request)
         do {
             return try decoder.decode(type, from: data)
         } catch {
@@ -422,13 +470,17 @@ private struct VaultWriteResponse: Decodable {
 
 enum GhostboxClientError: LocalizedError {
     case invalidResponse
+    case invalidRequestPayload
     case requestFailed(statusCode: Int, message: String?)
     case decodingFailed(Error)
+    case encodingFailed(Error)
 
     var errorDescription: String? {
         switch self {
         case .invalidResponse:
             return "Ghostbox returned an invalid response."
+        case .invalidRequestPayload:
+            return "Ghostbox request could not be prepared."
         case let .requestFailed(statusCode, message):
             if let message, !message.isEmpty {
                 return "Ghostbox request failed with status \(statusCode): \(message)"
@@ -436,6 +488,8 @@ enum GhostboxClientError: LocalizedError {
             return "Ghostbox request failed with status \(statusCode)."
         case let .decodingFailed(error):
             return "Ghostbox returned data that could not be read: \(error.localizedDescription)"
+        case let .encodingFailed(error):
+            return "Ghostbox request could not be encoded: \(error.localizedDescription)"
         }
     }
 }
