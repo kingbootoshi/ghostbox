@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 struct HistoryMessage: Decodable {
     let role: String
@@ -59,6 +60,8 @@ struct GhostboxConfig: Decodable {
 }
 
 final class GhostboxClient {
+    private static let logger = Logger(subsystem: "com.ghostbox.app", category: "network")
+
     private let baseURL: URL
     private let session: URLSession
     private let decoder = JSONDecoder()
@@ -226,60 +229,33 @@ final class GhostboxClient {
 
                     let (bytes, response) = try await session.bytes(for: request)
                     try validate(response: response)
-                    print("[GhostboxClient] SSE connected for ghost \(ghostName).")
+                    Self.logger.info("SSE connected for ghost \(ghostName, privacy: .public).")
 
-                    var iterator = bytes.makeAsyncIterator()
-                    var lineBuffer = Data()
-                    var currentEvent: String?
-                    var dataLines: [String] = []
-
-                    while let byte = try await iterator.next() {
+                    let parser = SSEStreamParser(decoder: decoder)
+                    for try await event in parser.parse(bytes: bytes, ghostName: ghostName) {
                         if Task.isCancelled {
-                            print("[GhostboxClient] SSE cancelled for ghost \(ghostName).")
+                            Self.logger.info("SSE cancelled for ghost \(ghostName, privacy: .public).")
                             continuation.finish()
                             return
                         }
 
-                        if byte == 0x0A {
-                            let line = decodeSSELine(from: lineBuffer)
-                            lineBuffer.removeAll(keepingCapacity: true)
-
-                            if try processSSELine(
-                                line,
-                                currentEvent: &currentEvent,
-                                dataLines: &dataLines,
-                                continuation: continuation
-                            ) {
-                                return
-                            }
-                        } else {
-                            lineBuffer.append(byte)
-                        }
-                    }
-
-                    if !lineBuffer.isEmpty {
-                        let line = decodeSSELine(from: lineBuffer)
-                        if try processSSELine(
-                            line,
-                            currentEvent: &currentEvent,
-                            dataLines: &dataLines,
-                            continuation: continuation
-                        ) {
+                        switch event {
+                        case let .message(message):
+                            continuation.yield(message)
+                        case .done:
+                            Self.logger.info("SSE finished for ghost \(ghostName, privacy: .public).")
+                            continuation.finish()
                             return
                         }
                     }
 
-                    if try handleSSEEvent(name: currentEvent, dataLines: dataLines, continuation: continuation) {
-                        return
-                    }
-
-                    print("[GhostboxClient] SSE finished for ghost \(ghostName).")
+                    Self.logger.info("SSE finished for ghost \(ghostName, privacy: .public).")
                     continuation.finish()
                 } catch is CancellationError {
-                    print("[GhostboxClient] SSE task cancelled for ghost \(ghostName).")
+                    Self.logger.info("SSE task cancelled for ghost \(ghostName, privacy: .public).")
                     continuation.finish()
                 } catch {
-                    print("[GhostboxClient] SSE failed for ghost \(ghostName): \(error.localizedDescription)")
+                    Self.logger.error("SSE failed for ghost \(ghostName, privacy: .public): \(error.localizedDescription, privacy: .public)")
                     continuation.finish(throwing: error)
                 }
             }
@@ -347,118 +323,6 @@ final class GhostboxClient {
             let message = data.flatMap { String(data: $0, encoding: .utf8) }
             throw GhostboxClientError.requestFailed(statusCode: httpResponse.statusCode, message: message)
         }
-    }
-
-    private func processSSELine(
-        _ line: String,
-        currentEvent: inout String?,
-        dataLines: inout [String],
-        continuation: AsyncThrowingStream<GhostMessage, Error>.Continuation
-    ) throws -> Bool {
-        print("[GhostboxClient] SSE line: \(line.isEmpty ? "<blank>" : line)")
-
-        if line.isEmpty {
-            if try handleSSEEvent(
-                name: currentEvent,
-                dataLines: dataLines,
-                continuation: continuation
-            ) {
-                return true
-            }
-
-            currentEvent = nil
-            dataLines.removeAll(keepingCapacity: true)
-            return false
-        }
-
-        if line.hasPrefix(":") {
-            return false
-        }
-
-        if let eventName = sseValue(for: "event:", in: line) {
-            currentEvent = eventName.trimmingCharacters(in: .whitespacesAndNewlines)
-            print("[GhostboxClient] SSE event name: \(currentEvent ?? "<none>")")
-        } else if let data = sseValue(for: "data:", in: line) {
-            dataLines.append(data)
-            print("[GhostboxClient] SSE data: \(data)")
-        }
-
-        return false
-    }
-
-    private func handleSSEEvent(
-        name: String?,
-        dataLines: [String],
-        continuation: AsyncThrowingStream<GhostMessage, Error>.Continuation
-    ) throws -> Bool {
-        let eventName = name ?? "message"
-        print("[GhostboxClient] Handling SSE event '\(eventName)' with \(dataLines.count) data line(s).")
-
-        if eventName == "done" {
-            continuation.finish()
-            return true
-        }
-
-        if eventName == "error" {
-            let payload = dataLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-            let errorMessage = sseErrorMessage(from: payload)
-            continuation.finish(throwing: GhostboxClientError.requestFailed(statusCode: 0, message: errorMessage))
-            return true
-        }
-
-        guard eventName == "message" else {
-            return false
-        }
-
-        let payload = dataLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !payload.isEmpty else {
-            return false
-        }
-
-        do {
-            let message = try decoder.decode(GhostMessage.self, from: Data(payload.utf8))
-            print("[GhostboxClient] Decoded ghost message of type '\(message.type.rawValue)'.")
-            continuation.yield(message)
-            return false
-        } catch {
-            throw GhostboxClientError.decodingFailed(error)
-        }
-    }
-
-    private func decodeSSELine(from data: Data) -> String {
-        var lineData = data
-        if lineData.last == 0x0D {
-            lineData.removeLast()
-        }
-        return String(decoding: lineData, as: UTF8.self)
-    }
-
-    private func sseValue(for prefix: String, in line: String) -> String? {
-        guard line.hasPrefix(prefix) else { return nil }
-
-        var value = String(line.dropFirst(prefix.count))
-        if value.first == " " {
-            value.removeFirst()
-        }
-        return value
-    }
-
-    private func sseErrorMessage(from payload: String) -> String {
-        guard !payload.isEmpty else {
-            return "Ghost connection failed"
-        }
-
-        struct ErrorPayload: Decodable {
-            let error: String
-        }
-
-        if let data = payload.data(using: .utf8),
-           let decoded = try? decoder.decode(ErrorPayload.self, from: data),
-           !decoded.error.isEmpty {
-            return decoded.error
-        }
-
-        return payload
     }
 }
 
