@@ -5,6 +5,8 @@ import { join } from 'node:path';
 
 import {
   type GhostApiKey,
+  type GhostboxConfig,
+  type HistoryResponse,
   type GhostMessage,
   type GhostState,
   type GhostboxState,
@@ -48,6 +50,12 @@ const getGhostboxApiKeysEnv = (ghost: GhostState): string => {
 const getGhostAuthorizationHeader = (ghost: GhostState): string | null => {
   const apiKey = ghost.apiKeys[0];
   return apiKey ? `Bearer ${apiKey.key}` : null;
+};
+
+const getGhostAuthHeaders = (ghost: GhostState): Record<string, string> => {
+  return getGhostAuthorizationHeader(ghost)
+    ? { Authorization: getGhostAuthorizationHeader(ghost) as string }
+    : {};
 };
 
 const normalizeGhostState = (
@@ -247,6 +255,16 @@ export const listGhosts = async (): Promise<Record<string, GhostState>> => {
   return state.ghosts;
 };
 
+export const getGhost = async (name: string): Promise<GhostState> => {
+  const state = await loadState();
+  return getGhostFromState(state, name);
+};
+
+export const getConfig = async (): Promise<GhostboxConfig> => {
+  const state = await loadState();
+  return state.config;
+};
+
 export const generateApiKey = async (
   name: string,
   label: string,
@@ -439,6 +457,7 @@ export const wakeGhost = async (name: string): Promise<void> => {
 export const sendMessage = async function* (
   name: string,
   prompt: string,
+  model?: string,
 ): AsyncGenerator<GhostMessage> {
   const state = await loadState();
   const ghost = getGhostFromState(state, name);
@@ -450,12 +469,11 @@ export const sendMessage = async function* (
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(getGhostAuthorizationHeader(ghost)
-        ? { Authorization: getGhostAuthorizationHeader(ghost) as string }
-        : {}),
+      ...getGhostAuthHeaders(ghost),
     },
     body: JSON.stringify({
       prompt,
+      ...(model ? { model } : {}),
     }),
     signal: AbortSignal.timeout(1_800_000),
   });
@@ -507,6 +525,90 @@ export const getGhostHealth = async (name: string): Promise<boolean> => {
   } catch {
     return false;
   }
+};
+
+export const getGhostHistory = async (name: string): Promise<HistoryResponse> => {
+  const state = await loadState();
+  const ghost = getGhostFromState(state, name);
+  if (ghost.status !== 'running') {
+    throw new Error(`Ghost "${name}" is not running.`);
+  }
+
+  const response = await fetch(`http://localhost:${ghost.portBase}/history`, {
+    headers: {
+      ...getGhostAuthHeaders(ghost),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Ghost history request failed with status ${response.status}.`);
+  }
+
+  return await response.json() as HistoryResponse;
+};
+
+export const reloadGhost = async (name: string): Promise<void> => {
+  const state = await loadState();
+  const ghost = getGhostFromState(state, name);
+  if (ghost.status !== 'running') {
+    throw new Error(`Ghost "${name}" is not running.`);
+  }
+
+  const response = await fetch(`http://localhost:${ghost.portBase}/reload`, {
+    method: 'POST',
+    headers: {
+      ...getGhostAuthHeaders(ghost),
+    },
+  });
+
+  if (response.ok) {
+    return;
+  }
+
+  let message = `Ghost reload failed with status ${response.status}.`;
+
+  try {
+    const payload = (await response.json()) as { error?: unknown };
+    if (typeof payload.error === 'string' && payload.error.length > 0) {
+      message = payload.error;
+    }
+  } catch {
+    // Ignore invalid JSON error payloads.
+  }
+
+  throw new Error(message);
+};
+
+export const compactGhost = async (name: string): Promise<void> => {
+  const state = await loadState();
+  const ghost = getGhostFromState(state, name);
+  if (ghost.status !== 'running') {
+    throw new Error(`Ghost "${name}" is not running.`);
+  }
+
+  const response = await fetch(`http://localhost:${ghost.portBase}/compact`, {
+    method: 'POST',
+    headers: {
+      ...getGhostAuthHeaders(ghost),
+    },
+  });
+
+  if (response.ok) {
+    return;
+  }
+
+  let message = `Ghost compact failed with status ${response.status}.`;
+
+  try {
+    const payload = (await response.json()) as { error?: unknown };
+    if (typeof payload.error === 'string' && payload.error.length > 0) {
+      message = payload.error;
+    }
+  } catch {
+    // Ignore invalid JSON error payloads.
+  }
+
+  throw new Error(message);
 };
 
 export const removeGhost = async (name: string): Promise<void> => {

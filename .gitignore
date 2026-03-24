@@ -3,4 +3,7 @@ dist/
 docker/ghost-server.js
 .env
 *.tmp
+.tmp/
 .DS_Store
+handoffs/
+native/Ghostbox.xcodeproj/

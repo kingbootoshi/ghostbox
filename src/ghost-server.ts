@@ -9,7 +9,7 @@ import {
   ModelRegistry,
   SessionManager,
 } from '@mariozechner/pi-coding-agent';
-import type { GhostMessage } from './types';
+import type { GhostMessage, HistoryMessage } from './types';
 
 const defaultSystemPrompt =
   'You are a ghost agent. Your vault at /vault is your persistent memory. Write important findings to /vault/knowledge/. Keep /vault/CLAUDE.md updated. Create tools in /vault/code/tools/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
@@ -29,6 +29,8 @@ type PiModel = {
 type PiAgentMessage = {
   role?: string;
   content?: unknown;
+  timestamp?: number | string;
+  toolName?: string;
 };
 
 type PiAgentEvent = {
@@ -126,6 +128,151 @@ const getAssistantText = (content: unknown): string => {
       return candidate.text;
     })
     .join('');
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+  return typeof value === 'object' && value !== null;
+};
+
+const summarizeValue = (value: unknown): string => {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (value === null || value === undefined) {
+    return '';
+  }
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+};
+
+const getContentText = (content: unknown): string => {
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  return getAssistantText(content);
+};
+
+const getContentSummary = (content: unknown): string => {
+  const text = getContentText(content);
+  if (text) {
+    return text;
+  }
+
+  return summarizeValue(content);
+};
+
+const getMessageTimestamp = (message: PiAgentMessage): string | undefined => {
+  const { timestamp } = message;
+
+  if (typeof timestamp === 'number' && Number.isFinite(timestamp)) {
+    return new Date(timestamp).toISOString();
+  }
+
+  if (typeof timestamp !== 'string' || timestamp.trim().length === 0) {
+    return undefined;
+  }
+
+  const parsed = Number(timestamp);
+  if (Number.isFinite(parsed)) {
+    return new Date(parsed).toISOString();
+  }
+
+  return timestamp;
+};
+
+const createHistoryMessage = (
+  role: HistoryMessage['role'],
+  text: string,
+  options?: { allowEmptyText?: boolean; toolName?: string; timestamp?: string },
+): HistoryMessage | null => {
+  const trimmedText = text.trim();
+  if (!trimmedText && options?.allowEmptyText !== true) {
+    return null;
+  }
+
+  return {
+    role,
+    text: trimmedText,
+    ...(options?.toolName ? { toolName: options.toolName } : {}),
+    ...(options?.timestamp ? { timestamp: options.timestamp } : {}),
+  };
+};
+
+const getHistoryMessages = (messages: PiAgentMessage[]): HistoryMessage[] => {
+  return messages.flatMap((message) => {
+    const timestamp = getMessageTimestamp(message);
+    const toolName = typeof message.toolName === 'string' ? message.toolName : undefined;
+
+    if (message.role === 'user' || message.role === 'system') {
+      const historyMessage = createHistoryMessage(message.role, getContentText(message.content), {
+        timestamp,
+      });
+      return historyMessage ? [historyMessage] : [];
+    }
+
+    if (message.role === 'assistant') {
+      const historyMessages: HistoryMessage[] = [];
+      const assistantMessage = createHistoryMessage(
+        'assistant',
+        getContentText(message.content),
+        { timestamp },
+      );
+
+      if (assistantMessage) {
+        historyMessages.push(assistantMessage);
+      }
+
+      if (Array.isArray(message.content)) {
+        for (const block of message.content) {
+          if (!isRecord(block) || block.type !== 'toolCall') {
+            continue;
+          }
+
+          const toolUseMessage = createHistoryMessage(
+            'tool_use',
+            summarizeValue(block.arguments),
+            {
+              allowEmptyText: true,
+              toolName: typeof block.name === 'string' ? block.name : undefined,
+              timestamp,
+            },
+          );
+
+          if (toolUseMessage) {
+            historyMessages.push(toolUseMessage);
+          }
+        }
+      }
+
+      return historyMessages;
+    }
+
+    if (message.role === 'toolResult' || message.role === 'tool_result') {
+      const historyMessage = createHistoryMessage(
+        'tool_result',
+        getContentSummary(message.content),
+        { allowEmptyText: true, toolName, timestamp },
+      );
+      return historyMessage ? [historyMessage] : [];
+    }
+
+    if (message.role === 'toolUse' || message.role === 'tool_use') {
+      const historyMessage = createHistoryMessage(
+        'tool_use',
+        getContentSummary(message.content),
+        { allowEmptyText: true, toolName, timestamp },
+      );
+      return historyMessage ? [historyMessage] : [];
+    }
+
+    return [];
+  });
 };
 
 const parseModelRef = (value: string): { provider: string; modelId: string } => {
@@ -362,6 +509,40 @@ const handleReload = async (res: ServerResponse): Promise<void> => {
   }
 };
 
+const handleHistory = (res: ServerResponse): void => {
+  try {
+    const messages = getHistoryMessages(session.messages);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ messages }));
+  } catch (error) {
+    log.error('Pi history failed', serializeError(error));
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        error: error instanceof Error ? error.message : 'History failed',
+      }),
+    );
+  }
+};
+
+const handleCompact = async (res: ServerResponse): Promise<void> => {
+  try {
+    log.info('Pi compact start', { sessionId: session.sessionId });
+    await runQueued(() => session.compact());
+    log.info('Pi compact complete', { sessionId: session.sessionId });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'compacted' }));
+  } catch (error) {
+    log.error('Pi compact failed', serializeError(error));
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        error: error instanceof Error ? error.message : 'Compaction failed',
+      }),
+    );
+  }
+};
+
 const handleRequest = async (
   req: IncomingMessage,
   res: ServerResponse,
@@ -396,8 +577,20 @@ const handleRequest = async (
     return;
   }
 
+  if (req.method === 'GET' && req.url === '/history') {
+    handleHistory(res);
+    log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
+    return;
+  }
+
   if (req.method === 'POST' && req.url === '/reload') {
     await handleReload(res);
+    log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/compact') {
+    await handleCompact(res);
     log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
     return;
   }

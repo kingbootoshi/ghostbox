@@ -7,6 +7,14 @@ export interface GhostApiKey {
   createdAt: string;
 }
 
+export interface VaultEntry {
+  name: string;
+  path: string;
+  type: 'file' | 'directory';
+  size?: number;
+  modified?: string;
+}
+
 export interface GhostState {
   containerId: string;
   portBase: number;
@@ -57,6 +65,17 @@ export type ResultMessage = {
   type: 'result';
   text: string;
   sessionId: string;
+};
+
+export type HistoryMessage = {
+  role: 'user' | 'assistant' | 'system' | 'tool_use' | 'tool_result';
+  text: string;
+  toolName?: string;
+  timestamp?: string;
+};
+
+export type HistoryResponse = {
+  messages: HistoryMessage[];
 };
 
 export type GhostMessage =

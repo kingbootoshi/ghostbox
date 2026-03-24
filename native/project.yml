@@ -1,0 +1,36 @@
+name: Ghostbox
+options:
+  bundleIdPrefix: com.ghostbox
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "16.0"
+  minimumXcodeGenVersion: "2.40.0"
+
+targets:
+  Ghostbox:
+    type: application
+    platform: macOS
+    sources:
+      - Sources
+      - path: Resources/Animations
+        buildPhase: resources
+        type: folder
+      - path: Resources/Fonts
+        buildPhase: resources
+        type: folder
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ghostbox.app
+        PRODUCT_NAME: Ghostbox
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        SWIFT_VERSION: "5.9"
+        INFOPLIST_FILE: ""
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_LSUIElement: YES
+        INFOPLIST_KEY_NSMainStoryboardFile: ""
+        INFOPLIST_KEY_NSPrincipalClass: NSApplication
+        CODE_SIGN_ENTITLEMENTS: ""
+        ENABLE_HARDENED_RUNTIME: NO
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Ghostbox connects to the local Ghostbox API server"

@@ -69,10 +69,14 @@ declare module '@mariozechner/pi-coding-agent' {
   export class AgentSession {
     readonly sessionId: string;
     readonly modelRegistry: ModelRegistry;
+    readonly messages: PiAgentMessage[];
+    readonly state: { messages: PiAgentMessage[] };
+    readonly sessionFile: string | undefined;
     subscribe(listener: (event: PiAgentSessionEvent) => void): () => void;
     prompt(text: string): Promise<void>;
     setModel(model: PiModel): Promise<void>;
     reload(): Promise<void>;
+    compact(customInstructions?: string): Promise<void>;
   }
 
   export const codingTools: unknown[];
