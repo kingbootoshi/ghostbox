@@ -7,6 +7,10 @@ final class AgentChatViewModel: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var preCompactionMessages: [ChatMessage] = []
     @Published var showingPreCompactionMessages = false
+    @Published var visiblePreCompactionCount = 0
+    @Published private(set) var compactionSummary: String?
+
+    static let olderMessagesBatchSize = 25
     @Published var inputText = ""
     @Published var isStreaming = false
     @Published private(set) var isLoadingHistory = false
@@ -192,17 +196,51 @@ final class AgentChatViewModel: ObservableObject {
 
         do {
             let history = try await client.getHistory(ghostName: ghostName)
-            messages = history.map { message in
-                ChatMessage(
-                    role: mapRole(message.role),
-                    content: message.text,
-                    timestamp: parseTimestamp(message.timestamp),
-                    toolName: message.toolName
-                )
+            messages = history.messages.map { historyMessageToChatMessage($0) }
+            preCompactionMessages = history.preCompactionMessages.map { historyMessageToChatMessage($0) }
+            compactionSummary = history.compactions.last?.summary
+            visiblePreCompactionCount = 0
+            showingPreCompactionMessages = false
+
+            if !history.compactions.isEmpty && messages.isEmpty && !preCompactionMessages.isEmpty {
+                messages = [ChatMessage(role: .system, content: "Session compacted")]
             }
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    private func historyMessageToChatMessage(_ message: HistoryMessage) -> ChatMessage {
+        ChatMessage(
+            role: mapRole(message.role),
+            content: message.text,
+            timestamp: parseTimestamp(message.timestamp),
+            toolName: message.toolName
+        )
+    }
+
+    func showMoreOlderMessages() {
+        let newCount = min(
+            visiblePreCompactionCount + Self.olderMessagesBatchSize,
+            preCompactionMessages.count
+        )
+        visiblePreCompactionCount = newCount
+        showingPreCompactionMessages = newCount > 0
+    }
+
+    func hideOlderMessages() {
+        visiblePreCompactionCount = 0
+        showingPreCompactionMessages = false
+    }
+
+    var visiblePreCompactionMessages: [ChatMessage] {
+        guard visiblePreCompactionCount > 0 else { return [] }
+        let startIndex = max(0, preCompactionMessages.count - visiblePreCompactionCount)
+        return Array(preCompactionMessages[startIndex...])
+    }
+
+    var hasMoreOlderMessages: Bool {
+        visiblePreCompactionCount < preCompactionMessages.count
     }
 
     func handleCompaction() async {
@@ -210,11 +248,7 @@ final class AgentChatViewModel: ObservableObject {
     }
 
     private func handleCompaction(compactResponseMessageID: UUID?) async {
-        preCompactionMessages = messages.filter { message in
-            message.id != compactResponseMessageID
-        }
         showingPreCompactionMessages = false
-        messages = [ChatMessage(role: .system, content: "Session compacted")]
         await loadHistory()
     }
 

@@ -95,8 +95,16 @@ export type HistoryMessage = {
   timestamp?: string;
 };
 
+export type CompactionInfo = {
+  timestamp: string;
+  summary: string;
+  tokensBefore: number;
+};
+
 export type HistoryResponse = {
   messages: HistoryMessage[];
+  preCompactionMessages: HistoryMessage[];
+  compactions: CompactionInfo[];
 };
 
 export type GhostMessage =

@@ -29,7 +29,7 @@ struct SpawnFormView: View {
                 .colorScheme(.dark)
 
                 fieldLabel("Model")
-                formField("claude-sonnet-4-20250514", text: $model)
+                formField("claude-sonnet-4-6", text: $model)
 
                 fieldLabel("System Prompt")
                 TextEditor(text: $systemPrompt)

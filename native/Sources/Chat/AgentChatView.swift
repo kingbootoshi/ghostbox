@@ -21,14 +21,20 @@ struct AgentChatView: View {
             VStack(spacing: 0) {
                 header
 
-                if showsVaultBrowser {
+                ZStack {
+                    VStack(spacing: 0) {
+                        chatContent
+                        inputArea
+                    }
+                    .opacity(showsVaultBrowser ? 0 : 1)
+                    .allowsHitTesting(!showsVaultBrowser)
+
                     VaultBrowserView(
                         ghostName: viewModel.ghostName,
                         client: viewModel.ghostboxClient
                     )
-                } else {
-                    chatContent
-                    inputArea
+                    .opacity(showsVaultBrowser ? 1 : 0)
+                    .allowsHitTesting(showsVaultBrowser)
                 }
             }
 
@@ -128,12 +134,22 @@ struct AgentChatView: View {
                 } else {
                     LazyVStack(spacing: 20) {
                         if !viewModel.preCompactionMessages.isEmpty {
-                            olderMessagesToggle
-                        }
+                            if viewModel.hasMoreOlderMessages {
+                                showMoreButton
+                            }
 
-                        if viewModel.showingPreCompactionMessages {
-                            chatItemsSection(preCompactionDisplayItems)
-                            CompactionDivider()
+                            if viewModel.showingPreCompactionMessages {
+                                chatItemsSection(preCompactionDisplayItems)
+
+                                HStack(spacing: 12) {
+                                    hideOlderButton
+                                    if viewModel.hasMoreOlderMessages {
+                                        showMoreButton
+                                    }
+                                }
+                            }
+
+                            CompactionDivider(summary: viewModel.compactionSummary)
                         }
 
                         chatItemsSection(displayItems)
@@ -493,7 +509,7 @@ struct AgentChatView: View {
     }
 
     private var preCompactionDisplayItems: [ChatDisplayItem] {
-        displayItems(for: viewModel.preCompactionMessages)
+        displayItems(for: viewModel.visiblePreCompactionMessages)
     }
 
     private var fullscreenToolGroup: ToolCallGroup? {
@@ -523,31 +539,54 @@ struct AgentChatView: View {
                 )
             }
 
-            if index < items.count - 1 {
+            if index < items.count - 1, needsBreak(current: item, next: items[index + 1]) {
                 ExchangeBreak()
             }
         }
+    }
+
+    private func needsBreak(current: ChatDisplayItem, next: ChatDisplayItem) -> Bool {
+        let currentIsUser: Bool
+        if case .message(let msg) = current { currentIsUser = msg.role == .user } else { currentIsUser = false }
+
+        let nextIsUser: Bool
+        if case .message(let msg) = next { nextIsUser = msg.role == .user } else { nextIsUser = false }
+
+        return currentIsUser != nextIsUser
     }
 
     private func displayItems(for messages: [ChatMessage]) -> [ChatDisplayItem] {
         ChatDisplayItem.build(from: messages)
     }
 
-    private var olderMessagesToggle: some View {
-        Button {
+    private var showMoreButton: some View {
+        let remaining = viewModel.preCompactionMessages.count - viewModel.visiblePreCompactionCount
+        let batch = min(remaining, AgentChatViewModel.olderMessagesBatchSize)
+
+        return Button {
             withAnimation(.easeOut(duration: 0.18)) {
-                viewModel.showingPreCompactionMessages.toggle()
+                viewModel.showMoreOlderMessages()
             }
         } label: {
-            Text(
-                viewModel.showingPreCompactionMessages
-                    ? "Hide \(viewModel.preCompactionMessages.count) older messages"
-                    : "Show \(viewModel.preCompactionMessages.count) older messages"
-            )
-            .font(Theme.Typography.label())
-            .foregroundColor(Color.white.opacity(Theme.Text.secondary))
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 20)
+            Text("Show \(batch) older messages (\(remaining) total)")
+                .font(Theme.Typography.label())
+                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var hideOlderButton: some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.18)) {
+                viewModel.hideOlderMessages()
+            }
+        } label: {
+            Text("Hide older messages")
+                .font(Theme.Typography.label())
+                .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+                .padding(.horizontal, 20)
         }
         .buttonStyle(.plain)
     }
@@ -676,22 +715,31 @@ private enum ChatDisplayItem: Identifiable {
             let message = messages[index]
 
             if message.role == .toolUse {
-                let result: ChatMessage?
-                if index + 1 < messages.count, messages[index + 1].role == .toolResult {
-                    result = messages[index + 1]
-                    index += 1
-                } else {
-                    result = nil
+                var toolUses: [ChatMessage] = [message]
+                var next = index + 1
+                while next < messages.count, messages[next].role == .toolUse {
+                    toolUses.append(messages[next])
+                    next += 1
                 }
 
-                items.append(.toolGroup(ToolCallGroup(toolUse: message, toolResult: result)))
+                var toolResults: [ChatMessage] = []
+                while next < messages.count, messages[next].role == .toolResult {
+                    toolResults.append(messages[next])
+                    next += 1
+                }
+
+                for (i, toolUse) in toolUses.enumerated() {
+                    let toolResult = i < toolResults.count ? toolResults[i] : nil
+                    items.append(.toolGroup(ToolCallGroup(toolUse: toolUse, toolResult: toolResult)))
+                }
+
+                index = next
             } else if message.role == .toolResult {
-                items.append(.message(message))
+                index += 1
             } else {
                 items.append(.message(message))
+                index += 1
             }
-
-            index += 1
         }
 
         return items
@@ -790,19 +838,35 @@ private struct ChatHeaderButton: View {
 }
 
 private struct CompactionDivider: View {
+    let summary: String?
+
     var body: some View {
-        HStack(spacing: 12) {
-            Rectangle()
-                .fill(Color.white.opacity(0.15))
-                .frame(height: 1)
+        VStack(spacing: 8) {
+            HStack(spacing: 12) {
+                Rectangle()
+                    .fill(Color.white.opacity(0.15))
+                    .frame(height: 1)
 
-            Text("Compacted")
-                .font(Theme.Typography.caption(weight: .medium))
-                .foregroundColor(Color.white.opacity(0.15))
+                Text("Session Compacted")
+                    .font(Theme.Typography.caption(weight: .medium))
+                    .foregroundColor(Color.white.opacity(0.25))
 
-            Rectangle()
-                .fill(Color.white.opacity(0.15))
-                .frame(height: 1)
+                Rectangle()
+                    .fill(Color.white.opacity(0.15))
+                    .frame(height: 1)
+            }
+
+            if let summary, !summary.isEmpty {
+                Text(summary)
+                    .font(Theme.Typography.caption())
+                    .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+                    .lineLimit(4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.02))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
         }
         .padding(.horizontal, 20)
     }
@@ -824,11 +888,8 @@ private struct AgentMessageBlock: View {
                 .font(Theme.Typography.label(weight: .semibold))
                 .foregroundColor(senderColor)
 
-            Text(message.content)
-                .font(Theme.Typography.body())
-                .foregroundColor(contentColor)
+            markdownContent
                 .textSelection(.enabled)
-                .lineSpacing(5.6)
                 .fixedSize(horizontal: false, vertical: true)
 
             Text(Self.formatter.string(from: message.timestamp))
@@ -838,6 +899,22 @@ private struct AgentMessageBlock: View {
         }
         .frame(maxWidth: .infinity, alignment: message.role == .user ? .trailing : .leading)
         .padding(.horizontal, 20)
+    }
+
+    @ViewBuilder
+    private var markdownContent: some View {
+        if message.role == .ghost || message.role == .system,
+           let attributed = try? AttributedString(markdown: message.content, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
+            Text(attributed)
+                .font(Theme.Typography.body())
+                .foregroundColor(contentColor)
+                .lineSpacing(5.6)
+        } else {
+            Text(message.content)
+                .font(Theme.Typography.body())
+                .foregroundColor(contentColor)
+                .lineSpacing(5.6)
+        }
     }
 
     private var senderName: String {
@@ -958,7 +1035,7 @@ private struct ToolCallGroupBlock: View {
                 .padding(12)
                 .background(Color.white.opacity(0.05))
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(.opacity)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -988,11 +1065,11 @@ private struct ToolCallFullscreenOverlay: View {
     let onClose: () -> Void
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            Color.black.opacity(0.62)
+        ZStack {
+            Color(red: 0.02, green: 0.02, blue: 0.04).opacity(0.88)
                 .onTapGesture(perform: onClose)
 
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 10) {
                     Image(systemName: group.iconName)
                         .font(.system(size: Theme.FontSize.sm, weight: .medium))
@@ -1014,23 +1091,29 @@ private struct ToolCallFullscreenOverlay: View {
                             .font(.system(size: Theme.FontSize.sm, weight: .semibold))
                             .foregroundColor(Color.white.opacity(Theme.Text.secondary))
                             .frame(width: 28, height: 28)
-                            .background(Color.white.opacity(0.05))
+                            .background(Color.white.opacity(0.08))
                             .clipShape(Circle())
                     }
                     .buttonStyle(.plain)
                 }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 16)
+
+                Rectangle()
+                    .fill(Color.white.opacity(0.06))
+                    .frame(height: 1)
 
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 16) {
                         Text("Input")
                             .font(Theme.Typography.caption(weight: .semibold))
-                            .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+                            .foregroundColor(Theme.Colors.accentLight.opacity(0.7))
 
                         Text(group.toolUse.content)
                             .font(Theme.Typography.mono())
-                            .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                            .foregroundColor(Color.white.opacity(Theme.Text.primary))
                             .textSelection(.enabled)
-                            .lineSpacing(4)
+                            .lineSpacing(5)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .fixedSize(horizontal: false, vertical: true)
 
@@ -1038,26 +1121,33 @@ private struct ToolCallFullscreenOverlay: View {
                             Rectangle()
                                 .fill(Color.white.opacity(0.06))
                                 .frame(height: 1)
+                                .padding(.vertical, 4)
 
                             Text("Output")
                                 .font(Theme.Typography.caption(weight: .semibold))
-                                .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+                                .foregroundColor(Theme.Colors.accentLight.opacity(0.7))
 
                             Text(toolResult.content)
                                 .font(Theme.Typography.mono())
-                                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                                .foregroundColor(Color.white.opacity(Theme.Text.primary))
                                 .textSelection(.enabled)
-                                .lineSpacing(4)
+                                .lineSpacing(5)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
-                    .padding(18)
+                    .padding(20)
                 }
-                .background(Color.white.opacity(0.05))
-                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
             }
-            .padding(18)
+            .background(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color(red: 0.06, green: 0.06, blue: 0.08).opacity(0.96))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .strokeBorder(Theme.Colors.accentLight.opacity(0.12), lineWidth: 0.5)
+            )
+            .padding(14)
         }
     }
 }

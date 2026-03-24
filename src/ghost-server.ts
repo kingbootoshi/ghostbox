@@ -9,7 +9,7 @@ import {
   ModelRegistry,
   SessionManager,
 } from '@mariozechner/pi-coding-agent';
-import type { GhostMessage, HistoryMessage } from './types';
+import type { CompactionInfo, GhostMessage, HistoryMessage } from './types';
 
 const defaultSystemPrompt =
   'You are a ghost agent. Your vault at /vault is your persistent memory. Write important findings to /vault/knowledge/. Keep /vault/CLAUDE.md updated. Create tools in /vault/code/tools/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
@@ -680,9 +680,54 @@ const handleReload = async (res: ServerResponse): Promise<void> => {
 
 const handleHistory = (res: ServerResponse): void => {
   try {
-    const messages = getHistoryMessages(session.messages);
+    const entries = sessionManager.getEntries();
+
+    let lastCompactionIndex = -1;
+    const compactions: CompactionInfo[] = [];
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      if (entry.type === 'compaction') {
+        lastCompactionIndex = i;
+        const compactionEntry = entry as unknown as {
+          timestamp: string;
+          summary: string;
+          tokensBefore: number;
+        };
+        compactions.push({
+          timestamp: compactionEntry.timestamp,
+          summary: compactionEntry.summary,
+          tokensBefore: compactionEntry.tokensBefore,
+        });
+      }
+    }
+
+    const preCompactionPiMessages: PiAgentMessage[] = [];
+    const postCompactionPiMessages: PiAgentMessage[] = [];
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      if (entry.type !== 'message') {
+        continue;
+      }
+
+      const message = (entry as unknown as { message: PiAgentMessage }).message;
+
+      if (lastCompactionIndex >= 0 && i < lastCompactionIndex) {
+        preCompactionPiMessages.push(message);
+      } else {
+        postCompactionPiMessages.push(message);
+      }
+    }
+
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ messages }));
+    res.end(
+      JSON.stringify({
+        messages: getHistoryMessages(postCompactionPiMessages),
+        preCompactionMessages: getHistoryMessages(preCompactionPiMessages),
+        compactions,
+      }),
+    );
   } catch (error) {
     log.error('Pi history failed', serializeError(error));
     res.writeHead(500, { 'Content-Type': 'application/json' });

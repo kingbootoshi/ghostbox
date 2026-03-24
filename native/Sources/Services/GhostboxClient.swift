@@ -7,6 +7,18 @@ struct HistoryMessage: Decodable {
     let timestamp: String?
 }
 
+struct CompactionInfo: Decodable {
+    let timestamp: String
+    let summary: String
+    let tokensBefore: Int
+}
+
+struct HistoryData {
+    let messages: [HistoryMessage]
+    let preCompactionMessages: [HistoryMessage]
+    let compactions: [CompactionInfo]
+}
+
 struct VaultEntry: Decodable, Identifiable {
     let name: String
     let path: String
@@ -119,10 +131,14 @@ final class GhostboxClient {
         _ = try await perform(request)
     }
 
-    func getHistory(ghostName: String) async throws -> [HistoryMessage] {
+    func getHistory(ghostName: String) async throws -> HistoryData {
         let request = makeRequest(path: ["api", "ghosts", ghostName, "history"])
         let response = try await decodeResponse(for: request, as: HistoryResponse.self)
-        return response.messages
+        return HistoryData(
+            messages: response.messages,
+            preCompactionMessages: response.preCompactionMessages ?? [],
+            compactions: response.compactions ?? []
+        )
     }
 
     func compactGhost(name: String) async throws {
@@ -448,6 +464,8 @@ final class GhostboxClient {
 
 private struct HistoryResponse: Decodable {
     let messages: [HistoryMessage]
+    let preCompactionMessages: [HistoryMessage]?
+    let compactions: [CompactionInfo]?
 }
 
 private struct CompactResponse: Decodable {
