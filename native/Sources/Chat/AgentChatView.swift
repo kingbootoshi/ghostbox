@@ -86,8 +86,15 @@ struct AgentChatView: View {
             handleInputTextChanged()
         }
         .onKeyPress(.escape, action: handleEscapeKey)
-        .onKeyPress(phases: [.down]) { keyPress in
-            handlePanelShortcut(keyPress)
+        .onReceive(NotificationCenter.default.publisher(for: .toggleGhostChatFiles)) { notification in
+            guard let name = notification.userInfo?["ghostName"] as? String,
+                  name == viewModel.ghostName else { return }
+            toggleVaultBrowser()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .toggleGhostHotkeyHelp)) { notification in
+            guard let name = notification.userInfo?["ghostName"] as? String,
+                  name == viewModel.ghostName else { return }
+            toggleHotkeyHelp()
         }
     }
 
@@ -399,27 +406,13 @@ struct AgentChatView: View {
     private func handleEscapeKey() -> KeyPress.Result {
         if showHotkeyHelp {
             dismissHotkeyHelp()
-        } else {
-            closeCurrentPanel()
+            return .handled
         }
 
-        return .handled
+        return .ignored
     }
 
-    private func handlePanelShortcut(_ keyPress: KeyPress) -> KeyPress.Result {
-        guard keyPress.modifiers == [.command] else { return .ignored }
-
-        switch keyPress.characters {
-        case "\\":
-            toggleVaultBrowser()
-            return .handled
-        case "/":
-            toggleHotkeyHelp()
-            return .handled
-        default:
-            return .ignored
-        }
-    }
+    // Panel shortcuts (Cmd+\, Cmd+/) handled by GlassPanel.keyDown via NotificationCenter
 
     private func handleInputTextChanged() {
         isSlashCommandPopupVisible = slashAutocompleteQuery != nil
@@ -649,7 +642,7 @@ private enum ShortcutItem: String, CaseIterable, Identifiable {
         case .toggleGhostbox:
             return "Toggle Ghostbox"
         case .toggleChatFiles:
-            return "Toggle Chat/Files"
+            return "Switch to Chat / Files"
         case .showHelp:
             return "Show this help"
         case .closePanel:
@@ -764,6 +757,8 @@ private struct ToolCallGroup: Identifiable {
 
 extension Notification.Name {
     static let resizeGhostChatPanel = Notification.Name("resizeGhostChatPanel")
+    static let toggleGhostChatFiles = Notification.Name("toggleGhostChatFiles")
+    static let toggleGhostHotkeyHelp = Notification.Name("toggleGhostHotkeyHelp")
 }
 
 private struct ChatHeaderButton: View {

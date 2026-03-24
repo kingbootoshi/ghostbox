@@ -164,6 +164,30 @@ class GlassPanel: NSPanel {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+        if flags == [.command], event.charactersIgnoringModifiers == "\\" {
+            NotificationCenter.default.post(
+                name: .toggleGhostChatFiles,
+                object: nil,
+                userInfo: ["ghostName": title]
+            )
+            return true
+        }
+
+        if flags == [.command], event.charactersIgnoringModifiers == "/" {
+            NotificationCenter.default.post(
+                name: .toggleGhostHotkeyHelp,
+                object: nil,
+                userInfo: ["ghostName": title]
+            )
+            return true
+        }
+
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 struct BorderlessGlass<Content: View>: View {
