@@ -94,6 +94,26 @@ struct GhostboxMessageImage: Encodable {
     let data: String
 }
 
+struct SteerResponse: Decodable {
+    let status: String
+    let pendingCount: Int
+}
+
+struct QueueStatus: Decodable {
+    let steering: [String]
+    let followUp: [String]
+    let pendingCount: Int
+}
+
+struct ClearQueueResponse: Decodable {
+    let cleared: ClearedQueues
+
+    struct ClearedQueues: Decodable {
+        let steering: [String]
+        let followUp: [String]
+    }
+}
+
 final class GhostboxClient {
     private static let logger = Logger(subsystem: "com.ghostbox.app", category: "network")
 
@@ -233,6 +253,39 @@ final class GhostboxClient {
         _ = try await perform(request)
     }
 
+    func steerGhost(
+        name: String,
+        prompt: String,
+        images: [GhostboxMessageImage]? = nil
+    ) async throws -> SteerResponse {
+        struct SteerRequest: Encodable {
+            let prompt: String
+            let images: [GhostboxMessageImage]?
+        }
+
+        let body = try encoder.encode(SteerRequest(prompt: prompt, images: images))
+        let request = makeRequest(
+            path: ["api", "ghosts", name, "steer"],
+            method: "POST",
+            body: body
+        )
+        return try await decodeResponse(for: request, as: SteerResponse.self)
+    }
+
+    func getGhostQueue(name: String) async throws -> QueueStatus {
+        let request = makeRequest(path: ["api", "ghosts", name, "queue"])
+        return try await decodeResponse(for: request, as: QueueStatus.self)
+    }
+
+    func clearGhostQueue(name: String) async throws -> ClearQueueResponse {
+        let request = makeRequest(
+            path: ["api", "ghosts", name, "clear-queue"],
+            method: "POST",
+            body: Data("{}".utf8)
+        )
+        return try await decodeResponse(for: request, as: ClearQueueResponse.self)
+    }
+
     func fetchStats(ghostName: String) async throws -> GhostStats {
         let request = makeRequest(path: ["api", "ghosts", ghostName, "stats"])
         return try await decodeResponse(for: request, as: GhostStats.self)
@@ -268,12 +321,14 @@ final class GhostboxClient {
         ghostName: String,
         prompt: String,
         model: String? = nil,
-        images: [GhostboxMessageImage]? = nil
+        images: [GhostboxMessageImage]? = nil,
+        streamingBehavior: String? = nil
     ) -> AsyncThrowingStream<GhostMessage, Error> {
         struct SendMessageRequest: Encodable {
             let prompt: String
             let model: String?
             let images: [GhostboxMessageImage]?
+            let streamingBehavior: String?
         }
 
         return AsyncThrowingStream { continuation in
@@ -283,7 +338,8 @@ final class GhostboxClient {
                         SendMessageRequest(
                             prompt: prompt,
                             model: model,
-                            images: images
+                            images: images,
+                            streamingBehavior: streamingBehavior
                         )
                     )
                     var request = makeRequest(

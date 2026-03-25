@@ -85,12 +85,17 @@ declare module '@mariozechner/pi-coding-agent' {
     readonly messages: PiAgentMessage[];
     readonly state: { messages: PiAgentMessage[] };
     readonly sessionFile: string | undefined;
+    readonly pendingMessageCount: number;
     subscribe(listener: (event: PiAgentSessionEvent) => void): () => void;
     prompt(text: string, options?: {
       images?: Array<{ type: 'image'; mimeType: string; data: string }>;
       streamingBehavior?: 'steer' | 'followUp';
       source?: string;
     }): Promise<void>;
+    steer(
+      text: string,
+      images?: Array<{ type: 'image'; mimeType: string; data: string }>,
+    ): Promise<void>;
     setModel(model: PiModel): Promise<void>;
     reload(): Promise<void>;
     compact(customInstructions?: string): Promise<void>;
@@ -100,6 +105,8 @@ declare module '@mariozechner/pi-coding-agent' {
       setup?: (sessionManager: SessionManager) => Promise<void>;
     }): Promise<boolean>;
     clearQueue(): { steering: string[]; followUp: string[] };
+    getSteeringMessages(): string[];
+    getFollowUpMessages(): string[];
     getSessionStats(): SessionStats;
     getContextUsage(): ContextUsage | null;
   }

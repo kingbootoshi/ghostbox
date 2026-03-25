@@ -48,6 +48,15 @@ struct AgentChatView: View {
                             onPasteCommand: viewModel.addImageFromPasteboard,
                             onSubmit: submitInput
                         )
+                        .overlay(alignment: .bottomTrailing) {
+                            if !viewModel.queuedMessages.isEmpty {
+                                queueIndicator
+                                    .padding(.trailing, 20)
+                                    .padding(.bottom, 44)
+                                    .transition(.opacity.combined(with: .move(edge: .trailing)))
+                            }
+                        }
+                        .animation(.easeOut(duration: 0.15), value: viewModel.queuedMessages.count)
                     }
                     .opacity(showsVaultBrowser ? 0 : 1)
                     .allowsHitTesting(!showsVaultBrowser)
@@ -242,6 +251,22 @@ struct AgentChatView: View {
         case .none:
             return Color.white.opacity(Theme.Text.quaternary)
         }
+    }
+
+    private var queueIndicator: some View {
+        Text("\(viewModel.queuedMessages.count) queued")
+            .font(Theme.Typography.caption(weight: .medium))
+            .foregroundColor(Theme.Colors.accentLightest)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Theme.Colors.accent.opacity(0.18))
+            .overlay {
+                RoundedRectangle(cornerRadius: 999, style: .continuous)
+                    .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 999, style: .continuous))
+            .shadow(color: Theme.Colors.accent.opacity(0.12), radius: 16, x: 0, y: 8)
+            .allowsHitTesting(false)
     }
 
     private func toggleToolMessage(_ id: UUID) {

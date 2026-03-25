@@ -12,6 +12,26 @@ export interface GhostImage {
   data: string;
 }
 
+export type GhostStreamingBehavior = 'steer' | 'followUp';
+
+export interface GhostQueueState {
+  steering: string[];
+  followUp: string[];
+  pendingCount: number;
+}
+
+export interface GhostQueueEnqueueResponse {
+  status: 'queued';
+  pendingCount: number;
+}
+
+export interface GhostQueueClearResponse {
+  cleared: {
+    steering: string[];
+    followUp: string[];
+  };
+}
+
 export interface VaultEntry {
   name: string;
   path: string;
@@ -25,6 +45,7 @@ export interface GhostState {
   portBase: number;
   model: string;
   provider: string;
+  imageVersion: string;
   status: GhostStatus;
   createdAt: string;
   systemPrompt: string | null;
@@ -38,6 +59,7 @@ export interface GhostboxConfig {
   defaultModel: string;
   defaultProvider: string;
   imageName: string;
+  imageVersion: string;
   observerModel: string;
 }
 
@@ -60,6 +82,7 @@ export type GhostboxConfigUpdate = Partial<{
   defaultModel: string;
   defaultProvider: string;
   imageName: string;
+  imageVersion: string;
   observerModel: string;
 }>;
 

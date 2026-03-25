@@ -1,0 +1,46 @@
+# Agents Log
+
+## Session: 2026-03-24T11:30:00Z
+Goal: De-slopify native macOS app - structural refactoring with zero visual changes
+
+### Spawned: 5a524bf3 - 11:30
+Type: implementation
+Prompt: Split AgentChatView.swift monolith (1641 lines) into ~10 focused files
+Sandbox: workspace-write
+Files target: native/Sources/Chat/
+
+### Spawned: 9af6779d - 11:30
+Type: implementation
+Prompt: Split HubView.swift (723 lines) into focused files + clean GhostboxClient.swift (extract SSE parser, replace print with os.Logger)
+Sandbox: workspace-write
+Files target: native/Sources/Hub/, native/Sources/Services/
+
+## Session: 2026-03-25T07:00:00Z
+Goal: Implement `ghostbox upgrade` with version tracking and rolling restarts
+
+### Spawned: 886dd44d - 07:00
+Type: research
+Prompt: Scope implementation of upgrade command - read CLI, orchestrator, types, Dockerfile. Propose plan.
+Reasoning: high
+Sandbox: read-only
+
+### Complete: 886dd44d - 07:24
+Findings:
+- CLI uses simple switch pattern, upgrade fits cleanly as new case
+- No version tracking exists - GhostState and GhostboxConfig need imageVersion field
+- ensureGhostPiAgent only copies auth if missing - needs force copy for upgrade
+- init builds image but doesn't compute/store version hash
+- list only gets ghost map, needs config access for stale detection
+- State normalization needs backfill for new version fields
+Gotchas: init writes state before build, failed wake leaves stale containerId, auth refresh needed
+
+### Synthesis - 07:25
+Approach: 9-point implementation plan covering types, hash computation, state normalization,
+stamp on spawn/wake, auth refresh helper, upgrade function, CLI command, list enhancement, init update.
+All changes follow existing patterns. Reuses killGhost/wakeGhost for rolling restart.
+
+### Spawned: d8d3a8c4 - 07:25
+Type: implementation
+Prompt: Full 9-point spec for upgrade command with version tracking
+Reasoning: high
+Sandbox: workspace-write

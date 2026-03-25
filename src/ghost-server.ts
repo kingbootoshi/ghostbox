@@ -11,7 +11,14 @@ import {
   ModelRegistry,
   SessionManager,
 } from '@mariozechner/pi-coding-agent';
-import type { CompactionInfo, GhostImage, GhostMessage, HistoryMessage } from './types';
+import type {
+  CompactionInfo,
+  GhostImage,
+  GhostMessage,
+  GhostQueueState,
+  GhostStreamingBehavior,
+  HistoryMessage,
+} from './types';
 
 const defaultSystemPrompt =
   'You are a ghost agent. Your vault at /vault is your persistent memory. Use `ghost-memory` to save/search facts and index vault files. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
@@ -894,11 +901,46 @@ const toPiPromptImages = (images: GhostImage[] | undefined): PiPromptImage[] | u
   }));
 };
 
+const isStreamingBehavior = (value: unknown): value is GhostStreamingBehavior => {
+  return value === 'steer' || value === 'followUp';
+};
+
+const parseRequestImages = (
+  imagesValue: unknown,
+): { images?: GhostImage[]; error?: string } => {
+  if (imagesValue === undefined) {
+    return {};
+  }
+
+  if (!Array.isArray(imagesValue)) {
+    return { error: 'Invalid images' };
+  }
+
+  const images: GhostImage[] = [];
+
+  for (const image of imagesValue) {
+    if (!image || typeof image !== 'object') {
+      return { error: 'Invalid images' };
+    }
+
+    const { mediaType, data } = image as { mediaType?: unknown; data?: unknown };
+
+    if (typeof mediaType !== 'string' || typeof data !== 'string') {
+      return { error: 'Invalid images' };
+    }
+
+    images.push({ mediaType, data });
+  }
+
+  return { images };
+};
+
 const streamPrompt = async (
   res: ServerResponse,
   prompt: string,
   modelValue?: string,
   images?: GhostImage[],
+  streamingBehavior?: GhostStreamingBehavior,
 ): Promise<void> => {
   startNdjsonResponse(res);
 
@@ -999,6 +1041,18 @@ const streamPrompt = async (
 
   try {
     const transformedImages = toPiPromptImages(images);
+    const promptOptions: {
+      images?: PiPromptImage[];
+      streamingBehavior?: GhostStreamingBehavior;
+    } = {};
+
+    if (transformedImages && transformedImages.length > 0) {
+      promptOptions.images = transformedImages;
+    }
+
+    if (streamingBehavior) {
+      promptOptions.streamingBehavior = streamingBehavior;
+    }
 
     log.info('Pi prompt start', {
       sessionId: session.sessionId,
@@ -1007,8 +1061,8 @@ const streamPrompt = async (
       preview: prompt.slice(0, 200),
     });
 
-    if (transformedImages && transformedImages.length > 0) {
-      await session.prompt(prompt, { images: transformedImages });
+    if (promptOptions.images || promptOptions.streamingBehavior) {
+      await session.prompt(prompt, promptOptions);
     } else {
       await session.prompt(prompt);
     }
@@ -1158,6 +1212,84 @@ const streamSlashCommand = async (
   }
 };
 
+const handleSteer = async (
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> => {
+  const bodyText = await getRequestBody(req);
+  let body: unknown;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+    return;
+  }
+
+  const requestBody =
+    typeof body === 'object' && body !== null
+      ? (body as { prompt?: unknown; images?: unknown })
+      : {};
+
+  if (typeof requestBody.prompt !== 'string') {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Missing prompt' }));
+    return;
+  }
+
+  const { images, error } = parseRequestImages(requestBody.images);
+
+  if (error) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error }));
+    return;
+  }
+
+  try {
+    await session.steer(requestBody.prompt, toPiPromptImages(images));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        status: 'queued',
+        pendingCount: session.pendingMessageCount,
+      }),
+    );
+  } catch (error) {
+    log.error('Pi steer failed', serializeError(error));
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Steer failed' }));
+  }
+};
+
+const handleQueue = (res: ServerResponse): void => {
+  try {
+    const queueState = {
+      steering: session.getSteeringMessages(),
+      followUp: session.getFollowUpMessages(),
+      pendingCount: session.pendingMessageCount,
+    } satisfies GhostQueueState;
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(queueState));
+  } catch (error) {
+    log.error('Pi queue failed', serializeError(error));
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Queue failed' }));
+  }
+};
+
+const handleClearQueue = (res: ServerResponse): void => {
+  try {
+    const cleared = session.clearQueue();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ cleared }));
+  } catch (error) {
+    log.error('Pi clear queue failed', serializeError(error));
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Clear queue failed' }));
+  }
+};
+
 const handleMessage = async (
   req: IncomingMessage,
   res: ServerResponse,
@@ -1174,12 +1306,17 @@ const handleMessage = async (
 
   const requestBody =
     typeof body === 'object' && body !== null
-      ? (body as { prompt?: unknown; model?: unknown; images?: unknown })
+      ? (body as {
+          prompt?: unknown;
+          model?: unknown;
+          images?: unknown;
+          streamingBehavior?: unknown;
+        })
       : {};
 
   const prompt = requestBody.prompt;
   const model = typeof requestBody.model === 'string' ? requestBody.model : undefined;
-  const imagesValue = requestBody.images;
+  const streamingBehaviorValue = requestBody.streamingBehavior;
 
   if (typeof prompt !== 'string') {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1187,33 +1324,18 @@ const handleMessage = async (
     return;
   }
 
-  if (imagesValue !== undefined && !Array.isArray(imagesValue)) {
+  if (streamingBehaviorValue !== undefined && !isStreamingBehavior(streamingBehaviorValue)) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Invalid images' }));
+    res.end(JSON.stringify({ error: 'Invalid streamingBehavior' }));
     return;
   }
 
-  let images: GhostImage[] | undefined;
-  if (Array.isArray(imagesValue)) {
-    images = [];
+  const { images, error } = parseRequestImages(requestBody.images);
 
-    for (const image of imagesValue) {
-      if (!image || typeof image !== 'object') {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid images' }));
-        return;
-      }
-
-      const { mediaType, data } = image as { mediaType?: unknown; data?: unknown };
-
-      if (typeof mediaType !== 'string' || typeof data !== 'string') {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid images' }));
-        return;
-      }
-
-      images.push({ mediaType, data });
-    }
+  if (error) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error }));
+    return;
   }
 
   const slashCommand = parseSlashCommandPrompt(prompt);
@@ -1223,6 +1345,11 @@ const handleMessage = async (
       await runQueued(() => streamSlashCommand(res, handler, slashCommand.args));
       return;
     }
+  }
+
+  if (streamingBehaviorValue) {
+    await streamPrompt(res, prompt, model, images, streamingBehaviorValue);
+    return;
   }
 
   await runQueued(() => streamPrompt(res, prompt, model, images));
@@ -1400,6 +1527,24 @@ const handleRequest = async (
 
   if (req.method === 'POST' && req.url === '/message') {
     await handleMessage(req, res);
+    log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/steer') {
+    await handleSteer(req, res);
+    log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
+    return;
+  }
+
+  if (req.method === 'GET' && req.url === '/queue') {
+    handleQueue(res);
+    log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/clear-queue') {
+    handleClearQueue(res);
     log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
     return;
   }

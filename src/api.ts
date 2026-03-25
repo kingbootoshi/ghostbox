@@ -6,12 +6,14 @@ import { dirname, relative, resolve, sep } from 'node:path';
 
 import {
   abortGhost,
+  clearGhostQueue,
   compactGhost,
   generateApiKey,
   getConfig,
   getGhost,
   getGhostHealth,
   getGhostHistory,
+  getGhostQueue,
   getGhostStats,
   killGhost,
   listApiKeys,
@@ -25,10 +27,12 @@ import {
   revokeApiKey,
   sendMessage,
   spawnGhost,
+  steerGhost,
   wakeGhost,
 } from './orchestrator';
 import type {
   GhostImage,
+  GhostStreamingBehavior,
   GhostboxConfig,
   GhostboxConfigResponse,
   GhostboxConfigSensitiveStatus,
@@ -64,6 +68,12 @@ type SpawnBody = {
 type MessageBody = {
   prompt?: unknown;
   model?: unknown;
+  images?: unknown;
+  streamingBehavior?: unknown;
+};
+
+type SteerBody = {
+  prompt?: unknown;
   images?: unknown;
 };
 
@@ -322,6 +332,18 @@ const normalizeGhostImages = (value: unknown): GhostImage[] | undefined => {
   });
 };
 
+const normalizeStreamingBehavior = (value: unknown): GhostStreamingBehavior | undefined => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value === 'steer' || value === 'followUp') {
+    return value;
+  }
+
+  throw new ApiError(400, 'Invalid streamingBehavior');
+};
+
 const getErrorStatus = (error: unknown): ApiStatusCode => {
   if (error instanceof ApiError) {
     return error.status;
@@ -492,6 +514,7 @@ app.post('/api/ghosts/:name/message', async (c) => {
     const modelValue = typeof body.model === 'string' ? body.model.trim() : '';
     const model = modelValue || undefined;
     const images = normalizeGhostImages(body.images);
+    const streamingBehavior = normalizeStreamingBehavior(body.streamingBehavior);
     const ghost = await getGhost(name);
 
     if (!prompt) {
@@ -502,7 +525,7 @@ app.post('/api/ghosts/:name/message', async (c) => {
       throw new ApiError(409, `Ghost "${name}" is not running.`);
     }
 
-    const messages = sendMessage(name, prompt, model, images);
+    const messages = sendMessage(name, prompt, model, images, streamingBehavior);
 
     return streamSSE(
       c,
@@ -541,6 +564,29 @@ app.post('/api/ghosts/:name/message', async (c) => {
     return c.json({ error: message }, { status });
   }
 });
+
+app.post('/api/ghosts/:name/steer', (c) =>
+  handleRoute(c, async () => {
+    const body = await parseJsonBody<SteerBody>(c);
+    const prompt = typeof body.prompt === 'string' ? body.prompt : '';
+    const images = normalizeGhostImages(body.images);
+
+    if (!prompt) {
+      throw new ApiError(400, 'Missing prompt');
+    }
+
+    return c.json(await steerGhost(c.req.param('name'), prompt, images));
+  }));
+
+app.get('/api/ghosts/:name/queue', (c) =>
+  handleRoute(c, async () => {
+    return c.json(await getGhostQueue(c.req.param('name')));
+  }));
+
+app.post('/api/ghosts/:name/clear-queue', (c) =>
+  handleRoute(c, async () => {
+    return c.json(await clearGhostQueue(c.req.param('name')));
+  }));
 
 app.get('/api/ghosts/:name/keys', (c) =>
   handleRoute(c, async () => {

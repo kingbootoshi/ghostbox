@@ -45,6 +45,7 @@ final class AgentChatViewModel: ObservableObject {
     static let olderMessagesBatchSize = 25
     @Published var inputText = ""
     @Published var pendingImages: [PendingImage] = []
+    @Published var queuedMessages: [(prompt: String, images: [PendingImage])] = []
     @Published var isStreaming = false
     @Published private(set) var isLoadingHistory = false
     @Published private(set) var isCompacting = false
@@ -54,6 +55,8 @@ final class AgentChatViewModel: ObservableObject {
 
     private let client: GhostboxClient
     private var streamTask: Task<Void, Never>?
+    private var activeStreamID: UUID?
+    private var lastAbortTime: Date?
     private static let timestampFormatterWithFractionalSeconds: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -88,9 +91,8 @@ final class AgentChatViewModel: ObservableObject {
     func send() {
         let prompt = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let submittedImages = pendingImages.filter { !$0.isProcessing }
-        guard (!prompt.isEmpty || !submittedImages.isEmpty), !isStreaming, !isLoadingHistory, !isCompacting else { return }
+        guard (!prompt.isEmpty || !submittedImages.isEmpty), !isLoadingHistory, !isCompacting else { return }
 
-        streamTask?.cancel()
         messages.append(
             ChatMessage(
                 role: .user,
@@ -101,29 +103,52 @@ final class AgentChatViewModel: ObservableObject {
         )
         inputText = ""
         pendingImages = []
-        isStreaming = true
-        error = nil
 
-        let ghostName = self.ghostName
-
-        streamTask = Task { [weak self] in
-            await self?.consumeStream(
-                prompt: prompt,
-                images: submittedImages,
-                ghostName: ghostName
-            )
+        if isStreaming {
+            queuedMessages.append((prompt: prompt, images: submittedImages))
+            return
         }
+
+        startStream(prompt: prompt, images: submittedImages)
     }
 
     func cancelStream() {
+        guard isStreaming else { return }
+
+        let now = Date()
+        let shouldClearQueue = lastAbortTime.map { now.timeIntervalSince($0) <= 0.5 } ?? false
+        lastAbortTime = now
+
+        let hasQueuedMessages = !queuedMessages.isEmpty
         let name = ghostName
         let abortClient = client
+        activeStreamID = nil
         streamTask?.cancel()
         streamTask = nil
         isStreaming = false
 
+        if shouldClearQueue && hasQueuedMessages {
+            clearQueue()
+        }
+
         Task {
             try? await abortClient.abortGhost(name: name)
+
+            guard hasQueuedMessages, !shouldClearQueue else { return }
+
+            await MainActor.run { [weak self] in
+                self?.processNextQueued()
+            }
+        }
+    }
+
+    func clearQueue() {
+        queuedMessages.removeAll()
+
+        let name = ghostName
+        let clearQueueClient = client
+        Task {
+            try? await clearQueueClient.clearGhostQueue(name: name)
         }
     }
 
@@ -263,13 +288,57 @@ final class AgentChatViewModel: ObservableObject {
         pendingImages.removeAll { $0.id == id }
     }
 
-    private func consumeStream(prompt: String, images: [PendingImage], ghostName: String) async {
+    private func processNextQueued() {
+        guard !isStreaming, !isLoadingHistory, !isCompacting, !queuedMessages.isEmpty else { return }
+
+        let nextMessage = queuedMessages.removeFirst()
+        startStream(
+            prompt: nextMessage.prompt,
+            images: nextMessage.images,
+            streamingBehavior: "followUp"
+        )
+    }
+
+    private func startStream(
+        prompt: String,
+        images: [PendingImage],
+        streamingBehavior: String? = nil
+    ) {
+        streamTask?.cancel()
+
+        let ghostName = self.ghostName
+        let streamID = UUID()
+        activeStreamID = streamID
+        isStreaming = true
+        error = nil
+
+        streamTask = Task { [weak self] in
+            await self?.consumeStream(
+                prompt: prompt,
+                images: images,
+                ghostName: ghostName,
+                streamingBehavior: streamingBehavior,
+                streamID: streamID
+            )
+        }
+    }
+
+    private func consumeStream(
+        prompt: String,
+        images: [PendingImage],
+        ghostName: String,
+        streamingBehavior: String?,
+        streamID: UUID
+    ) async {
         var currentAssistantText = ""
         var currentAssistantIndex: Int?
         let isCompactCommand = Self.isCompactCommand(prompt)
         var compactResponseMessageID: UUID?
 
         defer {
+            guard activeStreamID == streamID else { return }
+            activeStreamID = nil
+            streamTask = nil
             isStreaming = false
         }
 
@@ -283,7 +352,8 @@ final class AgentChatViewModel: ObservableObject {
                         mediaType: $0.mediaType,
                         data: $0.data.base64EncodedString()
                     )
-                }
+                },
+                streamingBehavior: streamingBehavior
             )
 
             for try await event in stream {
@@ -346,12 +416,22 @@ final class AgentChatViewModel: ObservableObject {
             return
         }
 
+        guard activeStreamID == streamID else { return }
+
         if isCompactCommand, let compactResponseMessageID {
             await handleCompaction(compactResponseMessageID: compactResponseMessageID)
         }
 
         await loadGhost()
         await loadStats()
+
+        activeStreamID = nil
+        streamTask = nil
+        isStreaming = false
+
+        if !queuedMessages.isEmpty {
+            processNextQueued()
+        }
     }
 
     private func loadInitialState() async {

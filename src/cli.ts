@@ -6,6 +6,7 @@ import { access, mkdir } from 'node:fs/promises';
 
 import { commitVault, pushVault } from './vault';
 import {
+  getConfig,
   generateApiKey,
   getStatePath,
   killGhost,
@@ -18,6 +19,7 @@ import {
   saveState,
   sendMessage,
   spawnGhost,
+  upgradeGhosts,
   wakeGhost,
 } from './orchestrator';
 import type { GhostApiKey, GhostboxState, GhostState } from './types';
@@ -94,20 +96,32 @@ const requireStateDirectory = async (): Promise<void> => {
   await mkdir(stateDirectory, { recursive: true });
 };
 
-const formatGhostTable = (ghosts: Record<string, GhostState>): string => {
+const formatGhostTable = (
+  ghosts: Record<string, GhostState>,
+  currentImageVersion: string,
+): string => {
   const header = [
     'NAME'.padEnd(12),
     'MODEL'.padEnd(34),
     'STATUS'.padEnd(10),
+    'VERSION'.padEnd(28),
     'PORTS',
   ].join('  ');
 
   const rows = Object.entries(ghosts).map(([name, ghost]) => {
     const ports = `${ghost.portBase}-${ghost.portBase + 9}`;
+    const version =
+      ghost.imageVersion.length === 0
+        ? ''
+        : ghost.imageVersion === currentImageVersion
+          ? `${ghost.imageVersion} (current)`
+          : `${ghost.imageVersion} (stale)`;
+
     return [
       name.padEnd(12),
       ghost.model.padEnd(34),
       ghost.status.padEnd(10),
+      version.padEnd(28),
       ports,
     ].join('  ');
   });
@@ -338,6 +352,7 @@ const printUsage = (): void => {
   log.info('  ghostbox init');
   log.info('  ghostbox spawn <name> [--model <model>] [--provider <provider>] [--prompt <text>]');
   log.info('  ghostbox list');
+  log.info('  ghostbox upgrade');
   log.info('  ghostbox talk <name> <message>');
   log.info('  ghostbox kill <name>');
   log.info('  ghostbox wake <name>');
@@ -444,6 +459,7 @@ const init = async (): Promise<void> => {
       defaultProvider,
       defaultModel,
       imageName: existingState?.config?.imageName ?? DEFAULT_IMAGE_NAME,
+      imageVersion: existingState?.config?.imageVersion ?? '',
       observerModel: existingState?.config?.observerModel ?? '',
     },
     telegram: existingState?.telegram ?? { activeChatGhosts: {} },
@@ -463,6 +479,13 @@ const init = async (): Promise<void> => {
   );
 
   await runCommandInherit('docker', ['build', '-t', DEFAULT_IMAGE_NAME, 'docker/']);
+
+  const { computeImageVersion } = await import('./orchestrator');
+  const imageVersion = computeImageVersion('docker/');
+  const refreshedState = await loadState();
+  refreshedState.config.imageVersion = imageVersion;
+  await saveState(refreshedState);
+  log.info(`Image version: ${imageVersion}`);
 
   log.info(chalk.green('Ghostbox initialized.'));
   log.info('config:');
@@ -512,7 +535,32 @@ const spawn = async (name: string, options: SpawnCommandOptions): Promise<void> 
 
 const list = async (): Promise<void> => {
   const ghosts = await listGhosts();
-  log.info(formatGhostTable(ghosts));
+  const config = await getConfig();
+  log.info(formatGhostTable(ghosts, config.imageVersion));
+};
+
+const upgrade = async (): Promise<void> => {
+  const state = await loadState();
+  const imageName = state.config.imageName || DEFAULT_IMAGE_NAME;
+
+  await runCommandInherit(
+    'bun',
+    [
+      'build',
+      'src/ghost-server.ts',
+      '--target=node',
+      '--outfile=docker/ghost-server.js',
+      '--external',
+      '@mariozechner/pi-coding-agent',
+    ],
+  );
+
+  await runCommandInherit('docker', ['build', '-t', imageName, 'docker/']);
+
+  const result = await upgradeGhosts('docker/');
+  log.info(
+    `Upgraded: ${result.upgraded.length}, Skipped: ${result.skipped.length}, Failed: ${result.failed.length}`,
+  );
 };
 
 const keys = async (args: string[]): Promise<void> => {
@@ -658,6 +706,9 @@ const main = async (): Promise<void> => {
       }
       case 'list':
         await list();
+        break;
+      case 'upgrade':
+        await upgrade();
         break;
       case 'talk': {
         const [name, ...messageParts] = args;
