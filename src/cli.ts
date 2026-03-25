@@ -14,6 +14,7 @@ import {
   listGhosts,
   loadState,
   mergeGhosts,
+  nudgeGhost,
   removeGhost,
   revokeApiKey,
   saveState,
@@ -359,6 +360,7 @@ const printUsage = (): void => {
   log.info('  ghostbox save <name>');
   log.info('  ghostbox merge <source> <target>');
   log.info('  ghostbox logs <name>');
+  log.info('  ghostbox nudge <name> [event] [reason]');
   log.info('  ghostbox rm <name>');
   log.info('  ghostbox keys <name>');
   log.info('  ghostbox keys generate <name> [label]');
@@ -750,6 +752,16 @@ const main = async (): Promise<void> => {
         }
         await logs(args[0]);
         break;
+      case 'nudge': {
+        if (!args[0]) {
+          throw new Error('Usage: ghostbox nudge <name> [event] [reason]');
+        }
+        const nudgeEvent = args[1] || 'self';
+        const nudgeReason = args[2] || 'cli';
+        await nudgeGhost(args[0], nudgeEvent, nudgeReason);
+        log.info(chalk.green(`Nudged ${args[0]} (${nudgeEvent}: ${nudgeReason})`));
+        break;
+      }
       case 'rm':
         if (!args[0]) {
           throw new Error('Usage: ghostbox rm <name>');

@@ -1060,6 +1060,44 @@ export const newGhostSession = async (name: string): Promise<void> => {
   throw new Error(message);
 };
 
+export const nudgeGhost = async (
+  name: string,
+  event: string = 'self',
+  reason: string = 'orchestrator',
+): Promise<void> => {
+  const state = await loadState();
+  const ghost = getGhostFromState(state, name);
+  if (ghost.status !== 'running') {
+    throw new Error(`Ghost "${name}" is not running.`);
+  }
+
+  const response = await fetch(`http://localhost:${ghost.portBase}/nudge`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...getGhostAuthHeaders(ghost),
+    },
+    body: JSON.stringify({ event, reason }),
+  });
+
+  if (response.ok) {
+    return;
+  }
+
+  let message = `Ghost nudge failed with status ${response.status}.`;
+
+  try {
+    const payload = (await response.json()) as { error?: unknown };
+    if (typeof payload.error === 'string' && payload.error.length > 0) {
+      message = payload.error;
+    }
+  } catch {
+    // Ignore invalid JSON error payloads.
+  }
+
+  throw new Error(message);
+};
+
 export const removeGhost = async (name: string): Promise<void> => {
   const state = await loadState();
   const ghost = getGhostFromState(state, name);
