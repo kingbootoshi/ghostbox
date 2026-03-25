@@ -1,9 +1,11 @@
 import chalk from 'chalk';
 import { checkbox, confirm, select } from '@inquirer/prompts';
+import { spawn as nodeSpawn } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { access, mkdir } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 
 import { commitVault, pushVault } from './vault';
 import {
@@ -65,32 +67,29 @@ const runCommandCapture = async (
   command: string,
   args: string[],
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
-  const child = Bun.spawn([command, ...args], {
-    stdout: 'pipe',
-    stderr: 'pipe',
+  return new Promise((resolve) => {
+    const child = nodeSpawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on('error', (err) => resolve({ exitCode: 1, stdout: '', stderr: err.message }));
+    child.on('close', (code) => resolve({ exitCode: code ?? 1, stdout, stderr }));
   });
-
-  const [stdout, stderr] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ]);
-  const exitCode = await child.exited;
-  return { exitCode, stdout, stderr };
 };
 
 const runCommandInherit = async (
   command: string,
   args: string[],
 ): Promise<void> => {
-  const child = Bun.spawn([command, ...args], {
-    stdout: 'inherit',
-    stderr: 'inherit',
+  return new Promise((resolve, reject) => {
+    const child = nodeSpawn(command, args, { stdio: 'inherit' });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) reject(new Error(`Command failed: ${command} ${args.join(' ')}`));
+      else resolve();
+    });
   });
-
-  const exitCode = await child.exited;
-  if (exitCode !== 0) {
-    throw new Error(`Command failed: ${command} ${args.join(' ')}`);
-  }
 };
 
 const requireStateDirectory = async (): Promise<void> => {
@@ -295,7 +294,7 @@ const promptForInitAdapters = async (): Promise<AuthProvider[]> => {
       },
       {
         name: 'OpenAI (Codex)',
-        value: 'openai' as AuthProvider,
+        value: 'openai-codex' as AuthProvider,
         disabled: openaiAuthed ? 'already connected' : false,
       },
     ],
@@ -729,6 +728,7 @@ const printUsage = (): void => {
   log.info('  ghostbox keys <name>                    List API keys');
   log.info('  ghostbox keys generate <name> [label]   Create API key');
   log.info('  ghostbox keys revoke <name> <keyId>     Revoke API key');
+  log.info('  ghostbox serve                          Start web dashboard');
   log.info('  ghostbox bot                            Start Telegram bot');
 };
 
@@ -744,31 +744,41 @@ const findRunningPort = async (): Promise<number | null> => {
   return null;
 };
 
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+const openUrl = (url: string): void => {
+  const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'linux' ? 'xdg-open' : null;
+  if (cmd) {
+    const child = nodeSpawn(cmd, [url], { stdio: 'ignore', detached: true });
+    child.unref();
+  }
+};
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
 const launchServer = async (): Promise<void> => {
   // Check if already running on any port in our range
   const existing = await findRunningPort();
   if (existing) {
     console.log(`  ${CHECKMARK} Server already running on port ${existing}`);
     const url = `http://localhost:${existing}`;
-    if (process.platform === 'darwin') {
-      Bun.spawn(['open', url], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' });
-    }
+    openUrl(url);
     console.log(`  ${CHECKMARK} Dashboard: ${chalk.underline(url)}`);
     return;
   }
 
-  // Start server in foreground - inherit stdout/stderr so logs are visible
-  const apiProc = Bun.spawn(['bun', 'run', 'src/api.ts'], {
-    cwd: import.meta.dir.replace('/src', ''),
-    stdin: 'ignore',
-    stdout: 'inherit',
-    stderr: 'inherit',
+  // Start server - use node with the bundled api.js
+  const apiProc = nodeSpawn('node', [join(__dirname, 'api.js')], {
+    cwd: join(__dirname, '..'),
+    stdio: ['ignore', 'inherit', 'inherit'],
   });
 
   // Wait for it to come up
   let boundPort: number | null = null;
   for (let i = 0; i < 30; i++) {
-    await Bun.sleep(200);
+    await sleep(200);
     boundPort = await findRunningPort();
     if (boundPort) break;
   }
@@ -776,18 +786,16 @@ const launchServer = async (): Promise<void> => {
   if (boundPort) {
     console.log(`  ${CHECKMARK} Server running on port ${boundPort}`);
     const url = `http://localhost:${boundPort}`;
-    if (process.platform === 'darwin') {
-      Bun.spawn(['open', url], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' });
-    }
+    openUrl(url);
     console.log(`  ${CHECKMARK} Dashboard: ${chalk.underline(url)}`);
     console.log('');
     console.log(chalk.dim('  Ctrl+C to stop server'));
     console.log('');
 
     // Keep process alive - wait for the server to exit
-    await apiProc.exited;
+    await new Promise<void>((resolve) => apiProc.on('close', () => resolve()));
   } else {
-    console.log(`  ${WARNING} Server may not have started. Run "bun run src/api.ts" manually.`);
+    console.log(`  ${WARNING} Server may not have started. Run "ghostbox serve" manually.`);
   }
 };
 
@@ -974,18 +982,12 @@ const init = async (forceReset = false): Promise<void> => {
   await saveState(state);
 
   try {
-    await runCommandInherit('bun', [
-      'build',
-      'src/ghost-server.ts',
-      '--target=node',
-      '--outfile=docker/ghost-server.js',
-      '--external',
-      '@mariozechner/pi-coding-agent',
-    ]);
-    await runCommandInherit('docker', ['build', '-t', DEFAULT_IMAGE_NAME, 'docker/']);
+    // docker/ ships pre-built with ghost-server.js inside the package
+    const dockerDir = join(__dirname, '..', 'docker');
+    await runCommandInherit('docker', ['build', '-t', DEFAULT_IMAGE_NAME, dockerDir]);
 
     const { computeImageVersion } = await import('./orchestrator');
-    const imageVersion = computeImageVersion('docker/');
+    const imageVersion = computeImageVersion(dockerDir);
     const refreshedState = await loadState();
     refreshedState.config.imageVersion = imageVersion;
     await saveState(refreshedState);
@@ -1101,22 +1103,11 @@ const list = async (): Promise<void> => {
 const upgrade = async (): Promise<void> => {
   const state = await loadState();
   const imageName = state.config.imageName || DEFAULT_IMAGE_NAME;
+  const dockerDir = join(__dirname, '..', 'docker');
 
-  await runCommandInherit(
-    'bun',
-    [
-      'build',
-      'src/ghost-server.ts',
-      '--target=node',
-      '--outfile=docker/ghost-server.js',
-      '--external',
-      '@mariozechner/pi-coding-agent',
-    ],
-  );
+  await runCommandInherit('docker', ['build', '-t', imageName, dockerDir]);
 
-  await runCommandInherit('docker', ['build', '-t', imageName, 'docker/']);
-
-  const result = await upgradeGhosts('docker/');
+  const result = await upgradeGhosts(dockerDir);
   log.info(
     `Upgraded: ${result.upgraded.length}, Skipped: ${result.skipped.length}, Failed: ${result.failed.length}`,
   );
@@ -1211,11 +1202,11 @@ const logs = async (name: string): Promise<void> => {
     throw new Error(`Ghost "${name}" not found.`);
   }
 
-  const child = Bun.spawn(['docker', 'logs', '-f', ghost.containerId], {
-    stdout: 'inherit',
-    stderr: 'inherit',
+  const exitCode = await new Promise<number>((resolve, reject) => {
+    const child = nodeSpawn('docker', ['logs', '-f', ghost.containerId], { stdio: 'inherit' });
+    child.on('error', reject);
+    child.on('close', (code) => resolve(code ?? 1));
   });
-  const exitCode = await child.exited;
   if (exitCode !== 0) {
     throw new Error(`docker logs failed with exit code ${exitCode}`);
   }
@@ -1260,10 +1251,10 @@ const main = async (): Promise<void> => {
         break;
       case 'login': {
         const provider = args[0] as AuthProvider | undefined;
-        if (!provider || !['anthropic', 'openai'].includes(provider)) {
-          throw new Error('Usage: ghostbox login [anthropic|openai]');
+        if (!provider || !['anthropic', 'openai-codex'].includes(provider)) {
+          throw new Error('Usage: ghostbox login [anthropic|openai-codex]');
         }
-        await loginProvider(provider);
+        await loginProvider(provider as AuthProvider);
         log.info(chalk.green(`${provider === 'anthropic' ? 'Anthropic' : 'OpenAI'} connected.`));
         break;
       }
@@ -1355,6 +1346,9 @@ const main = async (): Promise<void> => {
         break;
       case 'keys':
         await keys(args);
+        break;
+      case 'serve':
+        await launchServer();
         break;
       case 'bot':
         await bot();

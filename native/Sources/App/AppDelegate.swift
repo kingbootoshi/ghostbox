@@ -14,24 +14,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let panelAnimationStagger: TimeInterval = 0.03
     private let panelHideDuration: TimeInterval = 0.3
+    private var serverProcess: Process?
+    private var serverLogHandle: FileHandle?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         registerFonts()
         setupMenuBar()
         setupNotifications()
         setupHotkey()
-        preloadThenShowHub()
-    }
 
-    private func preloadThenShowHub() {
-        // Create the hub panel hidden so SwiftUI mounts and starts loading data
         hubPanelController = HubPanelController(client: client, appState: appState)
         hubPanelController?.createPanelHidden()
 
-        // Wait for API data to arrive, then reveal
         Task {
+            appState.isStartingServer = true
+            await ensureServerRunning()
+            appState.isStartingServer = false
             _ = try? await client.listGhosts()
-            // Small delay for SwiftUI to settle after data arrives
             try? await Task.sleep(for: .milliseconds(100))
             await MainActor.run {
                 NSApp.activate(ignoringOtherApps: true)
@@ -42,6 +41,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         closeChatAll()
+        if let process = serverProcess, process.isRunning {
+            process.terminate()
+        }
+        try? serverLogHandle?.close()
+        serverLogHandle = nil
+    }
+
+    private func ensureServerRunning() async {
+        if await client.healthCheck() { return }
+
+        guard let projectRoot = findProjectRoot() else { return }
+
+        let logDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".ghostbox")
+        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        let logFile = logDir.appendingPathComponent("server.log")
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/bun")
+        process.arguments = ["run", "src/api.ts"]
+        process.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
+
+        if !FileManager.default.fileExists(atPath: logFile.path) {
+            FileManager.default.createFile(atPath: logFile.path, contents: nil)
+        }
+
+        if let handle = try? FileHandle(forWritingTo: logFile) {
+            handle.seekToEndOfFile()
+            process.standardOutput = handle
+            process.standardError = handle
+            serverLogHandle = handle
+        }
+
+        do {
+            try process.run()
+            serverProcess = process
+
+            for _ in 0..<30 {
+                try? await Task.sleep(for: .milliseconds(300))
+                if await client.healthCheck() { return }
+            }
+        } catch {
+            try? serverLogHandle?.close()
+            serverLogHandle = nil
+            // Server failed to start - app will show connection error
+        }
+    }
+
+    private func findProjectRoot() -> String? {
+        var url = URL(fileURLWithPath: Bundle.main.bundlePath)
+        for _ in 0..<10 {
+            url = url.deletingLastPathComponent()
+            if FileManager.default.fileExists(atPath: url.appendingPathComponent("src/api.ts").path) {
+                return url.path
+            }
+        }
+        return nil
     }
 
     func toggleHub() {

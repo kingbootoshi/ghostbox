@@ -1,8 +1,11 @@
 import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { streamSSE } from 'hono/streaming';
+import { spawn as nodeSpawn } from 'node:child_process';
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { dirname, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   abortGhost,
@@ -19,6 +22,7 @@ import {
   listApiKeys,
   listGhosts,
   loadState,
+  reconcileGhostStates,
   mergeGhosts,
   newGhostSession,
   reloadGhost,
@@ -41,8 +45,10 @@ import type {
 } from './types';
 import { commitVault, getVaultPath } from './vault';
 import { createLogger } from './logger';
+import { getAuthStatus } from './oauth';
 
-const port = 3200;
+const DEFAULT_PORT = 8008;
+const port = Number(process.env.GHOSTBOX_PORT) || DEFAULT_PORT;
 const log = createLogger('api');
 const app = new Hono();
 
@@ -387,9 +393,21 @@ const getErrorMessage = (error: unknown): string => {
 
 const parseJsonBody = async <T>(c: Context): Promise<T> => {
   try {
-    return await c.req.json<T>();
-  } catch {
-    throw new ApiError(400, 'Invalid JSON body');
+    const text = await c.req.text();
+    if (!text || text.trim().length === 0) {
+      log.error({ method: c.req.method, path: c.req.path, contentType: c.req.header('content-type') }, 'Empty request body');
+      throw new ApiError(400, 'Empty request body');
+    }
+    try {
+      return JSON.parse(text) as T;
+    } catch (parseErr) {
+      log.error({ method: c.req.method, path: c.req.path, bodyPreview: text.slice(0, 200), contentType: c.req.header('content-type') }, 'JSON parse failed');
+      throw new ApiError(400, `Invalid JSON body: ${(parseErr as Error).message}`);
+    }
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    log.error({ method: c.req.method, path: c.req.path, err }, 'Failed to read request body');
+    throw new ApiError(400, 'Could not read request body');
   }
 };
 
@@ -414,20 +432,26 @@ const handleRoute = async (
 
 app.use('/api/*', cors({ origin: '*' }));
 
+// Polling endpoints that don't need per-request logging
+const QUIET_ROUTES = new Set(['/api/ghosts', '/api/config', '/api/auth']);
+
 app.use('/api/*', async (c, next) => {
   const startedAt = Date.now();
 
   await next();
 
-  log.info(
-    {
-      method: c.req.method,
-      path: c.req.path,
-      status: c.res.status,
-      durationMs: Date.now() - startedAt,
-    },
-    'API request complete',
-  );
+  const isQuietPoll = c.req.method === 'GET' && QUIET_ROUTES.has(c.req.path) && c.res.status === 200;
+  if (!isQuietPoll) {
+    log.info(
+      {
+        method: c.req.method,
+        path: c.req.path,
+        status: c.res.status,
+        durationMs: Date.now() - startedAt,
+      },
+      'API request',
+    );
+  }
 });
 
 app.get('/api/ghosts', (c) =>
@@ -693,14 +717,13 @@ app.delete('/api/ghosts/:name/vault/delete', (c) =>
         throw new ApiError(400, 'Path must be a file');
       }
 
-      const trash = Bun.spawn(['trash', fullPath], {
-        stdout: 'pipe',
-        stderr: 'pipe',
+      const { exitCode, stderr: trashStdErr } = await new Promise<{ exitCode: number; stderr: string }>((resolve, reject) => {
+        const proc = nodeSpawn('trash', [fullPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '';
+        proc.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+        proc.on('error', reject);
+        proc.on('close', (code) => resolve({ exitCode: code ?? 1, stderr }));
       });
-      const [trashStdErr, exitCode] = await Promise.all([
-        new Response(trash.stderr).text(),
-        trash.exited,
-      ]);
 
       if (exitCode !== 0) {
         throw new Error(`Trash command failed: ${trashStdErr.trim()}`);
@@ -722,6 +745,11 @@ app.post('/api/ghosts/:name/merge', (c) =>
     }
 
     return c.json({ result: await mergeGhosts(c.req.param('name'), target) });
+  }));
+
+app.get('/api/auth', (c) =>
+  handleRoute(c, async () => {
+    return c.json(await getAuthStatus());
   }));
 
 app.get('/api/config', (c) =>
@@ -801,13 +829,153 @@ app.post('/api/ghosts/:name/new', (c) =>
 
 app.notFound((c) => c.json({ error: 'Not found' }, { status: 404 }));
 
-if (import.meta.main) {
-  Bun.serve({
-    port,
-    fetch: app.fetch,
-  });
+const mimeTypes: Record<string, string> = {
+  '.html': 'text/html',
+  '.js': 'application/javascript',
+  '.css': 'text/css',
+  '.json': 'application/json',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.map': 'application/json',
+};
 
-  log.info({ port }, 'API server listening');
+const getMimeType = (filePath: string): string => {
+  const ext = filePath.slice(filePath.lastIndexOf('.'));
+  return mimeTypes[ext] ?? 'application/octet-stream';
+};
+
+const tryReadFile = async (filePath: string): Promise<Buffer | null> => {
+  try {
+    const content = await readFile(filePath);
+    return content;
+  } catch {
+    return null;
+  }
+};
+
+const __apiFilename = fileURLToPath(import.meta.url);
+const __apiDirname = dirname(__apiFilename);
+
+if (import.meta.main || process.argv[1] === __apiFilename) {
+  const webDir = resolve(__apiDirname, '..', 'web');
+
+  const handler = async (req: Request): Promise<Response> => {
+    const url = new URL(req.url);
+
+    if (url.pathname.startsWith('/api/')) {
+      return app.fetch(req);
+    }
+
+    const filePath = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
+    const content = await tryReadFile(resolve(webDir, filePath));
+    if (content) {
+      return new Response(content, { headers: { 'Content-Type': getMimeType(filePath) } });
+    }
+
+    const indexContent = await tryReadFile(resolve(webDir, 'index.html'));
+    if (indexContent) {
+      return new Response(indexContent, { headers: { 'Content-Type': 'text/html' } });
+    }
+
+    return app.fetch(req);
+  };
+
+  // Try preferred port, fall back up to 10 ports higher
+  let boundPort = port;
+  let server: ReturnType<typeof createServer> | null = null;
+
+  const tryListen = (p: number): Promise<boolean> =>
+    new Promise((resolve) => {
+      const s = createServer(async (req, res) => {
+        const url = `http://localhost:${p}${req.url ?? '/'}`;
+        const headers: Record<string, string> = {};
+        for (const [key, value] of Object.entries(req.headers)) {
+          if (typeof value === 'string') headers[key] = value;
+        }
+        const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
+        const reqBody = hasBody ? await new Promise<Buffer>((resolve) => {
+          const chunks: Buffer[] = [];
+          req.on('data', (chunk: Buffer) => chunks.push(chunk));
+          req.on('end', () => resolve(Buffer.concat(chunks)));
+        }) : undefined;
+        const response = await handler(new Request(url, { method: req.method, headers, body: reqBody }));
+        res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
+        if (response.body) {
+          const reader = response.body.getReader();
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              res.write(value);
+            }
+          } finally {
+            reader.releaseLock();
+          }
+          res.end();
+        } else {
+          res.end();
+        }
+      });
+      s.once('error', () => resolve(false));
+      s.listen(p, () => {
+        server = s;
+        resolve(true);
+      });
+    });
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    if (await tryListen(port + attempt)) {
+      boundPort = port + attempt;
+      break;
+    }
+  }
+
+  if (server) {
+    log.info({ port: boundPort }, 'Ghostbox server listening');
+  } else {
+    log.error({ port }, 'Failed to bind any port');
+    process.exit(1);
+  }
+
+  // Reconcile ghost states - restart containers that should be running
+  reconcileGhostStates()
+    .then(({ started, marked }) => {
+      if (marked.length > 0) {
+        log.info({ started, marked }, 'Ghost state reconciliation complete');
+      }
+    })
+    .catch((err) => {
+      log.error({ err }, 'Ghost state reconciliation failed');
+    });
+
+  // Graceful shutdown - stop all running ghost containers
+  const shutdown = async () => {
+    log.info('Shutting down - stopping ghost containers...');
+    try {
+      const ghosts = await listGhosts();
+      for (const [name, ghost] of Object.entries(ghosts)) {
+        if (ghost.status !== 'running') continue;
+        try {
+          await killGhost(name);
+          log.info({ name }, 'Stopped ghost');
+        } catch {
+          log.error({ name }, 'Failed to stop ghost');
+        }
+      }
+    } catch {
+      // State might not be readable
+    }
+    process.exit(0);
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
-export default app;
+export { app };

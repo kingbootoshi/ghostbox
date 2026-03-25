@@ -1,4 +1,5 @@
 import Docker from 'dockerode';
+import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { copyFile, mkdir, writeFile } from 'node:fs/promises';
@@ -41,7 +42,8 @@ const getBaseAgentsPath = (): string =>
   join(getBasePath(), 'AGENTS.md');
 
 export const computeImageVersion = (dockerDir: string): string => {
-  const resolvedDockerDir = join(process.cwd(), dockerDir);
+  // Accept both absolute and relative paths
+  const resolvedDockerDir = dockerDir.startsWith('/') ? dockerDir : join(process.cwd(), dockerDir);
   const files = [
     'ghost-server.js',
     'Dockerfile',
@@ -238,12 +240,15 @@ const ensureGhostPiAgent = async (name: string): Promise<void> => {
   await mkdir(ghostPiPath, { recursive: true });
 
   const sharedPath = getSharedPiAgentPath();
-  for (const file of ['auth.json', 'settings.json']) {
-    const source = join(sharedPath, file);
-    const dest = join(ghostPiPath, file);
-    if (existsSync(source) && !existsSync(dest)) {
-      await copyFile(source, dest);
-    }
+  const settingsSource = join(sharedPath, 'settings.json');
+  const settingsDest = join(ghostPiPath, 'settings.json');
+  if (existsSync(settingsSource) && !existsSync(settingsDest)) {
+    await copyFile(settingsSource, settingsDest);
+  }
+
+  const authSource = join(getHomeDirectory(), '.ghostbox', 'auth.json');
+  if (existsSync(authSource)) {
+    await copyFile(authSource, join(ghostPiPath, 'auth.json'));
   }
 
   const baseAgentsSource = getBaseAgentsPath();
@@ -357,7 +362,8 @@ const logDockerConnectionIssue = (
 
 const loadStateFile = async (path: string): Promise<GhostboxState> => {
   try {
-    const contents = await Bun.file(path).text();
+    const { readFile } = await import('node:fs/promises');
+    const contents = await readFile(path, 'utf8');
     return normalizeState(JSON.parse(contents) as GhostboxState);
   } catch (error: unknown) {
     if (isNodeError(error) && error.code === 'ENOENT') {
@@ -490,7 +496,7 @@ export const loadState = async (): Promise<GhostboxState> => {
 
 export const saveState = async (state: GhostboxState): Promise<void> => {
   const statePath = getStatePath();
-  await Bun.write(statePath, JSON.stringify(state, null, 2));
+  await writeFile(statePath, JSON.stringify(state, null, 2));
 };
 
 export const getNextPortBase = (state: GhostboxState): number => {
@@ -719,6 +725,20 @@ export const wakeGhost = async (name: string): Promise<void> => {
 
   if (ghost.status !== 'stopped') {
     throw new Error(`Ghost "${name}" is not stopped.`);
+  }
+
+  // Remove any lingering container with this name (stopped or dead)
+  if (ghost.containerId) {
+    try {
+      await docker.getContainer(ghost.containerId).remove({ force: true });
+    } catch {
+      // Container already gone
+    }
+  }
+  try {
+    await docker.getContainer(`ghostbox-${name}`).remove({ force: true });
+  } catch {
+    // No lingering container with that name
   }
 
   await ensureGhostPiAgent(name);
@@ -1185,14 +1205,13 @@ export const removeGhost = async (name: string): Promise<void> => {
   const refreshedState = await loadState();
   const vaultPath = getVaultPath(name);
 
-  const trash = Bun.spawn(['trash', vaultPath], {
-    stdout: 'pipe',
-    stderr: 'pipe',
+  const { exitCode, stderr: trashStdErr } = await new Promise<{ exitCode: number; stderr: string }>((resolve, reject) => {
+    const proc = nodeSpawn('trash', [vaultPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    proc.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code: number | null) => resolve({ exitCode: code ?? 1, stderr }));
   });
-  const [trashStdErr, exitCode] = await Promise.all([
-    new Response(trash.stderr).text(),
-    trash.exited,
-  ]);
 
   if (exitCode !== 0) {
     throw new Error(`Trash command failed: ${trashStdErr.trim()}`);

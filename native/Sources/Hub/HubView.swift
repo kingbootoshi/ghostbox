@@ -86,11 +86,13 @@ struct HubView: View {
 
     private var ghostListContent: some View {
         Group {
-            if let error = viewModel.error {
+            if appState.isStartingServer {
+                serverStartingView
+            } else if let error = viewModel.error {
                 errorView(error)
             }
 
-            if displayGhosts.isEmpty {
+            if displayGhosts.isEmpty && !appState.isStartingServer {
                 emptyState
             } else {
                 ForEach(displayGhosts) { ghost in
@@ -210,6 +212,19 @@ struct HubView: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 18)
         }
+    }
+
+    private var serverStartingView: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+                .tint(Theme.Colors.accentLight)
+            Text("Starting server...")
+                .font(Theme.Typography.body(weight: .medium))
+                .foregroundColor(Theme.Colors.accentLight)
+        }
+        .padding(.vertical, 16)
+        .frame(maxWidth: .infinity)
     }
 
     private var emptyState: some View {

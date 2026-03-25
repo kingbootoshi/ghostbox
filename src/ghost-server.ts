@@ -1118,6 +1118,8 @@ const isStreamingBehavior = (value: unknown): value is GhostStreamingBehavior =>
   return value === 'steer' || value === 'followUp';
 };
 
+const SUPPORTED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
 const parseRequestImages = (
   imagesValue: unknown,
 ): { images?: GhostImage[]; error?: string } => {
@@ -1142,6 +1144,9 @@ const parseRequestImages = (
       return { error: 'Invalid images' };
     }
 
+    if (!SUPPORTED_IMAGE_TYPES.has(mediaType)) {
+      return { error: `Unsupported image type: ${mediaType}. Must be jpeg, png, gif, or webp.` };
+    }
     images.push({ mediaType, data });
   }
 

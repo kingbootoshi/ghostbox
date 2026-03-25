@@ -122,7 +122,7 @@ final class GhostboxClient {
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
-    init(baseURL: URL = URL(string: "http://localhost:3200")!, session: URLSession? = nil) {
+    init(baseURL: URL = URL(string: "http://localhost:8008")!, session: URLSession? = nil) {
         self.baseURL = baseURL
 
         if let session {

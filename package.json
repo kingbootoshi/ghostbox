@@ -1,15 +1,25 @@
 {
-  "name": "ghostbox",
-  "version": "0.1.0",
+  "name": "@bootoshi/ghostbox",
+  "version": "0.1.5",
   "type": "module",
+  "description": "Spawn isolated AI agents in Docker containers",
   "bin": {
-    "ghostbox": "./dist/cli.js"
+    "ghostbox": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "docker/",
+    "web/"
+  ],
+  "engines": {
+    "node": ">=20"
   },
   "scripts": {
     "build:ghost": "bun build src/ghost-server.ts --target=node --outfile=docker/ghost-server.js --external @mariozechner/pi-coding-agent",
-    "build:cli": "bun build src/cli.ts --outdir=dist --target=bun",
+    "build:cli": "bun build src/cli.ts --outdir=dist --target=node --external pino --external pino-pretty --external thread-stream --external sonic-boom --external dockerode --external ssh2 --external @grpc/grpc-js && bun build src/api.ts --outdir=dist --target=node --external pino --external pino-pretty --external thread-stream --external sonic-boom --external dockerode --external ssh2 --external @grpc/grpc-js && printf '#!/usr/bin/env node\\n' | cat - dist/cli.js > dist/cli.tmp && mv dist/cli.tmp dist/cli.js && chmod +x dist/cli.js",
     "build:image": "docker build -t ghostbox-agent docker/",
-    "build": "bun run build:ghost && bun run build:image && bun run build:cli",
+    "build": "bun run build:ghost && bun run build:cli",
+    "prepublishOnly": "bun run build:ghost && bun run build:cli",
     "dev": "bun run src/cli.ts",
     "dev:api": "bun run --watch src/api.ts",
     "test": "bun test",
@@ -17,6 +27,7 @@
   },
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",
+    "@inquirer/prompts": "^8.3.2",
     "chalk": "^5.4.1",
     "dockerode": "^4.0.5",
     "grammy": "^1.39.0",

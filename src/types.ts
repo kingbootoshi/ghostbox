@@ -157,3 +157,23 @@ export type GhostMessage =
   | ToolUseMessage
   | ToolResultMessage
   | ResultMessage;
+
+export type AuthProvider = 'anthropic' | 'openai-codex';
+
+export interface OAuthTokenRecord {
+  type: 'oauth';
+  access: string;
+  refresh: string;
+  expires: number;
+}
+
+export type AuthTokenStore = Partial<Record<AuthProvider, OAuthTokenRecord>>;
+
+export interface AuthProviderStatus {
+  authenticated: boolean;
+  expiresAt: number | null;
+}
+
+export interface AuthStatus {
+  providers: Record<AuthProvider, AuthProviderStatus>;
+}

@@ -1,4 +1,5 @@
-import { access, mkdir } from 'node:fs/promises';
+import { spawn as nodeSpawn } from 'node:child_process';
+import { access, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { createLogger } from './logger';
@@ -54,17 +55,22 @@ const runCommand = async (
   const op = [command, ...args].join(' ');
   log.info({ name, op }, 'Vault operation');
 
-  const proc = Bun.spawn([command, ...args], {
-    cwd,
-    stdout: 'pipe',
-    stderr: 'pipe',
+  const { exitCode, stdout, stderr } = await new Promise<{
+    exitCode: number;
+    stdout: string;
+    stderr: string;
+  }>((resolve, reject) => {
+    const proc = nodeSpawn(command, args, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    let err = '';
+    proc.stdout?.on('data', (chunk: Buffer) => { out += chunk.toString(); });
+    proc.stderr?.on('data', (chunk: Buffer) => { err += chunk.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code) => resolve({ exitCode: code ?? 1, stdout: out, stderr: err }));
   });
-
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  const exitCode = await proc.exited;
 
   if (exitCode !== 0) {
     const stderrText = stderr.trim();
@@ -131,24 +137,24 @@ export const initVault = async (name: string): Promise<void> => {
   await runGit(name, vaultPath, ['init', '-b', 'main']);
   await configureGitIdentity(name, vaultPath);
 
-  await Bun.write(
+  await writeFile(
     join(vaultPath, '.gitignore'),
     ['node_modules/', '.env', '*.tmp', '.DS_Store'].join('\n') + '\n',
   );
-  await Bun.write(join(vaultPath, 'CLAUDE.md'), buildInitialClaudeContent(name));
+  await writeFile(join(vaultPath, 'CLAUDE.md'), buildInitialClaudeContent(name));
   await mkdir(join(vaultPath, 'knowledge'), { recursive: true });
   await mkdir(join(vaultPath, 'code'), { recursive: true });
-  await Bun.write(join(vaultPath, 'knowledge', '.gitkeep'), '');
-  await Bun.write(join(vaultPath, 'code', '.gitkeep'), '');
-  await Bun.write(join(vaultPath, 'MEMORY.md'), '');
-  await Bun.write(join(vaultPath, 'USER.md'), '');
+  await writeFile(join(vaultPath, 'knowledge', '.gitkeep'), '');
+  await writeFile(join(vaultPath, 'code', '.gitkeep'), '');
+  await writeFile(join(vaultPath, 'MEMORY.md'), '');
+  await writeFile(join(vaultPath, 'USER.md'), '');
 
   await runGit(name, vaultPath, ['add', '-A']);
   await runGit(name, vaultPath, ['commit', '-m', 'Initialize vault']);
 
   await runGit(name, vaultPath, ['checkout', '-b', branchName]);
   await mkdir(join(vaultPath, '.pi', 'extensions'), { recursive: true });
-  await Bun.write(join(vaultPath, '.pi', 'extensions', '.gitkeep'), '');
+  await writeFile(join(vaultPath, '.pi', 'extensions', '.gitkeep'), '');
   await runCommand(name, vaultPath, 'ln', ['-s', 'CLAUDE.md', 'AGENTS.md']);
   await runGit(name, vaultPath, ['add', '-A']);
   await runGit(name, vaultPath, ['commit', '-m', 'Set up ghost branch']);
