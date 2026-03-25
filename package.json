@@ -12,6 +12,7 @@
     "build": "bun run build:ghost && bun run build:image && bun run build:cli",
     "dev": "bun run src/cli.ts",
     "dev:api": "bun run --watch src/api.ts",
+    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

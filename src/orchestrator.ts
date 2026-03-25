@@ -197,6 +197,8 @@ You save automatically - the user should never need to ask. Save when you learn:
 
 - \`ghost-memory\` - Save/update/remove memory entries
 - \`ghost-changelog add "description" --tag TAG\` - Log what you changed and why after significant work
+- \`ghost-nudge memory\` - Trigger memory review now (observer extracts facts)
+- \`ghost-nudge self "reason"\` - Schedule a self-nudge (future: timed reminders)
 - \`qmd\` - Search and read vault files
 - \`ghost-save "message"\` - Commit and push vault to GitHub
 - \`exa-search "query"\` - Web search via Exa

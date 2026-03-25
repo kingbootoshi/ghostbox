@@ -173,7 +173,7 @@ class NudgeRegistry {
       this.handlerLastFired.set(handler.id, Date.now());
 
       if (handler.background) {
-        handler.handler(event, context).catch?.((error: unknown) => {
+        Promise.resolve(handler.handler(event, context)).catch((error: unknown) => {
           log.error('Nudge: background handler failed', {
             id: handler.id,
             event,
@@ -1713,7 +1713,7 @@ const handleRequest = async (
   // Nudge endpoint - external triggers for proactive agent behavior
   if (req.method === 'POST' && req.url === '/nudge') {
     try {
-      const body = await readBody(req);
+      const body = await getRequestBody(req);
       const parsed = JSON.parse(body) as { event?: string; reason?: string };
       const event = (parsed.event ?? 'self') as NudgeEvent;
       const reason = parsed.reason ?? 'api-trigger';

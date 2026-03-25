@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VAULT="/vault"
+CHANGELOG_FILE="$VAULT/CHANGELOG.md"
+
+ensure_file() { [ -f "$CHANGELOG_FILE" ] || touch "$CHANGELOG_FILE"; }
+
+cmd_add() {
+  local description="${1:?Usage: ghost-changelog add \"description\" [--tag TAG]}"
+  local tag="change"
+  shift || true
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tag)
+        tag="${2:?Error: --tag requires a value}"
+        shift 2
+        ;;
+      *)
+        echo "Error: unknown argument: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  ensure_file
+  local timestamp
+  timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  printf '## [%s] [%s]\n%s\n\n---\n\n' "$timestamp" "$tag" "$description" >> "$CHANGELOG_FILE"
+  echo "Changelog entry added."
+}
+
+cmd_list() {
+  local limit="${1:-10}"
+  case "$limit" in
+    ''|*[!0-9]*) echo "Error: list count must be a number" >&2; exit 1 ;;
+  esac
+
+  ensure_file
+  awk -v limit="$limit" '
+    BEGIN { RS="\n---\n\n"; count=0 }
+    {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      if ($0 != "") entries[++count] = $0
+    }
+    END {
+      start = count - limit + 1
+      if (start < 1) start = 1
+      for (i = count; i >= start; i--) {
+        print entries[i]
+        if (i > start) printf "\n\n---\n\n"
+      }
+    }
+  ' "$CHANGELOG_FILE"
+}
+
+cmd_help() {
+  echo "ghost-changelog: Append a simple work log"
+  echo "Commands:"
+  echo "  add \"description\" [--tag TAG]  Add a changelog entry"
+  echo "  list [N]                         Show the last N entries (default 10)"
+}
+
+action="${1:-help}"
+shift || true
+
+case "$action" in
+  add) cmd_add "$@" ;;
+  list) cmd_list "$@" ;;
+  help|--help|-h) cmd_help ;;
+  *)
+    echo "Unknown command: $action" >&2
+    cmd_help >&2
+    exit 1
+  ;;
+esac
