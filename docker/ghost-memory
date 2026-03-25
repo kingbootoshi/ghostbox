@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ghost-memory: Persistent fact store for ghost agents.
+# Manages /vault/memory.json - facts the agent remembers across sessions,
+# plus a vault_map index of what's stored on disk.
+#
+# Usage:
+#   ghost-memory add "content" [category]     Add a fact (category: user|env|project|learning)
+#   ghost-memory update <id> "new content"    Update a fact's content
+#   ghost-memory remove <id>                  Remove a fact
+#   ghost-memory list [category]              List facts, optionally filtered
+#   ghost-memory search "query"               Search facts by substring
+#   ghost-memory map <path> "summary"         Add/update a vault map entry
+#   ghost-memory unmap <path>                 Remove a vault map entry
+#   ghost-memory show                         Show full memory state (facts + map)
+#   ghost-memory stats                        Show memory statistics
+
+MEMORY_FILE="/vault/memory.json"
+
+ensure_memory_file() {
+  if [ ! -f "$MEMORY_FILE" ]; then
+    echo '{"facts":[],"vault_map":[]}' > "$MEMORY_FILE"
+  fi
+}
+
+generate_id() {
+  head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
+today() {
+  date -u +"%Y-%m-%d"
+}
+
+cmd_add() {
+  local content="${1:?Usage: ghost-memory add \"content\" [category]}"
+  local category="${2:-learning}"
+  local id
+  id=$(generate_id)
+  local date
+  date=$(today)
+
+  ensure_memory_file
+  local tmp
+  tmp=$(mktemp)
+  jq --arg id "$id" \
+     --arg content "$content" \
+     --arg cat "$category" \
+     --arg date "$date" \
+     '.facts += [{"id": $id, "content": $content, "category": $cat, "created": $date, "updated": $date}]' \
+     "$MEMORY_FILE" > "$tmp" && mv "$tmp" "$MEMORY_FILE"
+
+  echo "Saved fact $id [$category]: $content"
+}
+
+cmd_update() {
+  local id="${1:?Usage: ghost-memory update <id> \"new content\"}"
+  local content="${2:?Usage: ghost-memory update <id> \"new content\"}"
+  local date
+  date=$(today)
+
+  ensure_memory_file
+  local exists
+  exists=$(jq --arg id "$id" '[.facts[] | select(.id == $id)] | length' "$MEMORY_FILE")
+  if [ "$exists" = "0" ]; then
+    echo "Error: fact $id not found" >&2
+    exit 1
+  fi
+
+  local tmp
+  tmp=$(mktemp)
+  jq --arg id "$id" \
+     --arg content "$content" \
+     --arg date "$date" \
+     '.facts = [.facts[] | if .id == $id then .content = $content | .updated = $date else . end]' \
+     "$MEMORY_FILE" > "$tmp" && mv "$tmp" "$MEMORY_FILE"
+
+  echo "Updated fact $id"
+}
+
+cmd_remove() {
+  local id="${1:?Usage: ghost-memory remove <id>}"
+
+  ensure_memory_file
+  local exists
+  exists=$(jq --arg id "$id" '[.facts[] | select(.id == $id)] | length' "$MEMORY_FILE")
+  if [ "$exists" = "0" ]; then
+    echo "Error: fact $id not found" >&2
+    exit 1
+  fi
+
+  local tmp
+  tmp=$(mktemp)
+  jq --arg id "$id" '.facts = [.facts[] | select(.id != $id)]' \
+     "$MEMORY_FILE" > "$tmp" && mv "$tmp" "$MEMORY_FILE"
+
+  echo "Removed fact $id"
+}
+
+cmd_list() {
+  local category="${1:-}"
+
+  ensure_memory_file
+  if [ -n "$category" ]; then
+    jq -r --arg cat "$category" \
+      '.facts[] | select(.category == $cat) | "[\(.id)] [\(.category)] \(.content)"' \
+      "$MEMORY_FILE"
+  else
+    jq -r '.facts[] | "[\(.id)] [\(.category)] \(.content)"' "$MEMORY_FILE"
+  fi
+}
+
+cmd_search() {
+  local query="${1:?Usage: ghost-memory search \"query\"}"
+
+  ensure_memory_file
+  jq -r --arg q "$query" \
+    '.facts[] | select(.content | test($q; "i")) | "[\(.id)] [\(.category)] \(.content)"' \
+    "$MEMORY_FILE"
+}
+
+cmd_map() {
+  local path="${1:?Usage: ghost-memory map <path> \"summary\"}"
+  local summary="${2:?Usage: ghost-memory map <path> \"summary\"}"
+  local date
+  date=$(today)
+
+  ensure_memory_file
+  local tmp
+  tmp=$(mktemp)
+  jq --arg path "$path" \
+     --arg summary "$summary" \
+     --arg date "$date" \
+     '.vault_map = [.vault_map[] | select(.path != $path)] + [{"path": $path, "summary": $summary, "updated": $date}]' \
+     "$MEMORY_FILE" > "$tmp" && mv "$tmp" "$MEMORY_FILE"
+
+  echo "Mapped: $path -> $summary"
+}
+
+cmd_unmap() {
+  local path="${1:?Usage: ghost-memory unmap <path>}"
+
+  ensure_memory_file
+  local tmp
+  tmp=$(mktemp)
+  jq --arg path "$path" '.vault_map = [.vault_map[] | select(.path != $path)]' \
+     "$MEMORY_FILE" > "$tmp" && mv "$tmp" "$MEMORY_FILE"
+
+  echo "Unmapped: $path"
+}
+
+cmd_show() {
+  ensure_memory_file
+
+  local fact_count
+  fact_count=$(jq '.facts | length' "$MEMORY_FILE")
+  local map_count
+  map_count=$(jq '.vault_map | length' "$MEMORY_FILE")
+
+  echo "== FACTS ($fact_count) =="
+  jq -r '.facts[] | "[\(.id)] [\(.category)] (\(.updated)) \(.content)"' "$MEMORY_FILE"
+  echo ""
+  echo "== VAULT MAP ($map_count) =="
+  jq -r '.vault_map[] | "  \(.path) - \(.summary) (\(.updated))"' "$MEMORY_FILE"
+}
+
+cmd_stats() {
+  ensure_memory_file
+
+  local fact_count
+  fact_count=$(jq '.facts | length' "$MEMORY_FILE")
+  local map_count
+  map_count=$(jq '.vault_map | length' "$MEMORY_FILE")
+  local file_size
+  file_size=$(wc -c < "$MEMORY_FILE" | tr -d ' ')
+  local categories
+  categories=$(jq -r '[.facts[].category] | group_by(.) | map("\(.[0]): \(length)") | join(", ")' "$MEMORY_FILE")
+
+  echo "Facts: $fact_count ($categories)"
+  echo "Vault map entries: $map_count"
+  echo "File size: ${file_size} bytes"
+}
+
+cmd_help() {
+  echo "ghost-memory: Persistent fact store for ghost agents"
+  echo ""
+  echo "Commands:"
+  echo "  add \"content\" [category]     Add a fact (user|env|project|learning)"
+  echo "  update <id> \"new content\"    Update a fact"
+  echo "  remove <id>                  Remove a fact"
+  echo "  list [category]              List facts"
+  echo "  search \"query\"               Search facts (case-insensitive)"
+  echo "  map <path> \"summary\"         Index a vault file"
+  echo "  unmap <path>                 Remove a vault file from index"
+  echo "  show                         Show full memory state"
+  echo "  stats                        Show memory statistics"
+}
+
+action="${1:-help}"
+shift || true
+
+case "$action" in
+  add)    cmd_add "$@" ;;
+  update) cmd_update "$@" ;;
+  remove) cmd_remove "$@" ;;
+  list)   cmd_list "$@" ;;
+  search) cmd_search "$@" ;;
+  map)    cmd_map "$@" ;;
+  unmap)  cmd_unmap "$@" ;;
+  show)   cmd_show ;;
+  stats)  cmd_stats ;;
+  help|--help|-h) cmd_help ;;
+  *)
+    echo "Unknown command: $action" >&2
+    cmd_help >&2
+    exit 1
+    ;;
+esac

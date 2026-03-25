@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# qmd: Query Markdown - vault search and retrieval for ghost agents.
+# Searches, reads, indexes, and navigates the vault's markdown knowledge base.
+#
+# Usage:
+#   qmd search "query"              Search vault files by content (ripgrep)
+#   qmd search "query" --type md    Search only markdown files
+#   qmd read <path>                 Read a vault file (relative to /vault)
+#   qmd read <path> --section "H"  Read a specific section by heading
+#   qmd list [pattern]              List vault files (glob pattern)
+#   qmd tree [depth]                Show vault directory tree
+#   qmd index                       Scan vault and rebuild memory.json vault_map
+#   qmd recent [N]                  Show N most recently modified files (default: 10)
+#   qmd headings <path>             Show all headings in a markdown file
+#   qmd summary                     Quick overview of vault contents
+
+VAULT="/vault"
+MEMORY_FILE="/vault/memory.json"
+
+cmd_search() {
+  local query="${1:?Usage: qmd search \"query\" [--type TYPE]}"
+  shift
+  local file_type=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --type) file_type="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  local rg_args=(-n --color never --max-count 5 -i)
+
+  if [ -n "$file_type" ]; then
+    rg_args+=(--type "$file_type")
+  fi
+
+  # Search vault, exclude .git and node_modules
+  rg "${rg_args[@]}" --glob '!.git' --glob '!node_modules' "$query" "$VAULT" 2>/dev/null || echo "No results found."
+}
+
+cmd_read() {
+  local path="${1:?Usage: qmd read <path> [--section \"heading\"]}"
+  shift
+  local section=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --section) section="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  # Resolve path relative to vault
+  local full_path="$path"
+  if [[ ! "$path" = /* ]]; then
+    full_path="$VAULT/$path"
+  fi
+
+  if [ ! -f "$full_path" ]; then
+    echo "Error: file not found: $full_path" >&2
+    exit 1
+  fi
+
+  if [ -n "$section" ]; then
+    # Extract section by heading - from heading to next heading of same or higher level
+    awk -v heading="$section" '
+      BEGIN { found=0; level=0 }
+      /^#+/ {
+        current_level = 0
+        for (i=1; i<=length($0); i++) {
+          if (substr($0, i, 1) == "#") current_level++
+          else break
+        }
+        current_heading = $0
+        gsub(/^#+[ \t]*/, "", current_heading)
+        if (tolower(current_heading) ~ tolower(heading)) {
+          found = 1
+          level = current_level
+          print
+          next
+        }
+        if (found && current_level <= level) exit
+      }
+      found { print }
+    ' "$full_path"
+  else
+    cat "$full_path"
+  fi
+}
+
+cmd_list() {
+  local pattern="${1:-*}"
+
+  find "$VAULT" \
+    -not -path '*/.git/*' \
+    -not -path '*/node_modules/*' \
+    -name "$pattern" \
+    -type f \
+    2>/dev/null | \
+    sed "s|^$VAULT/||" | \
+    sort
+}
+
+cmd_tree() {
+  local depth="${1:-3}"
+
+  if command -v tree &>/dev/null; then
+    tree -L "$depth" -I '.git|node_modules|.DS_Store' --noreport "$VAULT"
+  else
+    # Fallback: find-based tree
+    find "$VAULT" \
+      -not -path '*/.git/*' \
+      -not -path '*/node_modules/*' \
+      -maxdepth "$depth" \
+      2>/dev/null | \
+      sed "s|^$VAULT||" | \
+      sort | \
+      awk '{
+        depth = gsub(/\//, "/")
+        indent = ""
+        for (i = 0; i < depth; i++) indent = indent "  "
+        n = split($0, parts, "/")
+        print indent parts[n]
+      }'
+  fi
+}
+
+cmd_index() {
+  # Scan vault for all meaningful files and rebuild vault_map in memory.json
+  if [ ! -f "$MEMORY_FILE" ]; then
+    echo '{"facts":[],"vault_map":[]}' > "$MEMORY_FILE"
+  fi
+
+  local date
+  date=$(date -u +"%Y-%m-%d")
+
+  # Build new vault_map entries from file headers/first lines
+  local entries="[]"
+
+  while IFS= read -r file; do
+    local rel_path="${file#$VAULT/}"
+    local summary=""
+
+    # Extract summary from file
+    if [[ "$file" == *.md ]]; then
+      # Use first heading or first non-empty line
+      summary=$(grep -m1 '^#' "$file" 2>/dev/null | sed 's/^#* *//' || head -1 "$file" 2>/dev/null)
+    elif [[ "$file" == *.json ]]; then
+      summary="JSON data"
+    elif [[ "$file" == *.ts || "$file" == *.js ]]; then
+      summary=$(head -1 "$file" 2>/dev/null | sed 's|^//[ ]*||')
+    else
+      summary=$(head -1 "$file" 2>/dev/null)
+    fi
+
+    # Truncate summary
+    summary="${summary:0:100}"
+
+    if [ -n "$summary" ]; then
+      entries=$(echo "$entries" | jq --arg p "$rel_path" --arg s "$summary" --arg d "$date" \
+        '. + [{"path": $p, "summary": $s, "updated": $d}]')
+    fi
+  done < <(find "$VAULT" \
+    -not -path '*/.git/*' \
+    -not -path '*/node_modules/*' \
+    -not -name '.gitkeep' \
+    -not -name '.gitignore' \
+    -not -name 'memory.json' \
+    -not -name '*.lock' \
+    -type f \
+    2>/dev/null)
+
+  # Merge: scanned entries replace matching paths, manual entries for missing files are preserved
+  local tmp
+  tmp=$(mktemp)
+  jq --argjson scanned "$entries" '
+    ($scanned | map(.path)) as $scanned_paths |
+    .vault_map = (
+      [.vault_map[] | select(.path as $p | $scanned_paths | index($p) | not)]
+      + $scanned
+    )
+  ' "$MEMORY_FILE" > "$tmp" && mv "$tmp" "$MEMORY_FILE"
+
+  local count
+  count=$(echo "$entries" | jq 'length')
+  echo "Indexed $count vault files into memory.json vault_map"
+}
+
+cmd_recent() {
+  local count="${1:-10}"
+
+  find "$VAULT" \
+    -not -path '*/.git/*' \
+    -not -path '*/node_modules/*' \
+    -not -name '.gitkeep' \
+    -type f \
+    -printf '%T@ %p\n' 2>/dev/null | \
+    sort -rn | \
+    head -n "$count" | \
+    awk '{
+      cmd = "date -d @" int($1) " +\"%Y-%m-%d %H:%M\" 2>/dev/null || date -r " int($1) " +\"%Y-%m-%d %H:%M\" 2>/dev/null"
+      cmd | getline dt
+      close(cmd)
+      sub(/^[^ ]+ /, "")
+      printf "%s  %s\n", dt, $0
+    }'
+}
+
+cmd_headings() {
+  local path="${1:?Usage: qmd headings <path>}"
+
+  local full_path="$path"
+  if [[ ! "$path" = /* ]]; then
+    full_path="$VAULT/$path"
+  fi
+
+  if [ ! -f "$full_path" ]; then
+    echo "Error: file not found: $full_path" >&2
+    exit 1
+  fi
+
+  grep -n '^#' "$full_path" 2>/dev/null || echo "No headings found."
+}
+
+cmd_summary() {
+  local total_files
+  total_files=$(find "$VAULT" -not -path '*/.git/*' -not -path '*/node_modules/*' -type f 2>/dev/null | wc -l | tr -d ' ')
+  local md_files
+  md_files=$(find "$VAULT" -not -path '*/.git/*' -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+  local total_size
+  total_size=$(find "$VAULT" -not -path '*/.git/*' -not -path '*/node_modules/*' -type f -exec du -ch {} + 2>/dev/null | tail -1 | awk '{print $1}')
+
+  echo "Vault: $VAULT"
+  echo "Files: $total_files total, $md_files markdown"
+  echo "Size: $total_size"
+  echo ""
+
+  # Show top-level directories with file counts
+  echo "Directories:"
+  for dir in "$VAULT"/*/; do
+    if [ -d "$dir" ] && [[ ! "$dir" == */.git/* ]] && [[ ! "$dir" == */node_modules/* ]]; then
+      local dirname
+      dirname=$(basename "$dir")
+      local count
+      count=$(find "$dir" -type f -not -path '*/.git/*' 2>/dev/null | wc -l | tr -d ' ')
+      echo "  $dirname/ ($count files)"
+    fi
+  done
+
+  echo ""
+
+  # Show memory state if available
+  if [ -f "$MEMORY_FILE" ]; then
+    local fact_count
+    fact_count=$(jq '.facts | length' "$MEMORY_FILE")
+    local map_count
+    map_count=$(jq '.vault_map | length' "$MEMORY_FILE")
+    echo "Memory: $fact_count facts, $map_count mapped files"
+  else
+    echo "Memory: not initialized"
+  fi
+}
+
+cmd_help() {
+  echo "qmd: Query Markdown - vault search and retrieval"
+  echo ""
+  echo "Commands:"
+  echo "  search \"query\" [--type TYPE]   Search vault files by content"
+  echo "  read <path> [--section \"H\"]    Read a vault file or section"
+  echo "  list [pattern]                 List vault files (glob)"
+  echo "  tree [depth]                   Show vault directory tree"
+  echo "  index                          Rebuild vault_map in memory.json"
+  echo "  recent [N]                     Show recently modified files"
+  echo "  headings <path>                Show markdown headings"
+  echo "  summary                        Quick vault overview"
+}
+
+action="${1:-help}"
+shift || true
+
+case "$action" in
+  search)   cmd_search "$@" ;;
+  read)     cmd_read "$@" ;;
+  list)     cmd_list "$@" ;;
+  tree)     cmd_tree "$@" ;;
+  index)    cmd_index ;;
+  recent)   cmd_recent "$@" ;;
+  headings) cmd_headings "$@" ;;
+  summary)  cmd_summary ;;
+  help|--help|-h) cmd_help ;;
+  *)
+    echo "Unknown command: $action" >&2
+    cmd_help >&2
+    exit 1
+    ;;
+esac

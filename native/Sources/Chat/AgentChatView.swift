@@ -15,6 +15,7 @@ struct AgentChatView: View {
     @State var slashCommands = SlashCommandPopup.fallbackSlashCommands
     @State var didAttemptSlashCommandFetch = false
     @State var isSlashCommandPopupVisible = false
+    @State private var expandedImage: NSImage?
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -89,6 +90,16 @@ struct AgentChatView: View {
                 }
                 .transition(.opacity)
                 .zIndex(3)
+            }
+
+            if let expandedImage {
+                ImageFullscreenOverlay(image: expandedImage) {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        self.expandedImage = nil
+                    }
+                }
+                .transition(.opacity)
+                .zIndex(4)
             }
         }
         .background(Color.clear)
@@ -199,7 +210,12 @@ struct AgentChatView: View {
         if !viewModel.pendingImages.isEmpty {
             PendingImageStripView(
                 images: viewModel.pendingImages,
-                onRemove: viewModel.removeImage
+                onRemove: viewModel.removeImage,
+                onTap: { image in
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        expandedImage = image
+                    }
+                }
             )
             .transition(.move(edge: .bottom).combined(with: .opacity))
         }
@@ -270,6 +286,13 @@ struct AgentChatView: View {
     }
 
     private func handleEscapeKey() -> KeyPress.Result {
+        if expandedImage != nil {
+            withAnimation(.easeOut(duration: 0.15)) {
+                expandedImage = nil
+            }
+            return .handled
+        }
+
         if showHotkeyHelp {
             dismissHotkeyHelp()
             return .handled
@@ -320,7 +343,11 @@ struct AgentChatView: View {
         ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
             switch item {
             case .message(let message):
-                AgentMessageBlock(message: message, ghostName: viewModel.ghostName)
+                AgentMessageBlock(message: message, ghostName: viewModel.ghostName, onThumbnailTap: { image in
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        expandedImage = image
+                    }
+                })
             case .toolGroup(let group):
                 ToolCallGroupBlock(
                     group: group,

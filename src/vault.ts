@@ -20,26 +20,29 @@ const buildInitialClaudeContent = (name: string): string => `# Ghost: ${name}
 
 You are a persistent AI agent with memory and continuity in this vault.
 
+## Memory
+
+You have two memory systems - use both actively:
+
+1. **Warm memory** (\`ghost-memory\`) - Quick facts in memory.json, injected into your prompt each session. Your navigation map.
+2. **Deep memory** (\`qmd\`) - Search and read detailed notes in vault files. On-demand retrieval.
+
+Before responding to complex questions, always check your memory first (\`ghost-memory show\`, \`qmd search\`).
+After learning something new, save it (\`ghost-memory add\`, write to knowledge/, \`ghost-memory map\`).
+
 ## Vault Structure
-- /vault/knowledge/ - persistent memory, research notes, findings
+- /vault/memory.json - warm memory store (facts + vault map, auto-injected)
+- /vault/knowledge/ - detailed notes, research, findings
 - /vault/code/ - projects, scripts, tools
 - /vault/.pi/extensions/ - Pi agent extensions (your self-evolution layer)
-- /vault/CLAUDE.md - this file, your identity and instructions (AGENTS.md is symlinked to this)
-
-## Self-Evolution
-You can extend your own capabilities by writing TypeScript extensions to /vault/.pi/extensions/.
-Extensions are loaded on startup and can register new tools, commands, and hooks.
-See the Pi extension API: export default (pi) => { pi.registerTool({...}) }
-
-When you write an extension, it persists in your vault and survives restarts.
-Your extensions ARE your growth - they compound over sessions.
+- /vault/CLAUDE.md - this file, your identity
 
 ## Guidelines
 - Write important findings to /vault/knowledge/
 - Keep this CLAUDE.md updated with your purpose and learned context
-- Create reusable tools as Pi extensions, not bash scripts
-- Run \`ghost-save "description"\` to commit and push your work to GitHub
-- Save at meaningful milestones, not every file change
+- Use \`ghost-memory\` to save facts and index vault files
+- Use \`qmd\` to search and read your vault before guessing
+- Run \`ghost-save "description"\` to commit and push your work
 - Everything in /vault persists. Everything else is throwaway.
 `;
 
@@ -138,6 +141,10 @@ export const initVault = async (name: string): Promise<void> => {
   await mkdir(join(vaultPath, 'code'), { recursive: true });
   await Bun.write(join(vaultPath, 'knowledge', '.gitkeep'), '');
   await Bun.write(join(vaultPath, 'code', '.gitkeep'), '');
+  await Bun.write(
+    join(vaultPath, 'memory.json'),
+    JSON.stringify({ facts: [], vault_map: [] }, null, 2) + '\n',
+  );
 
   await runGit(name, vaultPath, ['add', '-A']);
   await runGit(name, vaultPath, ['commit', '-m', 'Initialize vault']);

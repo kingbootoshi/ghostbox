@@ -377,11 +377,19 @@ final class AgentChatViewModel: ObservableObject {
     }
 
     private func historyMessageToChatMessage(_ message: HistoryMessage) -> ChatMessage {
-        ChatMessage(
+        let thumbnails: [NSImage] = (message.images ?? []).compactMap { imageData in
+            guard let data = Data(base64Encoded: imageData.data),
+                  let image = NSImage(data: data) else { return nil }
+            return image
+        }
+
+        return ChatMessage(
             role: mapRole(message.role),
             content: message.text,
             timestamp: parseTimestamp(message.timestamp),
-            toolName: message.toolName
+            toolName: message.toolName,
+            attachmentCount: message.attachmentCount ?? thumbnails.count,
+            thumbnails: thumbnails
         )
     }
 

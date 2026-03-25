@@ -1,11 +1,18 @@
 import Foundation
 import os
 
+struct HistoryImageData: Decodable {
+    let mediaType: String
+    let data: String
+}
+
 struct HistoryMessage: Decodable {
     let role: String
     let text: String
     let toolName: String?
     let timestamp: String?
+    let attachmentCount: Int?
+    let images: [HistoryImageData]?
 }
 
 struct CompactionInfo: Decodable {

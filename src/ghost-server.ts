@@ -13,7 +13,82 @@ import {
 import type { CompactionInfo, GhostImage, GhostMessage, HistoryMessage } from './types';
 
 const defaultSystemPrompt =
-  'You are a ghost agent. Your vault at /vault is your persistent memory. Write important findings to /vault/knowledge/. Keep /vault/AGENTS.md updated. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
+  'You are a ghost agent. Your vault at /vault is your persistent memory. Use `ghost-memory` to save/search facts and index vault files. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
+
+type MemoryFact = {
+  id: string;
+  content: string;
+  category: string;
+  created: string;
+  updated: string;
+};
+
+type VaultMapEntry = {
+  path: string;
+  summary: string;
+  updated: string;
+};
+
+type MemoryData = {
+  facts: MemoryFact[];
+  vault_map: VaultMapEntry[];
+};
+
+const formatMemoryBlock = (memory: MemoryData): string => {
+  const lines: string[] = [];
+
+  if (memory.facts.length > 0) {
+    lines.push('== MEMORY (your persistent facts - injected at session start) ==');
+    for (const fact of memory.facts) {
+      lines.push(`[${fact.id}] [${fact.category}] ${fact.content}`);
+    }
+    lines.push('');
+  }
+
+  if (memory.vault_map.length > 0) {
+    lines.push('== VAULT MAP (indexed files in your vault - use qmd to read them) ==');
+    for (const entry of memory.vault_map) {
+      lines.push(`  ${entry.path} - ${entry.summary}`);
+    }
+    lines.push('');
+  }
+
+  if (lines.length === 0) {
+    return '';
+  }
+
+  lines.push('Use `ghost-memory` to save/update facts. Use `qmd` to search and read vault files.');
+  lines.push('Your memory persists across sessions. Keep it current - update stale facts, remove obsolete ones.');
+  return lines.join('\n');
+};
+
+const loadMemory = (): MemoryData | null => {
+  try {
+    const raw = readFileSync('/vault/memory.json', 'utf8');
+    const data = JSON.parse(raw) as MemoryData;
+    if (Array.isArray(data.facts) && Array.isArray(data.vault_map)) {
+      return data;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+const buildSystemPrompt = (): string => {
+  const basePrompt = process.env.GHOSTBOX_SYSTEM_PROMPT || defaultSystemPrompt;
+  const memory = loadMemory();
+  if (!memory) {
+    return basePrompt;
+  }
+
+  const memoryBlock = formatMemoryBlock(memory);
+  if (!memoryBlock) {
+    return basePrompt;
+  }
+
+  return `${basePrompt}\n\n${memoryBlock}`;
+};
 
 const settingsPath = '/root/.pi/agent/settings.json';
 const defaultModelContextWindow = 200000;
@@ -248,10 +323,31 @@ const getMessageTimestamp = (message: PiAgentMessage): string | undefined => {
   return timestamp;
 };
 
+const countImageBlocks = (content: unknown): number => {
+  if (!Array.isArray(content)) return 0;
+  return content.filter(
+    (block) => typeof block === 'object' && block !== null && (block as TextBlock).type === 'image',
+  ).length;
+};
+
+const extractImageBlocks = (content: unknown): GhostImage[] => {
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter((block) => typeof block === 'object' && block !== null && (block as TextBlock).type === 'image')
+    .map((block) => {
+      const b = block as { mimeType?: string; data?: string; source?: { mediaType?: string; data?: string } };
+      return {
+        mediaType: b.mimeType || b.source?.mediaType || 'image/png',
+        data: b.data || b.source?.data || '',
+      };
+    })
+    .filter((img) => img.data.length > 0);
+};
+
 const createHistoryMessage = (
   role: HistoryMessage['role'],
   text: string,
-  options?: { allowEmptyText?: boolean; toolName?: string; timestamp?: string },
+  options?: { allowEmptyText?: boolean; toolName?: string; timestamp?: string; attachmentCount?: number; images?: GhostImage[] },
 ): HistoryMessage | null => {
   const trimmedText = text.trim();
   if (!trimmedText && options?.allowEmptyText !== true) {
@@ -263,6 +359,8 @@ const createHistoryMessage = (
     text: trimmedText,
     ...(options?.toolName ? { toolName: options.toolName } : {}),
     ...(options?.timestamp ? { timestamp: options.timestamp } : {}),
+    ...(options?.attachmentCount ? { attachmentCount: options.attachmentCount } : {}),
+    ...(options?.images ? { images: options.images } : {}),
   };
 };
 
@@ -272,8 +370,13 @@ const getHistoryMessages = (messages: PiAgentMessage[]): HistoryMessage[] => {
     const toolName = typeof message.toolName === 'string' ? message.toolName : undefined;
 
     if (message.role === 'user' || message.role === 'system') {
+      const imageCount = message.role === 'user' ? countImageBlocks(message.content) : 0;
+      const images = imageCount > 0 ? extractImageBlocks(message.content) : undefined;
       const historyMessage = createHistoryMessage(message.role, getContentText(message.content), {
         timestamp,
+        allowEmptyText: imageCount > 0,
+        ...(imageCount > 0 ? { attachmentCount: imageCount } : {}),
+        ...(images && images.length > 0 ? { images } : {}),
       });
       return historyMessage ? [historyMessage] : [];
     }
@@ -442,7 +545,6 @@ const writeCompactionSettings = (
 
 const authStorage = AuthStorage.create();
 const modelRegistry = new ModelRegistry(authStorage);
-const systemPrompt = process.env.GHOSTBOX_SYSTEM_PROMPT || defaultSystemPrompt;
 const startupModelValue = process.env.GHOSTBOX_MODEL;
 const configuredApiKeys = parseApiKeys(process.env.GHOSTBOX_API_KEYS);
 const startupModel = startupModelValue
@@ -458,7 +560,7 @@ const resumedSession = Boolean(sessionManagerCandidate.getSessionFile());
 
 const resourceLoader = new DefaultResourceLoader({
   cwd: '/vault',
-  systemPromptOverride: () => systemPrompt,
+  systemPromptOverride: () => buildSystemPrompt(),
   appendSystemPromptOverride: () => [],
 });
 await resourceLoader.reload();

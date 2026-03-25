@@ -3,6 +3,7 @@ import SwiftUI
 struct AgentMessageBlock: View {
     let message: ChatMessage
     let ghostName: String
+    var onThumbnailTap: ((NSImage) -> Void)?
 
     private static let formatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -74,6 +75,10 @@ struct AgentMessageBlock: View {
                     .scaledToFill()
                     .frame(width: 40, height: 40)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        onThumbnailTap?(thumbnail)
+                    }
             }
         }
     }

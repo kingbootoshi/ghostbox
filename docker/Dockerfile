@@ -29,9 +29,13 @@ COPY ghost-server.js /ghost-server.js
 COPY entrypoint.sh /entrypoint.sh
 COPY ghost-save /usr/local/bin/ghost-save
 COPY exa-search /usr/local/bin/exa-search
+COPY ghost-memory /usr/local/bin/ghost-memory
+COPY qmd /usr/local/bin/qmd
 RUN chmod +x /entrypoint.sh
 RUN chmod +x /usr/local/bin/ghost-save
 RUN chmod +x /usr/local/bin/exa-search
+RUN chmod +x /usr/local/bin/ghost-memory
+RUN chmod +x /usr/local/bin/qmd
 
 WORKDIR /vault
 EXPOSE 3000 8001-8009

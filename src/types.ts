@@ -98,6 +98,8 @@ export type HistoryMessage = {
   text: string;
   toolName?: string;
   timestamp?: string;
+  attachmentCount?: number;
+  images?: GhostImage[];
 };
 
 export type CompactionInfo = {

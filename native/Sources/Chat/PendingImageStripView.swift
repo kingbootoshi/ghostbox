@@ -3,6 +3,7 @@ import SwiftUI
 struct PendingImageStripView: View {
     let images: [PendingImage]
     let onRemove: (UUID) -> Void
+    var onTap: ((NSImage) -> Void)?
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -25,6 +26,8 @@ struct PendingImageStripView: View {
                                 .scaledToFill()
                                 .frame(width: 48, height: 48)
                                 .clipShape(RoundedRectangle(cornerRadius: 14))
+                                .contentShape(Rectangle())
+                                .onTapGesture { onTap?(image.thumbnail) }
                                 .padding(4)
                         }
                     }
