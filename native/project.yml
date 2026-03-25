@@ -18,6 +18,9 @@ targets:
       - path: Resources/Fonts
         buildPhase: resources
         type: folder
+      - path: Resources/Images
+        buildPhase: resources
+        type: folder
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ghostbox.app

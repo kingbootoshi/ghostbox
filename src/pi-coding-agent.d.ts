@@ -2,6 +2,7 @@ declare module '@mariozechner/pi-coding-agent' {
   export type PiModel = {
     provider: string;
     id: string;
+    contextWindow?: number;
   };
 
   export type PiAgentMessage = {
@@ -42,6 +43,18 @@ declare module '@mariozechner/pi-coding-agent' {
         [key: string]: unknown;
       };
 
+  export type SessionStats = {
+    tokens: number;
+    cost: number;
+    totalMessages: number;
+  };
+
+  export type ContextUsage = {
+    tokens: number;
+    contextWindow: number;
+    percent: number;
+  };
+
   export class AuthStorage {
     static create(path?: string): AuthStorage;
   }
@@ -73,10 +86,22 @@ declare module '@mariozechner/pi-coding-agent' {
     readonly state: { messages: PiAgentMessage[] };
     readonly sessionFile: string | undefined;
     subscribe(listener: (event: PiAgentSessionEvent) => void): () => void;
-    prompt(text: string): Promise<void>;
+    prompt(text: string, options?: {
+      images?: Array<{ type: 'image'; mimeType: string; data: string }>;
+      streamingBehavior?: 'steer' | 'followUp';
+      source?: string;
+    }): Promise<void>;
     setModel(model: PiModel): Promise<void>;
     reload(): Promise<void>;
     compact(customInstructions?: string): Promise<void>;
+    abort(): Promise<void>;
+    newSession(options?: {
+      parentSession?: string;
+      setup?: (sessionManager: SessionManager) => Promise<void>;
+    }): Promise<boolean>;
+    clearQueue(): { steering: string[]; followUp: string[] };
+    getSessionStats(): SessionStats;
+    getContextUsage(): ContextUsage | null;
   }
 
   export const codingTools: unknown[];

@@ -5,17 +5,20 @@ import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, relative, resolve, sep } from 'node:path';
 
 import {
+  abortGhost,
   compactGhost,
   generateApiKey,
   getConfig,
   getGhost,
   getGhostHealth,
   getGhostHistory,
+  getGhostStats,
   killGhost,
   listApiKeys,
   listGhosts,
   loadState,
   mergeGhosts,
+  newGhostSession,
   reloadGhost,
   removeGhost,
   saveState,
@@ -25,6 +28,7 @@ import {
   wakeGhost,
 } from './orchestrator';
 import type {
+  GhostImage,
   GhostboxConfig,
   GhostboxConfigResponse,
   GhostboxConfigSensitiveStatus,
@@ -60,6 +64,7 @@ type SpawnBody = {
 type MessageBody = {
   prompt?: unknown;
   model?: unknown;
+  images?: unknown;
 };
 
 type GenerateKeyBody = {
@@ -290,6 +295,33 @@ const normalizeSensitiveConfigValue = (
   return trimmed;
 };
 
+const normalizeGhostImages = (value: unknown): GhostImage[] | undefined => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Array.isArray(value)) {
+    throw new ApiError(400, 'Invalid images');
+  }
+
+  return value.map((image) => {
+    if (typeof image !== 'object' || image === null) {
+      throw new ApiError(400, 'Invalid images');
+    }
+
+    const { mediaType, data } = image as {
+      mediaType?: unknown;
+      data?: unknown;
+    };
+
+    if (typeof mediaType !== 'string' || typeof data !== 'string') {
+      throw new ApiError(400, 'Invalid images');
+    }
+
+    return { mediaType, data };
+  });
+};
+
 const getErrorStatus = (error: unknown): ApiStatusCode => {
   if (error instanceof ApiError) {
     return error.status;
@@ -447,6 +479,11 @@ app.get('/api/ghosts/:name/history', (c) =>
     return c.json(await getGhostHistory(c.req.param('name')));
   }));
 
+app.get('/api/ghosts/:name/stats', (c) =>
+  handleRoute(c, async () => {
+    return c.json(await getGhostStats(c.req.param('name')));
+  }));
+
 app.post('/api/ghosts/:name/message', async (c) => {
   try {
     const name = c.req.param('name');
@@ -454,6 +491,7 @@ app.post('/api/ghosts/:name/message', async (c) => {
     const prompt = typeof body.prompt === 'string' ? body.prompt : '';
     const modelValue = typeof body.model === 'string' ? body.model.trim() : '';
     const model = modelValue || undefined;
+    const images = normalizeGhostImages(body.images);
     const ghost = await getGhost(name);
 
     if (!prompt) {
@@ -464,7 +502,7 @@ app.post('/api/ghosts/:name/message', async (c) => {
       throw new ApiError(409, `Ghost "${name}" is not running.`);
     }
 
-    const messages = sendMessage(name, prompt, model);
+    const messages = sendMessage(name, prompt, model, images);
 
     return streamSSE(
       c,
@@ -701,6 +739,18 @@ app.post('/api/ghosts/:name/compact', (c) =>
   handleRoute(c, async () => {
     await compactGhost(c.req.param('name'));
     return c.json({ status: 'compacted' });
+  }));
+
+app.post('/api/ghosts/:name/abort', (c) =>
+  handleRoute(c, async () => {
+    await abortGhost(c.req.param('name'));
+    return c.json({ status: 'aborted' });
+  }));
+
+app.post('/api/ghosts/:name/new', (c) =>
+  handleRoute(c, async () => {
+    await newGhostSession(c.req.param('name'));
+    return c.json({ status: 'new_session' });
   }));
 
 app.notFound((c) => c.json({ error: 'Not found' }, { status: 404 }));

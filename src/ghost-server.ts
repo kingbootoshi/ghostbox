@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { readFileSync, writeFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import {
@@ -9,10 +10,17 @@ import {
   ModelRegistry,
   SessionManager,
 } from '@mariozechner/pi-coding-agent';
-import type { CompactionInfo, GhostMessage, HistoryMessage } from './types';
+import type { CompactionInfo, GhostImage, GhostMessage, HistoryMessage } from './types';
 
 const defaultSystemPrompt =
-  'You are a ghost agent. Your vault at /vault is your persistent memory. Write important findings to /vault/knowledge/. Keep /vault/CLAUDE.md updated. Create tools in /vault/code/tools/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
+  'You are a ghost agent. Your vault at /vault is your persistent memory. Write important findings to /vault/knowledge/. Keep /vault/AGENTS.md updated. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
+
+const settingsPath = '/root/.pi/agent/settings.json';
+const defaultModelContextWindow = 200000;
+const compactionTargetRatio = 0.25;
+const maxCompactionTargetTokens = 250000;
+const minReserveTokens = 16384;
+const keepRecentTokens = 20000;
 
 type LogContext = Record<string, unknown>;
 
@@ -24,6 +32,7 @@ type TextBlock = {
 type PiModel = {
   provider: string;
   id: string;
+  contextWindow?: number;
 };
 
 type PiAgentMessage = {
@@ -45,6 +54,12 @@ type PiAgentEvent = {
   result?: unknown;
   isError?: boolean;
   messages?: unknown[];
+};
+
+type PiPromptImage = {
+  type: 'image';
+  mimeType: string;
+  data: string;
 };
 
 type SlashCommandHandler = (
@@ -69,6 +84,17 @@ const isToolExecutionEndEvent = (event: PiAgentEvent): boolean =>
   event.type === 'tool_execution_end';
 
 const isAgentEndEvent = (event: PiAgentEvent): boolean => event.type === 'agent_end';
+
+const extractAgentEndError = (event: PiAgentEvent): string | undefined => {
+  if (!Array.isArray(event.messages)) return undefined;
+  for (const msg of event.messages) {
+    const m = msg as PiAgentMessage & { stopReason?: string; errorMessage?: string };
+    if (m.role === 'assistant' && m.errorMessage) {
+      return m.errorMessage;
+    }
+  }
+  return undefined;
+};
 
 const formatContext = (context?: LogContext): string => {
   if (!context) return '';
@@ -359,6 +385,61 @@ const resolveModel = (modelRegistry: ModelRegistry, value: string): PiModel => {
   return model;
 };
 
+const getCompactionSettings = (
+  model: PiModel | undefined,
+): {
+  modelContextWindow: number;
+  compactionTarget: number;
+  reserveTokens: number;
+  keepRecentTokens: number;
+} => {
+  const modelContextWindow = model?.contextWindow ?? defaultModelContextWindow;
+  const compactionTarget = Math.min(
+    modelContextWindow * compactionTargetRatio,
+    maxCompactionTargetTokens,
+  );
+  const reserveTokens = Math.max(modelContextWindow - compactionTarget, minReserveTokens);
+
+  return {
+    modelContextWindow,
+    compactionTarget,
+    reserveTokens,
+    keepRecentTokens,
+  };
+};
+
+const writeCompactionSettings = (
+  path: string,
+  model: PiModel | undefined,
+): ReturnType<typeof getCompactionSettings> => {
+  let existingSettings: Record<string, unknown> = {};
+
+  try {
+    existingSettings = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+  } catch {
+    existingSettings = {};
+  }
+
+  const compactionSettings = getCompactionSettings(model);
+  const existingCompaction = isRecord(existingSettings.compaction)
+    ? existingSettings.compaction
+    : {};
+
+  const nextSettings = {
+    ...existingSettings,
+    compaction: {
+      ...existingCompaction,
+      enabled: true,
+      reserveTokens: compactionSettings.reserveTokens,
+      keepRecentTokens: compactionSettings.keepRecentTokens,
+    },
+  };
+
+  writeFileSync(path, JSON.stringify(nextSettings, null, 2));
+
+  return compactionSettings;
+};
+
 const authStorage = AuthStorage.create();
 const modelRegistry = new ModelRegistry(authStorage);
 const systemPrompt = process.env.GHOSTBOX_SYSTEM_PROMPT || defaultSystemPrompt;
@@ -367,6 +448,7 @@ const configuredApiKeys = parseApiKeys(process.env.GHOSTBOX_API_KEYS);
 const startupModel = startupModelValue
   ? resolveModel(modelRegistry, startupModelValue)
   : undefined;
+const compactionSettings = writeCompactionSettings(settingsPath, startupModel);
 
 const sessionManagerCandidate = SessionManager.continueRecent('/vault');
 const sessionManager = sessionManagerCandidate.getSessionFile()
@@ -396,6 +478,13 @@ log.info('Pi session ready', {
   resumed: resumedSession,
   model: startupModelValue ?? 'default',
   apiKeyCount: configuredApiKeys.length,
+  compaction: {
+    settingsPath,
+    modelContextWindow: compactionSettings.modelContextWindow,
+    targetTokens: compactionSettings.compactionTarget,
+    reserveTokens: compactionSettings.reserveTokens,
+    keepRecentTokens: compactionSettings.keepRecentTokens,
+  },
 });
 
 let currentModelValue = startupModelValue ?? 'default';
@@ -411,10 +500,23 @@ const runQueued = async <T>(task: () => Promise<T>): Promise<T> => {
   return run;
 };
 
+const toPiPromptImages = (images: GhostImage[] | undefined): PiPromptImage[] | undefined => {
+  if (!images) {
+    return undefined;
+  }
+
+  return images.map(({ mediaType, data }) => ({
+    type: 'image',
+    mimeType: mediaType,
+    data,
+  }));
+};
+
 const streamPrompt = async (
   res: ServerResponse,
   prompt: string,
   modelValue?: string,
+  images?: GhostImage[],
 ): Promise<void> => {
   startNdjsonResponse(res);
 
@@ -446,7 +548,17 @@ const streamPrompt = async (
         }
 
         if (isMessageEndEvent(event) && event.message?.role === 'assistant') {
+          const msg = event.message as PiAgentMessage & { stopReason?: string; errorMessage?: string };
           const fullText = currentAssistantText || getAssistantText(event.message.content);
+
+          if (msg.stopReason === 'error' || msg.stopReason === 'aborted') {
+            const errorText = msg.errorMessage || 'Agent encountered an error.';
+            log.error('SDK assistant error', { stopReason: msg.stopReason, error: errorText });
+            sendJsonLine(res, { type: 'assistant', text: errorText });
+            currentAssistantText = '';
+            return;
+          }
+
           if (fullText) {
             lastAssistantText = fullText;
             log.info('SDK assistant', {
@@ -484,13 +596,16 @@ const streamPrompt = async (
         }
 
         if (isAgentEndEvent(event)) {
-          log.info('SDK result', { sessionId: session.sessionId });
+          const errorText = extractAgentEndError(event);
+          if (errorText) {
+            log.error('SDK agent_end error', { error: errorText, sessionId: session.sessionId });
+          }
+          log.info('SDK result', { sessionId: session.sessionId, hasError: Boolean(errorText) });
           sendJsonLine(res, {
             type: 'result',
-            text: '',
+            text: lastAssistantText || errorText || '',
             sessionId: session.sessionId,
           });
-          unsubscribe();
           resolve();
         }
       } catch (error) {
@@ -501,12 +616,21 @@ const streamPrompt = async (
   });
 
   try {
+    const transformedImages = toPiPromptImages(images);
+
     log.info('Pi prompt start', {
       sessionId: session.sessionId,
       chars: prompt.length,
+      imageCount: transformedImages?.length ?? 0,
       preview: prompt.slice(0, 200),
     });
-    await session.prompt(prompt);
+
+    if (transformedImages && transformedImages.length > 0) {
+      await session.prompt(prompt, { images: transformedImages });
+    } else {
+      await session.prompt(prompt);
+    }
+
     await completion;
   } catch (error) {
     unsubscribe();
@@ -602,6 +726,25 @@ registerSlashCommand({
   },
 });
 
+registerSlashCommand({
+  name: '/new',
+  description: 'Start a fresh session. Clears all messages and history.',
+  handler: async (res) => {
+    try {
+      log.info('Pi slash new start', { sessionId: session.sessionId });
+      await session.newSession();
+      log.info('Pi slash new complete', { sessionId: session.sessionId });
+      sendAssistantResult(res, 'New session started.');
+    } catch (error) {
+      log.error('Pi slash new failed', serializeError(error));
+      sendAssistantResult(
+        res,
+        error instanceof Error ? error.message : 'New session failed.',
+      );
+    }
+  },
+});
+
 const streamSlashCommand = async (
   res: ServerResponse,
   command: SlashCommand,
@@ -636,16 +779,46 @@ const handleMessage = async (
 
   const requestBody =
     typeof body === 'object' && body !== null
-      ? (body as { prompt?: unknown; model?: unknown })
+      ? (body as { prompt?: unknown; model?: unknown; images?: unknown })
       : {};
 
   const prompt = requestBody.prompt;
   const model = typeof requestBody.model === 'string' ? requestBody.model : undefined;
+  const imagesValue = requestBody.images;
 
   if (typeof prompt !== 'string') {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Missing prompt' }));
     return;
+  }
+
+  if (imagesValue !== undefined && !Array.isArray(imagesValue)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid images' }));
+    return;
+  }
+
+  let images: GhostImage[] | undefined;
+  if (Array.isArray(imagesValue)) {
+    images = [];
+
+    for (const image of imagesValue) {
+      if (!image || typeof image !== 'object') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid images' }));
+        return;
+      }
+
+      const { mediaType, data } = image as { mediaType?: unknown; data?: unknown };
+
+      if (typeof mediaType !== 'string' || typeof data !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid images' }));
+        return;
+      }
+
+      images.push({ mediaType, data });
+    }
   }
 
   const slashCommand = parseSlashCommandPrompt(prompt);
@@ -657,7 +830,7 @@ const handleMessage = async (
     }
   }
 
-  await runQueued(() => streamPrompt(res, prompt, model));
+  await runQueued(() => streamPrompt(res, prompt, model, images));
 };
 
 const handleReload = async (res: ServerResponse): Promise<void> => {
@@ -680,7 +853,17 @@ const handleReload = async (res: ServerResponse): Promise<void> => {
 
 const handleHistory = (res: ServerResponse): void => {
   try {
-    const entries = sessionManager.getEntries();
+    const entries = (
+      sessionManager as SessionManager & {
+        getEntries: () => Array<{
+          type: string;
+          message?: PiAgentMessage;
+          timestamp?: string;
+          summary?: string;
+          tokensBefore?: number;
+        }>;
+      }
+    ).getEntries();
 
     let lastCompactionIndex = -1;
     const compactions: CompactionInfo[] = [];
@@ -689,15 +872,10 @@ const handleHistory = (res: ServerResponse): void => {
       const entry = entries[i];
       if (entry.type === 'compaction') {
         lastCompactionIndex = i;
-        const compactionEntry = entry as unknown as {
-          timestamp: string;
-          summary: string;
-          tokensBefore: number;
-        };
         compactions.push({
-          timestamp: compactionEntry.timestamp,
-          summary: compactionEntry.summary,
-          tokensBefore: compactionEntry.tokensBefore,
+          timestamp: entry.timestamp ?? '',
+          summary: entry.summary ?? '',
+          tokensBefore: entry.tokensBefore ?? 0,
         });
       }
     }
@@ -711,7 +889,10 @@ const handleHistory = (res: ServerResponse): void => {
         continue;
       }
 
-      const message = (entry as unknown as { message: PiAgentMessage }).message;
+      const message = entry.message;
+      if (!message) {
+        continue;
+      }
 
       if (lastCompactionIndex >= 0 && i < lastCompactionIndex) {
         preCompactionPiMessages.push(message);
@@ -757,6 +938,39 @@ const handleCompact = async (res: ServerResponse): Promise<void> => {
   }
 };
 
+const handleStats = (res: ServerResponse): void => {
+  try {
+    const stats = session.getSessionStats();
+    const contextUsage = session.getContextUsage();
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        sessionId: session.sessionId,
+        model: currentModelValue,
+        tokens: stats.tokens,
+        cost: stats.cost,
+        messageCount: stats.totalMessages,
+        context: contextUsage
+          ? {
+              used: contextUsage.tokens,
+              window: contextUsage.contextWindow,
+              percent: contextUsage.percent,
+            }
+          : null,
+      }),
+    );
+  } catch (error) {
+    log.error('Pi stats failed', serializeError(error));
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        error: error instanceof Error ? error.message : 'Stats failed',
+      }),
+    );
+  }
+};
+
 const handleRequest = async (
   req: IncomingMessage,
   res: ServerResponse,
@@ -797,6 +1011,12 @@ const handleRequest = async (
     return;
   }
 
+  if (req.method === 'GET' && req.url === '/stats') {
+    handleStats(res);
+    log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
+    return;
+  }
+
   if (req.method === 'GET' && req.url === '/commands') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(
@@ -819,6 +1039,38 @@ const handleRequest = async (
 
   if (req.method === 'POST' && req.url === '/compact') {
     await handleCompact(res);
+    log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/abort') {
+    try {
+      log.info('Pi abort start', { sessionId: session.sessionId });
+      await session.abort();
+      log.info('Pi abort complete', { sessionId: session.sessionId });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'aborted' }));
+    } catch (error) {
+      log.error('Pi abort failed', serializeError(error));
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Abort failed' }));
+    }
+    log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/new') {
+    try {
+      log.info('Pi new session start', { sessionId: session.sessionId });
+      await session.newSession();
+      log.info('Pi new session complete', { sessionId: session.sessionId });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'new_session', sessionId: session.sessionId }));
+    } catch (error) {
+      log.error('Pi new session failed', serializeError(error));
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'New session failed' }));
+    }
     log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
     return;
   }

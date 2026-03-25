@@ -28,7 +28,7 @@ class GlassPanel: NSPanel {
         isMovableByWindowBackground = true
         animationBehavior = .none
         collectionBehavior = [.fullScreenAuxiliary]
-        minSize = NSSize(width: 320, height: 400)
+        minSize = NSSize(width: 380, height: 450)
         if let screen = NSScreen.main {
             maxSize = screen.frame.size
         } else {

@@ -123,13 +123,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem?.isVisible = true
 
         if let button = statusItem?.button {
-            button.title = "Ghostbox"
-            button.image = NSImage(systemSymbolName: "ghost.fill", accessibilityDescription: "Ghostbox")
-            button.image?.size = NSSize(width: 16, height: 16)
-            button.image?.isTemplate = true
-            button.imagePosition = .imageLeading
+            if let ghostImage = Self.loadMenuBarIcon() {
+                button.image = ghostImage
+            } else {
+                button.title = "Ghost"
+            }
         }
 
         let menu = NSMenu()
@@ -160,6 +161,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.toggleHub()
         })
         hotKeyMonitor?.register()
+    }
+
+    private static func loadMenuBarIcon() -> NSImage? {
+        guard let imageURL = Bundle.main.url(forResource: "ghost-menubar@2x", withExtension: "png", subdirectory: "Images"),
+              let image = NSImage(contentsOf: imageURL) else {
+            return nil
+        }
+
+        let targetHeight: CGFloat = 22
+        let ratio = image.size.width / image.size.height
+        let targetSize = NSSize(width: ceil(targetHeight * ratio), height: targetHeight)
+        let resized = NSImage(size: targetSize)
+        resized.lockFocus()
+        image.draw(
+            in: NSRect(origin: .zero, size: targetSize),
+            from: NSRect(origin: .zero, size: image.size),
+            operation: .copy,
+            fraction: 1
+        )
+        resized.unlockFocus()
+        return resized
     }
 
     @objc private func toggleHubMenuAction() {

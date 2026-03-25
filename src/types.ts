@@ -7,6 +7,11 @@ export interface GhostApiKey {
   createdAt: string;
 }
 
+export interface GhostImage {
+  mediaType: string;
+  data: string;
+}
+
 export interface VaultEntry {
   name: string;
   path: string;
@@ -105,6 +110,19 @@ export type HistoryResponse = {
   messages: HistoryMessage[];
   preCompactionMessages: HistoryMessage[];
   compactions: CompactionInfo[];
+};
+
+export type GhostStats = {
+  sessionId: string;
+  model: string;
+  tokens: number;
+  cost: number;
+  messageCount: number;
+  context: {
+    used: number;
+    window: number;
+    percent: number;
+  } | null;
 };
 
 export type GhostMessage =

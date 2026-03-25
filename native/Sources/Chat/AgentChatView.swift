@@ -31,6 +31,7 @@ struct AgentChatView: View {
                 ZStack {
                     VStack(spacing: 0) {
                         chatContent
+                        attachmentStrip
 
                         ChatInputView(
                             inputText: $viewModel.inputText,
@@ -40,6 +41,8 @@ struct AgentChatView: View {
                             isInputFocused: $isInputFocused,
                             showsSlashCommandPopup: showsSlashCommandPopup,
                             firstFilteredSlashCommand: filteredSlashCommands.first,
+                            stats: viewModel.stats,
+                            onPasteCommand: viewModel.addImageFromPasteboard,
                             onSubmit: submitInput
                         )
                     }
@@ -191,6 +194,17 @@ struct AgentChatView: View {
         }
     }
 
+    @ViewBuilder
+    private var attachmentStrip: some View {
+        if !viewModel.pendingImages.isEmpty {
+            PendingImageStripView(
+                images: viewModel.pendingImages,
+                onRemove: viewModel.removeImage
+            )
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
     private var statusColor: Color {
         switch viewModel.ghost?.status {
         case .running:
@@ -258,6 +272,11 @@ struct AgentChatView: View {
     private func handleEscapeKey() -> KeyPress.Result {
         if showHotkeyHelp {
             dismissHotkeyHelp()
+            return .handled
+        }
+
+        if viewModel.isStreaming {
+            viewModel.cancelStream()
             return .handled
         }
 

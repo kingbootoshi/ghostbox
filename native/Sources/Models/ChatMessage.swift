@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 struct ChatMessage: Identifiable {
@@ -6,6 +7,8 @@ struct ChatMessage: Identifiable {
     let content: String
     let timestamp: Date
     let toolName: String?
+    let attachmentCount: Int
+    let thumbnails: [NSImage]
 
     enum Role {
         case user
@@ -20,13 +23,17 @@ struct ChatMessage: Identifiable {
         role: Role,
         content: String,
         timestamp: Date = Date(),
-        toolName: String? = nil
+        toolName: String? = nil,
+        attachmentCount: Int = 0,
+        thumbnails: [NSImage] = []
     ) {
         self.id = id
         self.role = role
         self.content = content
         self.timestamp = timestamp
         self.toolName = toolName
+        self.attachmentCount = attachmentCount
+        self.thumbnails = thumbnails
     }
 }
 

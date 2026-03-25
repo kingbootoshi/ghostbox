@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# exa-search: CLI wrapper for Exa search via hosted MCP endpoint.
+# No API key required. Works anywhere with curl + jq.
+#
+# Usage:
+#   exa-search "query"                    # web search (default)
+#   exa-search --code "query"             # code search (GitHub, docs, SO)
+#   exa-search --code --tokens 10000 "q"  # code search with more context
+#   exa-search --results 5 "query"        # limit number of results
+
+EXA_MCP_URL="https://mcp.exa.ai/mcp"
+
+mode="web"
+num_results=5
+tokens_num=5000
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --code) mode="code"; shift ;;
+    --results) num_results="$2"; shift 2 ;;
+    --tokens) tokens_num="$2"; shift 2 ;;
+    --help|-h)
+      echo "Usage: exa-search [--code] [--results N] [--tokens N] \"query\""
+      echo ""
+      echo "Options:"
+      echo "  --code        Code search (GitHub, docs, Stack Overflow)"
+      echo "  --results N   Number of results (default: 5)"
+      echo "  --tokens N    Tokens for code search (default: 5000)"
+      echo ""
+      echo "Examples:"
+      echo "  exa-search \"Next.js app router middleware patterns\""
+      echo "  exa-search --code \"Express.js error handling middleware\""
+      exit 0
+      ;;
+    *) break ;;
+  esac
+done
+
+if [ $# -eq 0 ]; then
+  echo "Usage: exa-search [--code] [--results N] [--tokens N] \"query\"" >&2
+  exit 1
+fi
+
+query="$*"
+
+if [ "$mode" = "code" ]; then
+  payload=$(jq -n \
+    --arg query "$query" \
+    --argjson tokens "$tokens_num" \
+    '{
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "get_code_context_exa",
+        arguments: { query: $query, tokensNum: $tokens }
+      }
+    }')
+else
+  payload=$(jq -n \
+    --arg query "$query" \
+    --argjson num "$num_results" \
+    '{
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "web_search_exa",
+        arguments: { query: $query, numResults: $num }
+      }
+    }')
+fi
+
+response=$(curl -s -X POST "$EXA_MCP_URL" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d "$payload" 2>&1)
+
+# MCP returns SSE format: "event: message\ndata: {...}"
+json=$(echo "$response" | sed 's/^event: message$//' | sed '/^$/d' | sed 's/^data: //')
+
+# Check for errors
+error=$(echo "$json" | jq -r '.error.message // empty' 2>/dev/null)
+if [ -n "$error" ]; then
+  echo "exa-search error: $error" >&2
+  exit 1
+fi
+
+# Extract and print the text content
+echo "$json" | jq -r '.result.content[0].text // "No results found."' 2>/dev/null

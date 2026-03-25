@@ -59,6 +59,34 @@ struct GhostboxConfig: Decodable {
     let hasSensitive: GhostboxConfigSensitiveStatus
 }
 
+struct GhostStats: Decodable {
+    let sessionId: String
+    let model: String
+    let tokens: GhostStatsTokens
+    let cost: Double
+    let messageCount: Int
+    let context: GhostStatsContext?
+}
+
+struct GhostStatsTokens: Decodable {
+    let input: Int?
+    let output: Int?
+    let cacheRead: Int?
+    let cacheWrite: Int?
+    let total: Int?
+}
+
+struct GhostStatsContext: Decodable {
+    let used: Int
+    let window: Int
+    let percent: Double
+}
+
+struct GhostboxMessageImage: Encodable {
+    let mediaType: String
+    let data: String
+}
+
 final class GhostboxClient {
     private static let logger = Logger(subsystem: "com.ghostbox.app", category: "network")
 
@@ -180,6 +208,29 @@ final class GhostboxClient {
         _ = try await decodeResponse(for: request, as: VaultWriteResponse.self)
     }
 
+    func abortGhost(name: String) async throws {
+        let request = makeRequest(
+            path: ["api", "ghosts", name, "abort"],
+            method: "POST",
+            body: Data("{}".utf8)
+        )
+        _ = try await perform(request)
+    }
+
+    func newGhostSession(name: String) async throws {
+        let request = makeRequest(
+            path: ["api", "ghosts", name, "new"],
+            method: "POST",
+            body: Data("{}".utf8)
+        )
+        _ = try await perform(request)
+    }
+
+    func fetchStats(ghostName: String) async throws -> GhostStats {
+        let request = makeRequest(path: ["api", "ghosts", ghostName, "stats"])
+        return try await decodeResponse(for: request, as: GhostStats.self)
+    }
+
     func fetchCommands(ghostName: String) async throws -> [GhostSlashCommand] {
         let request = makeRequest(path: ["api", "ghosts", ghostName, "commands"])
         return try await decodeResponse(for: request, as: [GhostSlashCommand].self)
@@ -209,17 +260,25 @@ final class GhostboxClient {
     func sendMessage(
         ghostName: String,
         prompt: String,
-        model: String? = nil
+        model: String? = nil,
+        images: [GhostboxMessageImage]? = nil
     ) -> AsyncThrowingStream<GhostMessage, Error> {
         struct SendMessageRequest: Encodable {
             let prompt: String
             let model: String?
+            let images: [GhostboxMessageImage]?
         }
 
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let body = try encoder.encode(SendMessageRequest(prompt: prompt, model: model))
+                    let body = try encoder.encode(
+                        SendMessageRequest(
+                            prompt: prompt,
+                            model: model,
+                            images: images
+                        )
+                    )
                     var request = makeRequest(
                         path: ["api", "ghosts", ghostName, "message"],
                         method: "POST",

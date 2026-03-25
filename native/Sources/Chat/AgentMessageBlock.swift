@@ -31,17 +31,50 @@ struct AgentMessageBlock: View {
 
     @ViewBuilder
     private var markdownContent: some View {
-        if message.role == .ghost || message.role == .system,
-           let attributed = try? AttributedString(markdown: message.content, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
-            Text(attributed)
-                .font(Theme.Typography.body())
-                .foregroundColor(contentColor)
-                .lineSpacing(5.6)
-        } else {
-            Text(message.content)
-                .font(Theme.Typography.body())
-                .foregroundColor(contentColor)
-                .lineSpacing(5.6)
+        VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 8) {
+            if !message.thumbnails.isEmpty {
+                inlineThumbnails
+            } else if message.attachmentCount > 0 {
+                HStack(spacing: 4) {
+                    Image(systemName: "photo")
+                        .font(.system(size: 10))
+                    Text("\(message.attachmentCount) image\(message.attachmentCount == 1 ? "" : "s")")
+                }
+                .font(Theme.Typography.caption())
+                .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.white.opacity(0.04))
+                .clipShape(Capsule())
+            }
+
+            if !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if message.role == .ghost || message.role == .system,
+                   let attributed = try? AttributedString(markdown: message.content, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
+                    Text(attributed)
+                        .font(Theme.Typography.body())
+                        .foregroundColor(contentColor)
+                        .lineSpacing(5.6)
+                } else {
+                    Text(message.content)
+                        .font(Theme.Typography.body())
+                        .foregroundColor(contentColor)
+                        .lineSpacing(5.6)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var inlineThumbnails: some View {
+        HStack(spacing: 6) {
+            ForEach(Array(message.thumbnails.enumerated()), id: \.offset) { _, thumbnail in
+                Image(nsImage: thumbnail)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 40, height: 40)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
         }
     }
 

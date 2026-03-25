@@ -36,6 +36,7 @@ struct ChatHeaderView: View {
                     .font(Theme.Typography.label())
                     .foregroundColor(Color.white.opacity(Theme.Text.secondary))
                     .buttonStyle(.plain)
+                    .fixedSize()
                 }
 
                 ChatHeaderButton(
@@ -43,6 +44,7 @@ struct ChatHeaderView: View {
                     systemImage: showsVaultBrowser ? "bubble.left.and.bubble.right" : "folder",
                     action: toggleVaultBrowser
                 )
+                .fixedSize()
 
                 Button(action: toggleFullscreen) {
                     Image(systemName: "arrow.up.left.and.arrow.down.right")

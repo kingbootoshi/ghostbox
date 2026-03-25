@@ -138,14 +138,28 @@ struct VaultBrowserView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 20))
                     } else {
                         ScrollView {
-                            Text(file.content)
-                                .font(Theme.Typography.body())
-                                .foregroundColor(Color.white.opacity(Theme.Text.primary))
-                                .kerning(0.1)
-                                .lineSpacing(4.8)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .topLeading)
-                                .padding(18)
+                            if file.path.hasSuffix(".md"),
+                               let attributed = try? AttributedString(
+                                   markdown: file.content,
+                                   options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+                               ) {
+                                Text(attributed)
+                                    .font(Theme.Typography.body())
+                                    .foregroundColor(Color.white.opacity(Theme.Text.primary))
+                                    .lineSpacing(5.6)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                                    .padding(18)
+                            } else {
+                                Text(file.content)
+                                    .font(Theme.Typography.body())
+                                    .foregroundColor(Color.white.opacity(Theme.Text.primary))
+                                    .kerning(0.1)
+                                    .lineSpacing(4.8)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                                    .padding(18)
+                            }
                         }
                         .background(Color.white.opacity(0.03))
                         .clipShape(RoundedRectangle(cornerRadius: 20))
