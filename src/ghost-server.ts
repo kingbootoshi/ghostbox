@@ -1843,15 +1843,19 @@ const handleRequest = async (
 // Register nudge handlers
 // ---------------------------------------------------------------------------
 
-// Memory observer: fires on compaction, new session, and every N messages
+// Memory observer: fires on compaction, new session, every N messages, and self-triggered memory reviews
 nudges.register({
   id: 'memory-observer',
-  event: ['pre-compact', 'pre-new-session', 'message-complete'],
+  event: ['pre-compact', 'pre-new-session', 'message-complete', 'self', 'timer'],
   messageInterval: 8, // Fire every 8 messages (was 10 - more frequent for better capture)
   handler: async (event, context) => {
+    // For self/timer events, only fire if the reason is memory-related
+    if ((event === 'self' || event === 'timer') && !context.reason.includes('memory')) {
+      return;
+    }
     await runMemoryObserver(`nudge:${event}:${context.reason}`);
   },
-  background: true, // Non-blocking for message-complete, but emit() awaits for pre-compact/pre-new-session
+  background: true,
 });
 
 // Session-start check: if memory is empty but vault has content, trigger observer
