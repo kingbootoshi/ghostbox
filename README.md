@@ -10,7 +10,9 @@ Persistent AI agents in isolated Docker containers. Each ghost gets its own vaul
 
 ## What is this
 
-Ghostbox spawns AI agents that live in Docker containers. Each agent has:
+Ghostbox lets you create isolated AI agents, each with their own sandboxed environment and persistent vault. Agents self-evolve - building tools, refining instructions, growing their knowledge base - and save their updates to GitHub.
+
+Each agent has:
 
 - A **vault** - persistent git-backed filesystem that survives restarts
 - A **memory system** - warm facts injected into every session + deep knowledge searchable on demand
@@ -19,45 +21,23 @@ Ghostbox spawns AI agents that live in Docker containers. Each agent has:
 
 The host orchestrator manages container lifecycle, routes messages via Telegram or the REST API, and handles git persistence. A native macOS app provides a local interface.
 
-## The idea
-
-One agent per repo. Each agent becomes the master engineer - understands the architecture, tracks known issues, handles dispatch requests, preserves context across sessions. When context compacts or sessions restart, the agent picks up exactly where it left off because its memory persists in the vault.
-
-```
-You (CEO/Architect)
- |
- +-- Ghost: acme-api      "Hono + Drizzle + Stripe. 3 open bugs."
- +-- Ghost: mobile-app     "React Native 0.76. Release cut Thursday."
- +-- Ghost: infra          "Terraform + Fly.io. DNS migration in progress."
- +-- Ghost: data-pipeline  "Kafka -> Clickhouse. Backfill running."
-```
-
-Each ghost maintains its own:
-- Architecture knowledge in `/vault/knowledge/`
-- Dispatch history in `/vault/MEMORY.md`
-- User preferences in `/vault/USER.md`
-- Code changes in `/vault/code/`
-- Custom tools in `/vault/.pi/extensions/`
-
 ## Quick start
 
 ```bash
-# Install
-git clone https://github.com/kingbootoshi/ghostbox.git
-cd ghostbox
-bun install
+npx @bootoshi/ghostbox init
+```
 
-# Initialize (builds Docker image, sets up config)
-bun run src/cli.ts init
+This runs the setup wizard: configures API keys, builds the Docker image, and creates your first ghost.
 
+```bash
 # Spawn a ghost
-bun run src/cli.ts spawn researcher --model anthropic/claude-sonnet-4-6
+ghostbox spawn researcher --model anthropic/claude-sonnet-4-6
 
 # Talk to it
-bun run src/cli.ts talk researcher "Explore the codebase and save what you learn"
+ghostbox talk researcher "Explore the codebase and save what you learn"
 
 # Start the Telegram bot
-bun run src/cli.ts bot
+ghostbox bot
 ```
 
 ## Architecture
@@ -70,7 +50,7 @@ Host (Bun)                               Docker Containers
 |  +-----------+  +---------------+  |   |  /vault (mounted)      |
 |  | telegram  |->| orchestrator  |--+-->|  ghost-server.ts       |
 |  +-----------+  +---------------+  |   |  Pi Agent SDK          |
-|  | api.ts    |->|               |  |   |  ghost-memory + qmd    |
+|  | api.ts    |->|               |  |   |  memory + qmd          |
 |  +-----------+  +----+----------+  |   +------------------------+
 |                      |             |
 |                 +----+----+        |   +------------------------+
@@ -82,7 +62,7 @@ Host (Bun)                               Docker Containers
 
 ## Memory system
 
-Each ghost has a two-layer memory system inspired by [Hermes Agent](https://github.com/nousresearch/hermes-agent):
+Each ghost has a two-layer memory system:
 
 ### Warm memory (MEMORY.md + USER.md)
 
@@ -100,15 +80,12 @@ Architecture notes in knowledge/acme-architecture.md
 Saint. Builds AI agent infrastructure. Terse responses, no emojis.
 ```
 
-Managed via the `ghost-memory` CLI inside the container:
+Managed via native Pi extension tools (no CLI needed):
 
-```bash
-ghost-memory add memory "Deployment uses Fly.io with 2 replicas"
-ghost-memory add user "Prefers TypeScript strict, no any"
-ghost-memory replace memory "2 replicas" "3 replicas after scaling incident"
-ghost-memory remove memory "outdated fact"
-ghost-memory show
-```
+- `memory_write` - add an entry (target: "memory" or "user")
+- `memory_replace` - replace an entry by substring match
+- `memory_remove` - remove an entry by substring match
+- `memory_show` - show contents and usage stats
 
 ### Deep memory (vault files via qmd)
 
@@ -121,9 +98,9 @@ qmd scan                        # list all files with summaries
 qmd tree                        # vault structure
 ```
 
-### Memory observer
+### Pre-compaction flush
 
-A cheap model (Haiku 4.5) reviews conversations before compaction and extracts facts worth saving. Fires automatically on `/compact`, `/new`, and every 10 messages.
+Before context compacts or sessions reset, the nudge system gives the agent one final turn to save anything it missed using `memory_write`. Artifacts from the flush are stripped from history so they don't pollute the next context window.
 
 ### The pattern
 
@@ -145,6 +122,7 @@ MEMORY.md tells the agent what it knows and where to find details. When it needs
 | `ghostbox save <name>` | Git commit + push vault |
 | `ghostbox merge <src> <dst>` | Merge two ghost vaults |
 | `ghostbox rm <name>` | Delete ghost and vault |
+| `ghostbox nudge <name> [event] [reason]` | Trigger a nudge event on a ghost |
 | `ghostbox bot` | Start Telegram bot |
 | `ghostbox keys <name>` | Manage API keys |
 
@@ -173,9 +151,8 @@ Upgraded: 1, Skipped: 1, Failed: 0
 | Docker | dockerode |
 | Telegram | grammY |
 | Persistence | Git (per vault) |
-| Memory | MEMORY.md + USER.md (Hermes-style) |
+| Memory | Native Pi extension (MEMORY.md + USER.md) |
 | Vault search | qmd (ripgrep-based) |
-| Observer | Anthropic Haiku 4.5 |
 | Native app | SwiftUI (macOS) |
 
 ## Vault structure
@@ -197,33 +174,44 @@ The vault is mounted from the host. Everything else in the container is throwawa
 
 ## Container tools
 
-Every ghost container ships with:
+Every ghost container has:
+
+**Native tools** (Pi extension, called directly by the agent):
 
 | Tool | Purpose |
 |------|---------|
-| `ghost-memory` | Manage warm memory (add/replace/remove facts) |
+| `memory_write` | Add entry to warm memory (MEMORY.md or USER.md) |
+| `memory_replace` | Replace entry by substring match |
+| `memory_remove` | Remove entry by substring match |
+| `memory_show` | Show memory contents and usage stats |
+| `web_search` | Web search via Exa |
+| `code_search` | Code search via Exa |
+
+**Bash CLI tools:**
+
+| Tool | Purpose |
+|------|---------|
 | `qmd` | Search and read vault files |
 | `ghost-save` | Git commit + push vault to GitHub |
-| `exa-search` | Web and code search via Exa |
+| `ghost-changelog` | Log significant changes |
+| `ghost-nudge` | Trigger nudge events from inside the container |
+| `exa-search` | Web and code search via Exa (CLI alternative) |
 
 Plus full coding tools via the Pi Agent SDK: file I/O, bash, ripgrep, git, package managers.
 
 ## Configuration
 
-State lives at `~/.ghostbox/state.json`. Key config fields:
+State lives at `~/.ghostbox/state.json`. Base extensions and agent config live at `~/.ghostbox/base/`.
 
 ```json
 {
   "config": {
     "defaultModel": "anthropic/claude-sonnet-4-6",
     "imageName": "ghostbox-agent",
-    "imageVersion": "gb-75bb758c",
-    "observerModel": "anthropic/claude-haiku-4-5-20251001"
+    "imageVersion": "gb-75bb758c"
   }
 }
 ```
-
-Set `observerModel` to enable the memory observer. Leave empty to disable.
 
 ## API server
 
@@ -241,16 +229,6 @@ curl -X POST http://localhost:3200/api/ghosts/researcher/message \
 # Read vault files
 curl http://localhost:3200/api/ghosts/researcher/vault/knowledge/notes.md
 ```
-
-## Eval
-
-The memory system includes an evaluation harness that simulates a full engineering lifecycle:
-
-```bash
-bun run tests/eval-memory.ts <ghost-name>
-```
-
-Tests onboarding, bug fixes, feature implementation, compaction survival, and deep recall across multiple session boundaries. Scored 21/21 on Claude Sonnet 4.6.
 
 ## License
 

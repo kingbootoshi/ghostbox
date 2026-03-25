@@ -62,26 +62,20 @@ USER PROFILE (who the user is) [7% - 140/2000 chars]
 
 This refreshes on `/new` (new session) and `/compact` (context compaction) via `session.reload()`.
 
-### CLI: ghost-memory
+### Native tools
 
-```bash
-# Add entries
-ghost-memory add memory "Project uses Bun on host, Node 22 in containers"
-ghost-memory add user "Prefers terse responses"
+Memory is managed via Pi extension tools registered at `~/.ghostbox/base/extensions/memory.ts`. The agent calls these directly - no bash needed.
 
-# Update by substring match (finds entry containing "Bun on host", replaces entire entry)
-ghost-memory replace memory "Bun on host" "Project uses Bun on host, Deno in edge workers"
+| Tool | Parameters | Description |
+|------|-----------|-------------|
+| `memory_write` | target ("memory" or "user"), content | Add an entry |
+| `memory_replace` | target, search (substring), content | Replace entry matching substring |
+| `memory_remove` | target, search (substring) | Remove entry matching substring |
+| `memory_show` | target (optional) | Show contents and usage stats |
 
-# Remove by substring match
-ghost-memory remove memory "outdated fact"
+Replace and remove use substring matching - provide a unique fragment of the entry you want to target. If multiple entries match, the tool returns an error and asks to be more specific.
 
-# View current state with usage
-ghost-memory show
-ghost-memory show memory   # just MEMORY.md
-ghost-memory show user     # just USER.md
-```
-
-Replace and remove use substring matching - provide a unique fragment of the entry you want to target. If multiple entries match, the command fails and asks you to be more specific.
+The tools return results in the `AgentToolResult` format required by the Pi SDK: `{ content: [{ type: "text", text }], details: {} }`.
 
 ## Deep Memory
 
@@ -107,41 +101,42 @@ qmd headings arch.md     # show headings in a file
 qmd summary              # vault overview with stats
 ```
 
-## Memory Observer
+## Pre-compaction Flush (Nudge System)
 
-An optional cheap model (Haiku 4.5 or GPT nano) that reviews conversations and extracts facts before context is lost.
+Before context is lost, the nudge system gives the agent one final turn to save anything it missed.
 
 ### When it fires
 
-1. Before `/compact` - extracts facts from the conversation being compressed
-2. Before `/new` - extracts facts from the session being replaced
-3. Every 10 messages - background nudge (non-blocking)
+1. Before `/compact` - agent gets one turn to save from the conversation being compressed
+2. Before `/new` - agent gets one turn to save from the session being replaced
 
-### What it does
+### How it works
 
-1. Reads the conversation history (last ~30k chars)
-2. Reads current MEMORY.md and USER.md
-3. Calls the observer model with a structured extraction prompt
-4. Parses the response for memory operations (add/replace/remove)
-5. Executes operations via the ghost-memory CLI
+1. The NudgeRegistry emits a `pre-compact` or `pre-new-session` event
+2. The memory-observer handler calls `flushMemories()`
+3. `flushMemories()` sends a system prompt via `session.prompt()` telling the agent to save
+4. The agent calls `memory_write` to save any unsaved facts
+5. Flush artifacts (the prompt and response) are stripped from session history
 
-### Configuration
+Critical events (`pre-compact`, `pre-new-session`) always await completion before proceeding.
 
-Set `observerModel` in state.json config:
+### Nudge API
 
-```json
-{
-  "config": {
-    "observerModel": "anthropic/claude-haiku-4-5-20251001"
-  }
-}
+Nudges can be triggered from outside the container:
+
+```bash
+# From the host CLI
+ghostbox nudge <name> pre-compact "manual flush"
+
+# Via HTTP
+curl -X POST http://localhost:3100/nudge \
+  -H "Authorization: Bearer <api-key>" \
+  -d '{"event":"pre-compact","reason":"manual"}'
+
+# From inside the container
+ghost-nudge memory
+ghost-nudge self "reason"
 ```
-
-Leave empty to disable. The observer uses the Pi SDK's OAuth tokens from auth.json - supports both Anthropic and OpenAI providers.
-
-### Auth
-
-The observer reads OAuth tokens from `/root/.pi/agent/auth.json` inside the container. For Anthropic, it refreshes expired tokens automatically. The token is used with standard Anthropic Messages API headers including the `anthropic-beta: oauth-2025-04-20` flag.
 
 ## The Workflow
 
@@ -151,13 +146,13 @@ The observer reads OAuth tokens from `/root/.pi/agent/auth.json` inside the cont
 2. Agent checks warm memory for relevant context before responding
 3. Agent uses `qmd search` to find related vault files
 4. Agent does work, learns new things
-5. Agent saves quick facts: `ghost-memory add memory "..."`
+5. Agent saves quick facts via `memory_write`
 6. Agent writes detailed notes: creates files in `knowledge/`
-7. Agent maps new files: `ghost-memory add memory "Notes at knowledge/topic.md"`
+7. Agent maps new files: `memory_write` with a pointer to the file
 
 ### On compaction or new session
 
-1. Observer fires (if configured) - extracts facts from conversation
+1. Nudge system fires - agent gets one turn to flush unsaved facts
 2. `session.reload()` refreshes the system prompt with latest files
 3. New session starts with updated warm memory
 4. Agent picks up where it left off
