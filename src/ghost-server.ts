@@ -21,7 +21,7 @@ import type {
 } from './types';
 
 const defaultSystemPrompt =
-  'You are a ghost agent. Your vault at /vault is your persistent memory. Use `ghost-memory` to save/search facts and index vault files. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
+  'You are a ghost agent. Your vault at /vault is your persistent memory. Use memory_write to save facts (target "memory" for notes, target "user" for user profile). Use memory_show to check your current memory. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
 
 const memoryCharLimit = 4000;
 const userCharLimit = 2000;
@@ -65,7 +65,7 @@ const buildSystemPrompt = (): string => {
 };
 
 // ---------------------------------------------------------------------------
-// Memory Observer - extracts facts before compaction using a cheap model
+// Memory flush + observer fallback
 // ---------------------------------------------------------------------------
 
 type AuthEntry = {
@@ -89,8 +89,8 @@ const observerModelEnv = process.env.GHOSTBOX_OBSERVER_MODEL || '';
 // Nudge Registry - centralized event bus for proactive agent behavior
 // ---------------------------------------------------------------------------
 // Nudges are internal events that trigger actions without user instruction.
-// Memory observer is the first handler. Future: scheduled hooks, sub-agent
-// callbacks, agent self-activation.
+// Pre-compaction memory flush is the default critical-path handler. Future:
+// scheduled hooks, sub-agent callbacks, agent self-activation.
 
 const NUDGE_EVENTS = [
   'message-complete',     // After each user message is processed
@@ -414,7 +414,7 @@ const executeObserverOp = (op: ObserverOperation): void => {
     } else {
       return;
     }
-    execFileSync('/usr/local/bin/ghost-memory', args, { timeout: 5000 });
+    execFileSync('/usr/local/bin/memory', args, { timeout: 5000 });
   } catch (error) {
     log.error('Observer memory op failed', {
       action: op.action,
@@ -531,6 +531,62 @@ const runMemoryObserver = async (reason: string): Promise<void> => {
       preview: responseText.slice(0, 300),
       ...serializeError(error),
     });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Hermes-style pre-compaction memory flush
+// ---------------------------------------------------------------------------
+// Gives the agent ONE turn before context is lost. The agent uses its normal
+// tools (including memory via bash) to save anything important.
+// After the flush turn, the flush prompt is removed from history.
+
+const flushMemories = async (reason: string): Promise<void> => {
+  if (session.messages.length < 3) {
+    log.info('Memory flush skipped - too few messages', { reason });
+    return;
+  }
+
+  const flushPrompt =
+    '[System: The session is being compressed. Save anything worth remembering using memory_write (target "memory" for facts, target "user" for user preferences). Prioritize user preferences, corrections, and recurring patterns over task-specific details. Do NOT respond conversationally - just save and stop.]';
+
+  log.info('Memory flush start', {
+    reason,
+    sessionId: session.sessionId,
+    messageCount: session.messages.length,
+  });
+
+  try {
+    // Give the agent a turn with the flush instruction.
+    // session.prompt() uses the normal Pi SDK flow - the agent calls
+    // memory_write tool directly (registered by base extension).
+    await session.prompt(flushPrompt);
+
+    log.info('Memory flush complete', {
+      reason,
+      sessionId: session.sessionId,
+    });
+  } catch (error) {
+    log.error('Memory flush failed', {
+      reason,
+      sessionId: session.sessionId,
+      ...serializeError(error),
+    });
+  }
+
+  // Strip the flush prompt and response from session history so they
+  // don't persist into the compacted context.
+  // The flush prompt is the last user message containing our sentinel text.
+  // The response (if any) follows it.
+  const msgs = session.messages;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const text = getContentText(msgs[i].content);
+    if (text?.includes('[System: The session is being compressed')) {
+      // Remove from this point to end (flush prompt + any response)
+      msgs.splice(i);
+      log.info('Memory flush artifacts stripped', { removedFrom: i });
+      break;
+    }
   }
 };
 
@@ -1847,60 +1903,25 @@ const handleRequest = async (
 // Register nudge handlers
 // ---------------------------------------------------------------------------
 
-// Memory observer: fires on compaction, new session, every N messages, and self-triggered memory reviews
+// Pre-compaction memory flush: gives the live agent one last turn before context loss
 nudges.register({
   id: 'memory-observer',
-  event: ['pre-compact', 'pre-new-session', 'message-complete', 'self', 'timer'],
-  messageInterval: 8, // Fire every 8 messages (was 10 - more frequent for better capture)
+  event: ['pre-compact', 'pre-new-session'],
   handler: async (event, context) => {
-    // For self/timer events, only fire if the reason is memory-related
-    if ((event === 'self' || event === 'timer') && !context.reason.includes('memory')) {
+    await flushMemories(`nudge:${event}:${context.reason}`);
+  },
+  background: true,
+});
+
+// Optional fallback: explicit self/timer nudges can still invoke the observer model
+nudges.register({
+  id: 'memory-observer-fallback',
+  event: ['self', 'timer'],
+  handler: async (event, context) => {
+    if (!context.reason.includes('memory')) {
       return;
     }
     await runMemoryObserver(`nudge:${event}:${context.reason}`);
-  },
-  background: true,
-});
-
-// Session-start check: if memory is empty but vault has content, trigger observer
-nudges.register({
-  id: 'session-start-check',
-  event: 'session-start',
-  handler: async (_event, _context) => {
-    const memoryContent = readMemoryFile('/vault/MEMORY.md');
-    if (memoryContent.length < 50) {
-      // Memory is nearly empty - check if vault has content worth indexing
-      try {
-        const vaultFiles = execFileSync('find', ['/vault', '-name', '*.md', '-not', '-name', 'MEMORY.md', '-not', '-name', 'USER.md'], { timeout: 3000 }).toString().trim();
-        if (vaultFiles) {
-          log.info('Nudge: session-start-check - memory empty but vault has files, triggering observer');
-          await runMemoryObserver('nudge:session-start:empty-memory-with-vault');
-        }
-      } catch {
-        // find command failed, not critical
-      }
-    }
-  },
-  background: true,
-});
-
-// Memory review nudge: after 20+ messages, if memory is empty, inject a stronger nudge
-nudges.register({
-  id: 'memory-review',
-  event: 'message-complete',
-  messageInterval: 20,
-  handler: async (_event, context) => {
-    const memoryContent = readMemoryFile('/vault/MEMORY.md');
-    const userContent = readMemoryFile('/vault/USER.md');
-    const totalChars = memoryContent.length + userContent.length;
-    if (totalChars < 100 && context.messageCount > 15) {
-      // Memory is nearly empty after significant conversation - observer gets extra context
-      log.info('Nudge: memory-review triggered - memory nearly empty after conversation', {
-        messageCount: context.messageCount,
-        memoryChars: totalChars,
-      });
-      await runMemoryObserver('nudge:memory-review:empty-after-conversation');
-    }
   },
   background: true,
 });

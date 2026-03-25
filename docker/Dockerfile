@@ -30,14 +30,12 @@ COPY entrypoint.sh /entrypoint.sh
 COPY ghost-save /usr/local/bin/ghost-save
 COPY ghost-changelog /usr/local/bin/ghost-changelog
 COPY exa-search /usr/local/bin/exa-search
-COPY ghost-memory /usr/local/bin/ghost-memory
 COPY ghost-nudge /usr/local/bin/ghost-nudge
 COPY qmd /usr/local/bin/qmd
 RUN chmod +x /entrypoint.sh
 RUN chmod +x /usr/local/bin/ghost-save
 RUN chmod +x /usr/local/bin/ghost-changelog
 RUN chmod +x /usr/local/bin/exa-search
-RUN chmod +x /usr/local/bin/ghost-memory
 RUN chmod +x /usr/local/bin/ghost-nudge
 RUN chmod +x /usr/local/bin/qmd
 

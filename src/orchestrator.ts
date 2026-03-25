@@ -47,7 +47,6 @@ export const computeImageVersion = (dockerDir: string): string => {
     'Dockerfile',
     'entrypoint.sh',
     'ghost-changelog',
-    'ghost-memory',
     'ghost-nudge',
     'qmd',
     'ghost-save',
@@ -75,25 +74,16 @@ Two files are loaded into your system prompt at session start:
 
 These are your "working memory" - what you immediately know without searching. Keep them compact and high-signal. Entries are separated by a line containing only \`§\`.
 
-**CLI: ghost-memory**
-\`\`\`
-ghost-memory add memory "content"               # Save a note
-ghost-memory add user "content"                 # Save user info
-ghost-memory replace memory "old" "new"         # Update by substring match
-ghost-memory replace user "old" "new"           # Update by substring match
-ghost-memory remove memory "substring"          # Remove entry matching substring
-ghost-memory show                               # See both with usage stats
-\`\`\`
+**Tools: memory_write, memory_replace, memory_remove, memory_show** (native tools - use directly, no bash needed)
+
+- \`memory_write\` - Add an entry. Params: target ("memory" or "user"), content (the text).
+- \`memory_replace\` - Replace an entry by substring match. Params: target, search (substring to find), content (replacement).
+- \`memory_remove\` - Remove an entry by substring match. Params: target, search (substring to find).
+- \`memory_show\` - Show current memory contents and usage stats. Params: target (optional, omit for both).
 
 Limits: MEMORY.md 4000 chars, USER.md 2000 chars. If full, replace or remove entries first.
 
-Write whatever you want. No schema, no categories. Your thoughts in your words. Examples:
-\`\`\`
-ghost-memory add memory "Project uses Bun on host, Node 22 in containers. Never npm."
-ghost-memory add memory "Detailed Docker research notes in knowledge/docker-patterns.md"
-ghost-memory add user "Prefers terse responses. No summaries. Hates em dashes."
-ghost-memory replace memory "Docker research" "Docker + K8s research in knowledge/infra-notes.md"
-\`\`\`
+Write whatever you want. No schema, no categories. Your thoughts in your words.
 
 **Priority**: User corrections and preferences > environment facts > conventions > file references.
 The most valuable memory prevents the user from having to repeat themselves.
@@ -151,7 +141,11 @@ The workflow:
 
 ### When to Save (Proactively)
 
-You save automatically - the user should never need to ask. Save when you learn:
+You are responsible for memory. There is no background process that will reliably save things for you later.
+If something matters and you do not save it, it can be lost.
+Before compaction, you will get one final turn to save. But do not rely on this - save continuously as you learn.
+
+Save when you learn:
 
 **ALWAYS save immediately:**
 - User corrects you -> update memory or user profile NOW
@@ -196,14 +190,32 @@ You save automatically - the user should never need to ask. Save when you learn:
 
 ## Tools
 
-- \`ghost-memory\` - Save/update/remove memory entries
-- \`ghost-changelog add "description" --tag TAG\` - Log what you changed and why after significant work
-- \`ghost-nudge memory\` - Trigger memory review now (observer extracts facts)
-- \`ghost-nudge self "reason"\` - Schedule a self-nudge (future: timed reminders)
+**Native (use directly):**
+- \`memory_write\` - Add entry to warm memory (MEMORY.md or USER.md)
+- \`memory_replace\` - Replace entry by substring match
+- \`memory_remove\` - Remove entry by substring match
+- \`memory_show\` - Show memory contents and usage
+- \`web_search\` / \`code_search\` - Exa search (via base extension)
+
+**Bash CLI:**
+- \`ghost-changelog add "description" --tag TAG\` - Log what you changed and why
+- \`ghost-nudge memory\` - Trigger manual memory-review fallback
+- \`ghost-nudge self "reason"\` - Schedule a self-nudge
 - \`qmd\` - Search and read vault files
 - \`ghost-save "message"\` - Commit and push vault to GitHub
-- \`exa-search "query"\` - Web search via Exa
-- \`exa-search --code "query"\` - Code search via Exa
+- \`exa-search "query"\` - Web search (alternative to web_search tool)
+- \`exa-search --code "query"\` - Code search (alternative to code_search tool)
+
+## When to Save (ghost-save)
+
+**Run ghost-save after:**
+- Creating or updating extensions
+- Completing a bug fix or feature dispatch
+- Writing knowledge docs or architecture notes
+- Any work you'd want to survive a container rebuild
+
+Format: \`ghost-save "Brief description of what changed"\`
+This commits your entire vault and pushes to GitHub on your branch (ghost/YOUR_NAME).
 
 ## Slash Commands
 
@@ -212,6 +224,13 @@ You save automatically - the user should never need to ask. Save when you learn:
 ## Self-Evolution
 
 Write TypeScript extensions to /vault/.pi/extensions/. They persist in your vault, load on startup, and compound over sessions. Base extensions in /root/.pi/agent/extensions/ are read-only.
+
+**Extension workflow:**
+1. Write your .ts file to /vault/.pi/extensions/
+2. Run /reload to activate it
+3. Test the tool in conversation
+4. Run ghost-changelog add "Created X extension" --tag extension
+5. Run ghost-save "Add X extension" to push to GitHub
 `;
 
 const ensureGhostPiAgent = async (name: string): Promise<void> => {
@@ -486,6 +505,56 @@ export const getNextPortBase = (state: GhostboxState): number => {
   }
 
   return portBase;
+};
+
+export const reconcileGhostStates = async (): Promise<{ started: string[]; marked: string[] }> => {
+  const state = await loadState();
+  const started: string[] = [];
+  const marked: string[] = [];
+
+  for (const [name, ghost] of Object.entries(state.ghosts)) {
+    if (ghost.status !== 'running') continue;
+
+    // Check if container is actually running
+    try {
+      const container = docker.getContainer(ghost.containerId);
+      const info = await container.inspect();
+      if (info.State.Running) continue;
+
+      // Container exists but stopped - remove it so we can recreate
+      await container.remove({ force: true }).catch(() => {});
+    } catch {
+      // Container doesn't exist at all - that's fine
+    }
+
+    // Also remove by name in case an old container with the same name is lingering
+    try {
+      const namedContainer = docker.getContainer(`ghostbox-${name}`);
+      await namedContainer.remove({ force: true });
+    } catch {
+      // No lingering container with that name
+    }
+
+    ghost.status = 'stopped';
+    marked.push(name);
+    log.info({ name }, 'Ghost container not running - restarting');
+  }
+
+  await saveState(state);
+
+  // Restart all ghosts that need it
+  for (const name of marked) {
+    try {
+      await wakeGhost(name);
+      started.push(name);
+      log.info({ name }, 'Ghost restarted');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log.error({ name, err: message }, 'Failed to restart ghost');
+    }
+  }
+
+  return { started, marked };
 };
 
 export const listGhosts = async (): Promise<Record<string, GhostState>> => {

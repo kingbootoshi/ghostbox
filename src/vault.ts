@@ -26,7 +26,7 @@ Two files are injected into your prompt at the start of each session:
 - **MEMORY.md** - Your personal notes (environment, conventions, file references, lessons)
 - **USER.md** - Who the user is (preferences, role, style, corrections)
 
-Use \`ghost-memory add memory "..."\` and \`ghost-memory add user "..."\` to save.
+Use memory_write to save (target "memory" for notes, target "user" for user profile).
 Use \`qmd search\` and \`qmd read\` to find and read detailed vault files.
 Check your memory before answering complex questions. Save what you learn.
 

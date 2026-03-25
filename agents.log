@@ -61,3 +61,17 @@ Type: implementation
 Prompt: Build orchestrator eval harness - tests CEO/CTO workflow with NO memory cheating
 Reasoning: high
 Sandbox: workspace-write
+
+## Session: 2026-03-25T18:30:00Z
+Goal: Implement Hermes-style pre-compaction memory flush + nudge system
+
+### Context
+Built NudgeRegistry (10 iterations, all kept). Now replacing observer-based pre-compact
+handler with Hermes 1:1 pattern: agent gets ONE turn before compaction with only ghost-memory
+tool available. No separate observer model.
+
+### Spawned: 627a07e6 - 18:30
+Type: implementation
+Prompt: Implement Hermes-style flushMemories() in ghost-server.ts. Reference: ~/Dev/hermes-agent/run_agent.py:4411-4573 and gateway/run.py:521-628. Replace observer handlers with flush handler for pre-compact/pre-new-session. Update AGENTS.md.
+Reasoning: high
+Sandbox: workspace-write
