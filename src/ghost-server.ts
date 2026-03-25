@@ -1317,6 +1317,10 @@ registerSlashCommand({
       await nudges.emit('pre-new-session', 'slash-command');
       await session.reload();
       await session.newSession();
+      nudges.resetCounters();
+      nudges.emit('session-start', 'slash-new').catch((e) => {
+        log.error('Session-start nudge failed', serializeError(e));
+      });
       log.info('Pi slash new complete', { sessionId: session.sessionId });
       sendAssistantResult(res, 'New session started.');
     } catch (error) {
@@ -1777,6 +1781,10 @@ const handleRequest = async (
       await nudges.emit('pre-new-session', 'api');
       await session.reload();
       await session.newSession();
+      nudges.resetCounters();
+      nudges.emit('session-start', 'api-new').catch((e) => {
+        log.error('Session-start nudge failed', serializeError(e));
+      });
       log.info('Pi new session complete', { sessionId: session.sessionId });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'new_session', sessionId: session.sessionId }));
@@ -1807,6 +1815,28 @@ nudges.register({
     await runMemoryObserver(`nudge:${event}:${context.reason}`);
   },
   background: true, // Non-blocking for message-complete, but emit() awaits for pre-compact/pre-new-session
+});
+
+// Session-start check: if memory is empty but vault has content, trigger observer
+nudges.register({
+  id: 'session-start-check',
+  event: 'session-start',
+  handler: async (_event, _context) => {
+    const memoryContent = readMemoryFile('/vault/MEMORY.md');
+    if (memoryContent.length < 50) {
+      // Memory is nearly empty - check if vault has content worth indexing
+      try {
+        const vaultFiles = execFileSync('find', ['/vault', '-name', '*.md', '-not', '-name', 'MEMORY.md', '-not', '-name', 'USER.md'], { timeout: 3000 }).toString().trim();
+        if (vaultFiles) {
+          log.info('Nudge: session-start-check - memory empty but vault has files, triggering observer');
+          await runMemoryObserver('nudge:session-start:empty-memory-with-vault');
+        }
+      } catch {
+        // find command failed, not critical
+      }
+    }
+  },
+  background: true,
 });
 
 // Memory review nudge: after 20+ messages, if memory is empty, inject a stronger nudge
