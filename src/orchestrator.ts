@@ -46,6 +46,7 @@ export const computeImageVersion = (dockerDir: string): string => {
     'ghost-server.js',
     'Dockerfile',
     'entrypoint.sh',
+    'ghost-changelog',
     'ghost-memory',
     'qmd',
     'ghost-save',
@@ -95,6 +96,19 @@ ghost-memory replace memory "Docker research" "Docker + K8s research in knowledg
 
 **Priority**: User corrections and preferences > environment facts > conventions > file references.
 The most valuable memory prevents the user from having to repeat themselves.
+
+## Change Log
+
+Track meaningful work in \`/vault/CHANGELOG.md\`. Use this after completing significant work so there is a simple record of what changed and why.
+
+**CLI: ghost-changelog**
+\`\`\`
+ghost-changelog add "Fixed order validation bug" --tag BUG-2847
+ghost-changelog add "Created codebase-search extension" --tag extension
+ghost-changelog add "Upgraded auth middleware" --tag security
+ghost-changelog list
+ghost-changelog list 5
+\`\`\`
 
 ### Deep Memory (vault files - searched on demand)
 
@@ -164,10 +178,15 @@ The workflow:
 ## Tools
 
 - \`ghost-memory\` - Save/update/remove memory entries
+- \`ghost-changelog add "description" --tag TAG\` - Log what you changed and why after significant work
 - \`qmd\` - Search and read vault files
 - \`ghost-save "message"\` - Commit and push vault to GitHub
 - \`exa-search "query"\` - Web search via Exa
 - \`exa-search --code "query"\` - Code search via Exa
+
+## Slash Commands
+
+- \`/reload\` - Reload extensions from /vault/.pi/extensions/. Use after creating or editing extension files to activate them.
 
 ## Self-Evolution
 

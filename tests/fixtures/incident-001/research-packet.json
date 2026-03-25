@@ -1,0 +1,36 @@
+{
+  "id": "7c79640d-b530-4e41-9d8c-3efb6e16d2fa",
+  "repositoryId": "9a2c1d40-b3ef-4bb2-a623-fb5f52b46e11",
+  "issueId": "8dfbc625-d6b1-4690-a5c4-f81454f03de1",
+  "threadId": "2d4cfd39-0284-4678-99d3-a570bb98579f",
+  "agentId": "4aeafec4-c0b7-43b2-9b06-01d15cd0f180",
+  "version": 1,
+  "status": "ready",
+  "summary": "The production crash is caused by missing request validation in POST /api/orders. The handler consumes the JSON body and uses body.items before proving it exists, so requests that omit items throw a TypeError and return 500 instead of a controlled 400 response. The fix should validate the payload at the route boundary before calculating totals or creating a Stripe payment intent.",
+  "fileCitations": [
+    {
+      "path": "src/routes/orders.ts",
+      "note": "In the incident snapshot, the POST / handler at roughly lines 15-19 parses JSON and reads body.items to compute the order total before any shape validation, which matches the TypeError in the crash log."
+    },
+    {
+      "path": "src/db/schema.ts",
+      "note": "The orders table at lines 11-17 and order_items table at lines 19-25 both assume valid line-item data exists. There is no schema-level fallback that would protect the route from a missing items array."
+    },
+    {
+      "path": "README.md",
+      "note": "The known issues section at lines 4-6 already calls out missing input validation on order creation, which aligns with the observed failure mode."
+    }
+  ],
+  "discoveredConstraints": [
+    "Validation must happen before total calculation, database writes, or Stripe payment intent creation.",
+    "The existing route response shape for successful order creation should remain unchanged.",
+    "A malformed payload should return a 400-level client error instead of throwing and surfacing as a 500."
+  ],
+  "openQuestions": [
+    "Is there already a shared request validation pattern in this codebase, or should the route own a local schema for now?",
+    "Do upstream clients rely on a specific error message shape for invalid order payloads?"
+  ],
+  "createdAt": "2026-03-24T18:23:11.102Z",
+  "updatedAt": "2026-03-24T18:27:42.330Z",
+  "acceptedAt": "2026-03-24T18:29:03.441Z"
+}

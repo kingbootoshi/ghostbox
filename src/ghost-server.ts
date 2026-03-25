@@ -1120,6 +1120,25 @@ registerSlashCommand({
 });
 
 registerSlashCommand({
+  name: '/reload',
+  description: 'Reload extensions from /vault/.pi/extensions/.',
+  handler: async (res) => {
+    try {
+      log.info('Pi slash reload start', { sessionId: session.sessionId });
+      await session.reload();
+      log.info('Pi slash reload complete', { sessionId: session.sessionId });
+      sendAssistantResult(res, 'Extensions reloaded. New tools are now available.');
+    } catch (error) {
+      log.error('Pi slash reload failed', serializeError(error));
+      sendAssistantResult(
+        res,
+        error instanceof Error ? error.message : 'Reload failed.',
+      );
+    }
+  },
+});
+
+registerSlashCommand({
   name: '/history',
   description: 'Show session history counts and session details.',
   handler: (res) => {

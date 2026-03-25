@@ -1,0 +1,2 @@
+2026-03-25T11:06:21.000Z ENGINEERING_REQUEST
+"Rate limiter config is hardcoded at 100 req/min. Make it env-configurable."

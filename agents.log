@@ -44,3 +44,20 @@ Type: implementation
 Prompt: Full 9-point spec for upgrade command with version tracking
 Reasoning: high
 Sandbox: workspace-write
+
+### Complete: d8d3a8c4 - 07:28
+Files modified: src/types.ts, src/orchestrator.ts, src/cli.ts
+Result: All 9 changes implemented. ghostbox upgrade command working.
+Build verified, idempotent upgrade confirmed (0 upgraded, 3 skipped on re-run).
+
+### Spawned: 015908d0 - 08:15
+Type: implementation
+Prompt: Build realistic Dispatch fixture data for orchestrator eval (3 scenarios: clean fix, bad contract, bad implementation)
+Reasoning: high
+Sandbox: workspace-write
+
+### Spawned: e9f67e83 - 08:15
+Type: implementation
+Prompt: Build orchestrator eval harness - tests CEO/CTO workflow with NO memory cheating
+Reasoning: high
+Sandbox: workspace-write
