@@ -20,6 +20,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenuBar()
         setupNotifications()
         setupHotkey()
+        preloadThenShowHub()
+    }
+
+    private func preloadThenShowHub() {
+        // Create the hub panel hidden so SwiftUI mounts and starts loading data
+        hubPanelController = HubPanelController(client: client, appState: appState)
+        hubPanelController?.createPanelHidden()
+
+        // Wait for API data to arrive, then reveal
+        Task {
+            _ = try? await client.listGhosts()
+            // Small delay for SwiftUI to settle after data arrives
+            try? await Task.sleep(for: .milliseconds(100))
+            await MainActor.run {
+                NSApp.activate(ignoringOtherApps: true)
+                hubPanelController?.revealPanel()
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -78,15 +96,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return NSPoint(x: workArea.midX, y: workArea.midY)
     }
 
-    private func openHubAndPanels() {
+    private func openHubAndPanels(animated: Bool = true) {
         if hubPanelController == nil {
             hubPanelController = HubPanelController(client: client, appState: appState)
         }
 
         NSApp.activate(ignoringOtherApps: true)
 
-        // Everything appears at the same time, in place
-        hubPanelController?.show()
+        hubPanelController?.show(animated: animated)
 
         let controllersToShow = chatPanelControllers.values.filter { $0.wasOpen }
         for controller in controllersToShow {

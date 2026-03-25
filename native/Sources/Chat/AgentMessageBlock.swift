@@ -50,8 +50,7 @@ struct AgentMessageBlock: View {
             }
 
             if !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                if message.role == .ghost || message.role == .system,
-                   let attributed = try? AttributedString(markdown: message.content, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
+                if let attributed = message.attributedContent {
                     Text(attributed)
                         .font(Theme.Typography.body())
                         .foregroundColor(contentColor)

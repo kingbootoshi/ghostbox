@@ -18,31 +18,30 @@ const getGhostBranchName = (name: string): string => `ghost/${name}`;
 
 const buildInitialClaudeContent = (name: string): string => `# Ghost: ${name}
 
-You are a persistent AI agent with memory and continuity in this vault.
+You are a persistent AI agent with memory and continuity.
 
 ## Memory
 
-You have two memory systems - use both actively:
+Two files are injected into your prompt at the start of each session:
+- **MEMORY.md** - Your personal notes (environment, conventions, file references, lessons)
+- **USER.md** - Who the user is (preferences, role, style, corrections)
 
-1. **Warm memory** (\`ghost-memory\`) - Quick facts in memory.json, injected into your prompt each session. Your navigation map.
-2. **Deep memory** (\`qmd\`) - Search and read detailed notes in vault files. On-demand retrieval.
-
-Before responding to complex questions, always check your memory first (\`ghost-memory show\`, \`qmd search\`).
-After learning something new, save it (\`ghost-memory add\`, write to knowledge/, \`ghost-memory map\`).
+Use \`ghost-memory add memory "..."\` and \`ghost-memory add user "..."\` to save.
+Use \`qmd search\` and \`qmd read\` to find and read detailed vault files.
+Check your memory before answering complex questions. Save what you learn.
 
 ## Vault Structure
-- /vault/memory.json - warm memory store (facts + vault map, auto-injected)
+- /vault/MEMORY.md - warm memory (auto-injected each session)
+- /vault/USER.md - user profile (auto-injected each session)
 - /vault/knowledge/ - detailed notes, research, findings
 - /vault/code/ - projects, scripts, tools
-- /vault/.pi/extensions/ - Pi agent extensions (your self-evolution layer)
+- /vault/.pi/extensions/ - custom tools (self-evolution)
 - /vault/CLAUDE.md - this file, your identity
 
 ## Guidelines
-- Write important findings to /vault/knowledge/
+- Write findings to /vault/knowledge/, then note the file path in MEMORY.md
 - Keep this CLAUDE.md updated with your purpose and learned context
-- Use \`ghost-memory\` to save facts and index vault files
-- Use \`qmd\` to search and read your vault before guessing
-- Run \`ghost-save "description"\` to commit and push your work
+- Use \`ghost-save "description"\` to commit and push your work
 - Everything in /vault persists. Everything else is throwaway.
 `;
 
@@ -141,10 +140,8 @@ export const initVault = async (name: string): Promise<void> => {
   await mkdir(join(vaultPath, 'code'), { recursive: true });
   await Bun.write(join(vaultPath, 'knowledge', '.gitkeep'), '');
   await Bun.write(join(vaultPath, 'code', '.gitkeep'), '');
-  await Bun.write(
-    join(vaultPath, 'memory.json'),
-    JSON.stringify({ facts: [], vault_map: [] }, null, 2) + '\n',
-  );
+  await Bun.write(join(vaultPath, 'MEMORY.md'), '');
+  await Bun.write(join(vaultPath, 'USER.md'), '');
 
   await runGit(name, vaultPath, ['add', '-A']);
   await runGit(name, vaultPath, ['commit', '-m', 'Initialize vault']);

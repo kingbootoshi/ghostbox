@@ -22,11 +22,25 @@ struct PendingImage: Identifiable {
 final class AgentChatViewModel: ObservableObject {
     let ghostName: String
 
-    @Published var messages: [ChatMessage] = []
-    @Published var preCompactionMessages: [ChatMessage] = []
+    @Published var messages: [ChatMessage] = [] {
+        didSet {
+            messagesVersion &+= 1
+        }
+    }
+    @Published var preCompactionMessages: [ChatMessage] = [] {
+        didSet {
+            preCompactionDisplayVersion &+= 1
+        }
+    }
     @Published var showingPreCompactionMessages = false
-    @Published var visiblePreCompactionCount = 0
+    @Published var visiblePreCompactionCount = 0 {
+        didSet {
+            preCompactionDisplayVersion &+= 1
+        }
+    }
     @Published private(set) var compactionSummary: String?
+    @Published private(set) var messagesVersion = 0
+    @Published private(set) var preCompactionDisplayVersion = 0
 
     static let olderMessagesBatchSize = 25
     @Published var inputText = ""
@@ -286,13 +300,7 @@ final class AgentChatViewModel: ObservableObject {
 
                     if let index = currentAssistantIndex, messages.indices.contains(index) {
                         let existingMessage = messages[index]
-                        messages[index] = ChatMessage(
-                            id: existingMessage.id,
-                            role: .ghost,
-                            content: currentAssistantText,
-                            timestamp: existingMessage.timestamp,
-                            attachmentCount: existingMessage.attachmentCount
-                        )
+                        messages[index] = existingMessage.updatingContent(currentAssistantText)
                         if isCompactCommand {
                             compactResponseMessageID = existingMessage.id
                         }

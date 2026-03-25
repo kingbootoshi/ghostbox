@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import {
@@ -15,79 +16,358 @@ import type { CompactionInfo, GhostImage, GhostMessage, HistoryMessage } from '.
 const defaultSystemPrompt =
   'You are a ghost agent. Your vault at /vault is your persistent memory. Use `ghost-memory` to save/search facts and index vault files. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
 
-type MemoryFact = {
-  id: string;
-  content: string;
-  category: string;
-  created: string;
-  updated: string;
-};
+const memoryCharLimit = 4000;
+const userCharLimit = 2000;
 
-type VaultMapEntry = {
-  path: string;
-  summary: string;
-  updated: string;
-};
-
-type MemoryData = {
-  facts: MemoryFact[];
-  vault_map: VaultMapEntry[];
-};
-
-const formatMemoryBlock = (memory: MemoryData): string => {
-  const lines: string[] = [];
-
-  if (memory.facts.length > 0) {
-    lines.push('== MEMORY (your persistent facts - injected at session start) ==');
-    for (const fact of memory.facts) {
-      lines.push(`[${fact.id}] [${fact.category}] ${fact.content}`);
-    }
-    lines.push('');
-  }
-
-  if (memory.vault_map.length > 0) {
-    lines.push('== VAULT MAP (indexed files in your vault - use qmd to read them) ==');
-    for (const entry of memory.vault_map) {
-      lines.push(`  ${entry.path} - ${entry.summary}`);
-    }
-    lines.push('');
-  }
-
-  if (lines.length === 0) {
+const readMemoryFile = (path: string): string => {
+  try {
+    return readFileSync(path, 'utf8').trim();
+  } catch {
     return '';
   }
-
-  lines.push('Use `ghost-memory` to save/update facts. Use `qmd` to search and read vault files.');
-  lines.push('Your memory persists across sessions. Keep it current - update stale facts, remove obsolete ones.');
-  return lines.join('\n');
 };
 
-const loadMemory = (): MemoryData | null => {
+const renderMemoryBlock = (label: string, content: string, limit: number): string => {
+  if (!content) return '';
+  const pct = Math.round((content.length / limit) * 100);
+  const separator = '='.repeat(50);
+  return `${separator}\n${label} [${pct}% - ${content.length}/${limit} chars]\n${separator}\n${content}`;
+};
+
+const buildSystemPrompt = (): string => {
+  const basePrompt = process.env.GHOSTBOX_SYSTEM_PROMPT || defaultSystemPrompt;
+
+  const memoryContent = readMemoryFile('/vault/MEMORY.md');
+  const userContent = readMemoryFile('/vault/USER.md');
+
+  if (!memoryContent && !userContent) {
+    return basePrompt;
+  }
+
+  const blocks: string[] = [basePrompt, ''];
+
+  if (memoryContent) {
+    blocks.push(renderMemoryBlock('MEMORY (your personal notes)', memoryContent, memoryCharLimit));
+  }
+
+  if (userContent) {
+    blocks.push(renderMemoryBlock('USER PROFILE (who the user is)', userContent, userCharLimit));
+  }
+
+  return blocks.join('\n');
+};
+
+// ---------------------------------------------------------------------------
+// Memory Observer - extracts facts before compaction using a cheap model
+// ---------------------------------------------------------------------------
+
+type AuthEntry = {
+  type: string;
+  access: string;
+  refresh: string;
+  expires: number;
+  accountId?: string;
+};
+
+type ObserverOperation = {
+  action: 'add' | 'replace' | 'remove';
+  target: 'memory' | 'user';
+  content?: string;
+  old_text?: string;
+};
+
+const observerModelEnv = process.env.GHOSTBOX_OBSERVER_MODEL || '';
+const observerNudgeInterval = 10;
+let messagesSinceObserver = 0;
+
+const readAuthEntry = (provider: string): AuthEntry | null => {
   try {
-    const raw = readFileSync('/vault/memory.json', 'utf8');
-    const data = JSON.parse(raw) as MemoryData;
-    if (Array.isArray(data.facts) && Array.isArray(data.vault_map)) {
-      return data;
-    }
-    return null;
+    const raw = readFileSync('/root/.pi/agent/auth.json', 'utf8');
+    const auth = JSON.parse(raw) as Record<string, AuthEntry>;
+    const entry = auth[provider];
+    if (!entry?.access) return null;
+    return entry;
   } catch {
     return null;
   }
 };
 
-const buildSystemPrompt = (): string => {
-  const basePrompt = process.env.GHOSTBOX_SYSTEM_PROMPT || defaultSystemPrompt;
-  const memory = loadMemory();
-  if (!memory) {
-    return basePrompt;
+const refreshAnthropicToken = async (entry: AuthEntry): Promise<string | null> => {
+  if (Date.now() < entry.expires) {
+    return entry.access;
+  }
+  try {
+    const response = await fetch('https://platform.claude.com/v1/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'refresh_token',
+        client_id: '9d1c250a-e61b-44d9-88ed-5944d19624f5e',
+        refresh_token: entry.refresh,
+      }),
+    });
+    if (!response.ok) return null;
+    const data = (await response.json()) as { access_token?: string; expires_in?: number };
+    if (!data.access_token) return null;
+    // Update auth.json with new token
+    try {
+      const raw = readFileSync('/root/.pi/agent/auth.json', 'utf8');
+      const auth = JSON.parse(raw) as Record<string, AuthEntry>;
+      auth.anthropic.access = data.access_token;
+      auth.anthropic.expires = Date.now() + (data.expires_in ?? 3600) * 1000;
+      writeFileSync('/root/.pi/agent/auth.json', JSON.stringify(auth, null, 2));
+    } catch {
+      // Best effort
+    }
+    return data.access_token;
+  } catch {
+    return null;
+  }
+};
+
+const callObserverAnthropic = async (
+  token: string,
+  model: string,
+  system: string,
+  user: string,
+): Promise<string | null> => {
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'oauth-2025-04-20',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 2048,
+        system,
+        messages: [{ role: 'user', content: user }],
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+    if (!response.ok) {
+      log.error('Observer Anthropic API failed', { status: response.status });
+      return null;
+    }
+    const data = (await response.json()) as { content?: Array<{ text?: string }> };
+    return data.content?.[0]?.text ?? null;
+  } catch (error) {
+    log.error('Observer Anthropic API error', serializeError(error));
+    return null;
+  }
+};
+
+const callObserverOpenAI = async (
+  token: string,
+  model: string,
+  system: string,
+  user: string,
+): Promise<string | null> => {
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 2048,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+    if (!response.ok) {
+      log.error('Observer OpenAI API failed', { status: response.status });
+      return null;
+    }
+    const data = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    return data.choices?.[0]?.message?.content ?? null;
+  } catch (error) {
+    log.error('Observer OpenAI API error', serializeError(error));
+    return null;
+  }
+};
+
+const observerSystemPrompt = `You are a memory extraction agent. Review the conversation and extract durable facts worth persisting.
+
+Two memory stores:
+- "memory": Agent's personal notes (environment facts, conventions, tool quirks, file references, lessons)
+- "user": Info about the user (preferences, role, communication style, corrections)
+
+Priority: User corrections > preferences > environment facts > conventions > file references.
+The most valuable memory prevents the user from having to repeat themselves.
+
+Do NOT save: task progress, session outcomes, temporary state, things easily re-discovered, info already in current memory.
+
+Output a JSON array of operations:
+[{"action":"add","target":"memory","content":"fact to save"}]
+[{"action":"replace","target":"memory","old_text":"unique substring of entry to update","content":"updated text"}]
+[{"action":"remove","target":"user","old_text":"unique substring of entry to delete"}]
+
+If nothing worth saving, output: []
+Output ONLY the JSON array.`;
+
+const formatConversationForObserver = (messages: PiAgentMessage[]): string => {
+  const lines: string[] = [];
+  const maxChars = 30000;
+  let totalChars = 0;
+
+  // Work backwards to get the most recent messages
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    const role = msg.role ?? 'unknown';
+    const text = getContentText(msg.content);
+    if (!text) continue;
+
+    const line = `[${role}]: ${text}`;
+    if (totalChars + line.length > maxChars) break;
+
+    lines.unshift(line);
+    totalChars += line.length;
   }
 
-  const memoryBlock = formatMemoryBlock(memory);
-  if (!memoryBlock) {
-    return basePrompt;
+  return lines.join('\n\n');
+};
+
+const executeObserverOp = (op: ObserverOperation): void => {
+  try {
+    const args: string[] = [];
+    if (op.action === 'add' && op.content && op.target) {
+      args.push('add', op.target, op.content);
+    } else if (op.action === 'replace' && op.old_text && op.content && op.target) {
+      args.push('replace', op.target, op.old_text, op.content);
+    } else if (op.action === 'remove' && op.old_text && op.target) {
+      args.push('remove', op.target, op.old_text);
+    } else {
+      return;
+    }
+    execFileSync('/usr/local/bin/ghost-memory', args, { timeout: 5000 });
+  } catch (error) {
+    log.error('Observer memory op failed', {
+      action: op.action,
+      target: op.target,
+      ...serializeError(error),
+    });
+  }
+};
+
+const runMemoryObserver = async (reason: string): Promise<void> => {
+  if (!observerModelEnv) return;
+
+  const separatorIdx = observerModelEnv.indexOf('/');
+  if (separatorIdx <= 0) {
+    log.error('Observer: invalid model format, expected provider/model', {
+      model: observerModelEnv,
+    });
+    return;
   }
 
-  return `${basePrompt}\n\n${memoryBlock}`;
+  const provider = observerModelEnv.slice(0, separatorIdx);
+  const modelId = observerModelEnv.slice(separatorIdx + 1);
+
+  log.info('Observer: starting', { reason, provider, model: modelId });
+
+  // Get auth
+  const authKey = provider === 'openai' ? 'openai-codex' : provider;
+  const authEntry = readAuthEntry(authKey);
+  if (!authEntry) {
+    log.info('Observer: no auth for provider, skipping', { provider: authKey });
+    return;
+  }
+
+  // Build context
+  const conversationText = formatConversationForObserver(session.messages);
+  if (!conversationText) {
+    log.info('Observer: no conversation to review, skipping');
+    return;
+  }
+
+  const currentMemory = readMemoryFile('/vault/MEMORY.md');
+  const currentUser = readMemoryFile('/vault/USER.md');
+
+  const userMessage = [
+    'Current MEMORY.md:',
+    currentMemory || '(empty)',
+    '',
+    'Current USER.md:',
+    currentUser || '(empty)',
+    '',
+    'Conversation to review:',
+    conversationText,
+  ].join('\n');
+
+  // Call API
+  let responseText: string | null = null;
+
+  if (provider === 'anthropic') {
+    const token = await refreshAnthropicToken(authEntry);
+    if (!token) {
+      log.error('Observer: failed to get Anthropic token');
+      return;
+    }
+    responseText = await callObserverAnthropic(
+      token,
+      modelId,
+      observerSystemPrompt,
+      userMessage,
+    );
+  } else if (provider === 'openai') {
+    responseText = await callObserverOpenAI(
+      authEntry.access,
+      modelId,
+      observerSystemPrompt,
+      userMessage,
+    );
+  } else {
+    log.error('Observer: unsupported provider', { provider });
+    return;
+  }
+
+  if (!responseText) {
+    log.info('Observer: no response from model');
+    return;
+  }
+
+  // Parse and execute operations
+  try {
+    // Extract JSON array from response (handle markdown code blocks)
+    const cleaned = responseText.replace(/^```json?\n?/m, '').replace(/\n?```$/m, '').trim();
+    const operations = JSON.parse(cleaned) as ObserverOperation[];
+
+    if (!Array.isArray(operations)) {
+      log.error('Observer: response is not an array');
+      return;
+    }
+
+    if (operations.length === 0) {
+      log.info('Observer: nothing to save');
+      return;
+    }
+
+    let successCount = 0;
+    for (const op of operations) {
+      if (op.action && op.target) {
+        executeObserverOp(op);
+        successCount++;
+      }
+    }
+
+    log.info('Observer: complete', { reason, operations: successCount });
+  } catch (error) {
+    log.error('Observer: failed to parse response', {
+      preview: responseText.slice(0, 300),
+      ...serializeError(error),
+    });
+  }
 };
 
 const settingsPath = '/root/.pi/agent/settings.json';
@@ -734,6 +1014,15 @@ const streamPrompt = async (
     }
 
     await completion;
+
+    // Periodic observer nudge (background, non-blocking)
+    messagesSinceObserver++;
+    if (observerModelEnv && messagesSinceObserver >= observerNudgeInterval) {
+      messagesSinceObserver = 0;
+      runMemoryObserver('periodic-nudge').catch((error) => {
+        log.error('Observer periodic nudge failed', serializeError(error));
+      });
+    }
   } catch (error) {
     unsubscribe();
     log.error('Message processing failed', serializeError(error));
@@ -761,7 +1050,9 @@ registerSlashCommand({
   handler: async (res) => {
     try {
       log.info('Pi slash compact start', { sessionId: session.sessionId });
+      await runMemoryObserver('pre-compact');
       await session.compact();
+      await session.reload();
       log.info('Pi slash compact complete', { sessionId: session.sessionId });
       sendAssistantResult(res, 'Session compacted. Context reduced.');
     } catch (error) {
@@ -834,6 +1125,8 @@ registerSlashCommand({
   handler: async (res) => {
     try {
       log.info('Pi slash new start', { sessionId: session.sessionId });
+      await runMemoryObserver('pre-new-session');
+      await session.reload();
       await session.newSession();
       log.info('Pi slash new complete', { sessionId: session.sessionId });
       sendAssistantResult(res, 'New session started.');
@@ -1025,7 +1318,11 @@ const handleHistory = (res: ServerResponse): void => {
 const handleCompact = async (res: ServerResponse): Promise<void> => {
   try {
     log.info('Pi compact start', { sessionId: session.sessionId });
-    await runQueued(() => session.compact());
+    await runQueued(async () => {
+      await runMemoryObserver('pre-compact-api');
+      await session.compact();
+      await session.reload();
+    });
     log.info('Pi compact complete', { sessionId: session.sessionId });
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'compacted' }));
@@ -1164,6 +1461,8 @@ const handleRequest = async (
   if (req.method === 'POST' && req.url === '/new') {
     try {
       log.info('Pi new session start', { sessionId: session.sessionId });
+      await runMemoryObserver('pre-new-session-api');
+      await session.reload();
       await session.newSession();
       log.info('Pi new session complete', { sessionId: session.sessionId });
       res.writeHead(200, { 'Content-Type': 'application/json' });

@@ -10,6 +10,8 @@ struct AgentChatView: View {
     @FocusState var isInputFocused: Bool
     @State private var expandedToolMessages: Set<UUID> = []
     @State private var fullscreenToolGroupID: UUID?
+    @State private var cachedDisplayItems: [ChatDisplayItem] = []
+    @State private var cachedPreCompactionDisplayItems: [ChatDisplayItem] = []
     @State var showsVaultBrowser = false
     @State private var showHotkeyHelp = false
     @State var slashCommands = SlashCommandPopup.fallbackSlashCommands
@@ -105,6 +107,8 @@ struct AgentChatView: View {
         .background(Color.clear)
         .onAppear {
             isInputFocused = true
+            rebuildDisplayItems()
+            rebuildPreCompactionDisplayItems()
         }
         .onChange(of: showsVaultBrowser) {
             isInputFocused = !showsVaultBrowser
@@ -121,6 +125,12 @@ struct AgentChatView: View {
         }
         .onChange(of: viewModel.inputText) {
             handleInputTextChanged()
+        }
+        .onChange(of: viewModel.messagesVersion) {
+            rebuildDisplayItems()
+        }
+        .onChange(of: viewModel.preCompactionDisplayVersion) {
+            rebuildPreCompactionDisplayItems()
         }
         .onKeyPress(.escape, action: handleEscapeKey)
         .onReceive(NotificationCenter.default.publisher(for: .toggleGhostChatFiles)) { notification in
@@ -170,7 +180,7 @@ struct AgentChatView: View {
                             }
 
                             if viewModel.showingPreCompactionMessages {
-                                chatItemsSection(preCompactionDisplayItems)
+                                chatItemsSection(cachedPreCompactionDisplayItems)
 
                                 HStack(spacing: 12) {
                                     hideOlderButton
@@ -183,7 +193,7 @@ struct AgentChatView: View {
                             CompactionDivider(summary: viewModel.compactionSummary)
                         }
 
-                        chatItemsSection(displayItems)
+                        chatItemsSection(cachedDisplayItems)
 
                         if viewModel.isStreaming {
                             GhostTypingBlock(name: viewModel.ghostName)
@@ -250,9 +260,7 @@ struct AgentChatView: View {
     }
 
     private func toggleVaultBrowser() {
-        withAnimation(.easeOut(duration: 0.18)) {
-            showsVaultBrowser.toggle()
-        }
+        showsVaultBrowser.toggle()
     }
 
     private func toggleFullscreen() {
@@ -318,19 +326,11 @@ struct AgentChatView: View {
         }
     }
 
-    var displayItems: [ChatDisplayItem] {
-        displayItems(for: viewModel.messages)
-    }
-
-    private var preCompactionDisplayItems: [ChatDisplayItem] {
-        displayItems(for: viewModel.visiblePreCompactionMessages)
-    }
-
     var fullscreenToolGroup: ToolCallGroup? {
         guard let fullscreenToolGroupID else { return nil }
 
-        for item in displayItems {
-            if case .toolGroup(let group) = item, group.id == fullscreenToolGroupID {
+        for item in cachedDisplayItems {
+            if case .toolGroup(let group, _) = item, group.id == fullscreenToolGroupID {
                 return group
             }
         }
@@ -340,41 +340,30 @@ struct AgentChatView: View {
 
     @ViewBuilder
     func chatItemsSection(_ items: [ChatDisplayItem]) -> some View {
-        ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-            switch item {
-            case .message(let message):
-                AgentMessageBlock(message: message, ghostName: viewModel.ghostName, onThumbnailTap: { image in
+        ForEach(items) { item in
+            ChatDisplayRow(
+                item: item,
+                ghostName: viewModel.ghostName,
+                isToolGroupExpanded: { groupID in
+                    expandedToolMessages.contains(groupID)
+                },
+                onToggleToolGroup: toggleToolMessage,
+                onShowFullscreenToolGroup: showFullscreenToolGroup,
+                onThumbnailTap: { image in
                     withAnimation(.easeOut(duration: 0.15)) {
                         expandedImage = image
                     }
-                })
-            case .toolGroup(let group):
-                ToolCallGroupBlock(
-                    group: group,
-                    isExpanded: expandedToolMessages.contains(group.id),
-                    onToggle: { toggleToolMessage(group.id) },
-                    onShowFullscreen: { showFullscreenToolGroup(group.id) }
-                )
-            }
-
-            if index < items.count - 1, needsBreak(current: item, next: items[index + 1]) {
-                ExchangeBreak()
-            }
+                }
+            )
         }
     }
 
-    func needsBreak(current: ChatDisplayItem, next: ChatDisplayItem) -> Bool {
-        let currentIsUser: Bool
-        if case .message(let msg) = current { currentIsUser = msg.role == .user } else { currentIsUser = false }
-
-        let nextIsUser: Bool
-        if case .message(let msg) = next { nextIsUser = msg.role == .user } else { nextIsUser = false }
-
-        return currentIsUser != nextIsUser
+    private func rebuildDisplayItems() {
+        cachedDisplayItems = ChatDisplayItem.build(from: viewModel.messages)
     }
 
-    private func displayItems(for messages: [ChatMessage]) -> [ChatDisplayItem] {
-        ChatDisplayItem.build(from: messages)
+    private func rebuildPreCompactionDisplayItems() {
+        cachedPreCompactionDisplayItems = ChatDisplayItem.build(from: viewModel.visiblePreCompactionMessages)
     }
 
     private var showMoreButton: some View {
@@ -412,4 +401,44 @@ struct AgentChatView: View {
 
 private enum ChatScrollAnchor {
     static let bottom = "chat-bottom-anchor"
+}
+
+private struct ChatDisplayRow: View {
+    let item: ChatDisplayItem
+    let ghostName: String
+    let isToolGroupExpanded: (UUID) -> Bool
+    let onToggleToolGroup: (UUID) -> Void
+    let onShowFullscreenToolGroup: (UUID) -> Void
+    let onThumbnailTap: (NSImage) -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            rowContent
+
+            ExchangeBreak()
+                .frame(height: item.showsBreakAfter ? 1 : 0, alignment: .top)
+                .clipped()
+                .padding(.top, item.showsBreakAfter ? 20 : 0)
+                .opacity(item.showsBreakAfter ? 1 : 0)
+        }
+    }
+
+    @ViewBuilder
+    private var rowContent: some View {
+        switch item {
+        case .message(let message, _):
+            AgentMessageBlock(
+                message: message,
+                ghostName: ghostName,
+                onThumbnailTap: onThumbnailTap
+            )
+        case .toolGroup(let group, _):
+            ToolCallGroupBlock(
+                group: group,
+                isExpanded: isToolGroupExpanded(group.id),
+                onToggle: { onToggleToolGroup(group.id) },
+                onShowFullscreen: { onShowFullscreenToolGroup(group.id) }
+            )
+        }
+    }
 }

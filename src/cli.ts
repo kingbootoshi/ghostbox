@@ -444,6 +444,7 @@ const init = async (): Promise<void> => {
       defaultProvider,
       defaultModel,
       imageName: existingState?.config?.imageName ?? DEFAULT_IMAGE_NAME,
+      observerModel: existingState?.config?.observerModel ?? '',
     },
     telegram: existingState?.telegram ?? { activeChatGhosts: {} },
   } as unknown as GhostboxState;

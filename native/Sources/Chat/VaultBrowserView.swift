@@ -1,4 +1,5 @@
 import Foundation
+import MarkdownUI
 import SwiftUI
 
 struct VaultBrowserView: View {
@@ -138,15 +139,8 @@ struct VaultBrowserView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 20))
                     } else {
                         ScrollView {
-                            if file.path.hasSuffix(".md"),
-                               let attributed = try? AttributedString(
-                                   markdown: file.content,
-                                   options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-                               ) {
-                                Text(attributed)
-                                    .font(Theme.Typography.body())
-                                    .foregroundColor(Color.white.opacity(Theme.Text.primary))
-                                    .lineSpacing(5.6)
+                            if file.path.hasSuffix(".md") {
+                                markdownPreview(file.content)
                                     .textSelection(.enabled)
                                     .frame(maxWidth: .infinity, alignment: .topLeading)
                                     .padding(18)
@@ -199,6 +193,114 @@ struct VaultBrowserView: View {
         }
 
         return "File"
+    }
+
+    @ViewBuilder
+    private func markdownPreview(_ content: String) -> some View {
+        Markdown(content)
+            .font(Theme.Typography.body())
+            .markdownTheme(.gitHub)
+            .markdownTextStyle(\.text) {
+                FontSize(Theme.FontSize.md)
+                ForegroundColor(Color.white.opacity(Theme.Text.primary))
+                BackgroundColor(nil)
+            }
+            .markdownTextStyle(\.strong) {
+                FontWeight(.semibold)
+                ForegroundColor(Color.white.opacity(Theme.Text.primary))
+            }
+            .markdownTextStyle(\.link) {
+                ForegroundColor(Theme.Colors.accentLight)
+            }
+            .markdownTextStyle(\.code) {
+                FontFamilyVariant(.monospaced)
+                FontSize(.em(0.92))
+                ForegroundColor(Color.white.opacity(0.92))
+                BackgroundColor(Color.white.opacity(0.05))
+            }
+            .markdownBlockStyle(\.heading1) { configuration in
+                configuration.label
+                    .relativeLineSpacing(.em(0.12))
+                    .markdownMargin(top: 0, bottom: 16)
+                    .markdownTextStyle {
+                        FontWeight(.semibold)
+                        FontSize(24)
+                        ForegroundColor(Color.white.opacity(0.97))
+                    }
+            }
+            .markdownBlockStyle(\.heading2) { configuration in
+                configuration.label
+                    .relativeLineSpacing(.em(0.12))
+                    .markdownMargin(top: 8, bottom: 14)
+                    .markdownTextStyle {
+                        FontWeight(.semibold)
+                        FontSize(20)
+                        ForegroundColor(Color.white.opacity(0.96))
+                    }
+            }
+            .markdownBlockStyle(\.heading3) { configuration in
+                configuration.label
+                    .relativeLineSpacing(.em(0.12))
+                    .markdownMargin(top: 8, bottom: 12)
+                    .markdownTextStyle {
+                        FontWeight(.semibold)
+                        FontSize(18)
+                        ForegroundColor(Color.white.opacity(0.95))
+                    }
+            }
+            .markdownBlockStyle(\.heading4) { configuration in
+                configuration.label
+                    .relativeLineSpacing(.em(0.12))
+                    .markdownMargin(top: 6, bottom: 10)
+                    .markdownTextStyle {
+                        FontWeight(.semibold)
+                        FontSize(16)
+                        ForegroundColor(Color.white.opacity(0.94))
+                    }
+            }
+            .markdownBlockStyle(\.paragraph) { configuration in
+                configuration.label
+                    .fixedSize(horizontal: false, vertical: true)
+                    .relativeLineSpacing(.em(0.22))
+                    .markdownMargin(top: 0, bottom: 14)
+            }
+            .markdownBlockStyle(\.blockquote) { configuration in
+                HStack(alignment: .top, spacing: 0) {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Theme.Colors.accentLight.opacity(0.35))
+                        .frame(width: 3)
+
+                    configuration.label
+                        .relativePadding(.leading, length: .em(0.9))
+                        .markdownTextStyle {
+                            ForegroundColor(Color.white.opacity(Theme.Text.secondary))
+                        }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .markdownMargin(top: 0, bottom: 14)
+            }
+            .markdownBlockStyle(\.codeBlock) { configuration in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    configuration.label
+                        .fixedSize(horizontal: false, vertical: true)
+                        .relativeLineSpacing(.em(0.22))
+                        .markdownTextStyle {
+                            FontFamilyVariant(.monospaced)
+                            FontSize(.em(0.92))
+                            ForegroundColor(Color.white.opacity(0.9))
+                        }
+                        .padding(16)
+                }
+                .background(Color.white.opacity(0.05))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .markdownMargin(top: 0, bottom: 14)
+            }
+            .markdownBlockStyle(\.thematicBreak) {
+                Divider()
+                    .overlay(Color.white.opacity(0.08))
+                    .markdownMargin(top: 18, bottom: 18)
+            }
+            .tint(Theme.Colors.accentLight)
     }
 }
 
@@ -427,9 +529,7 @@ final class VaultBrowserViewModel: ObservableObject {
 
             guard requestedPath == currentPath else { return }
 
-            withAnimation(.easeOut(duration: 0.15)) {
-                entries = sortedEntries
-            }
+            entries = sortedEntries
         } catch {
             guard requestedPath == currentPath else { return }
             self.error = error.localizedDescription

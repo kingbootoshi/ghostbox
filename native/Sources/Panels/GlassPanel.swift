@@ -96,6 +96,11 @@ class GlassPanel: NSPanel {
         alphaValue = 1
     }
 
+    func showInstant() {
+        alphaValue = 1
+        orderFrontRegardless()
+    }
+
     func snapOut(completion: (() -> Void)? = nil) {
         guard let layer = contentView?.layer else {
             orderOut(nil)

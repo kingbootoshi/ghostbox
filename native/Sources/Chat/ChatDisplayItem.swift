@@ -1,15 +1,24 @@
 import Foundation
 
 enum ChatDisplayItem: Identifiable {
-    case message(ChatMessage)
-    case toolGroup(ToolCallGroup)
+    case message(ChatMessage, showsBreakAfter: Bool)
+    case toolGroup(ToolCallGroup, showsBreakAfter: Bool)
 
     var id: UUID {
         switch self {
-        case .message(let message):
+        case .message(let message, _):
             return message.id
-        case .toolGroup(let group):
+        case .toolGroup(let group, _):
             return group.id
+        }
+    }
+
+    var showsBreakAfter: Bool {
+        switch self {
+        case .message(_, let showsBreakAfter):
+            return showsBreakAfter
+        case .toolGroup(_, let showsBreakAfter):
+            return showsBreakAfter
         }
     }
 
@@ -36,19 +45,50 @@ enum ChatDisplayItem: Identifiable {
 
                 for (i, toolUse) in toolUses.enumerated() {
                     let toolResult = i < toolResults.count ? toolResults[i] : nil
-                    items.append(.toolGroup(ToolCallGroup(toolUse: toolUse, toolResult: toolResult)))
+                    items.append(.toolGroup(ToolCallGroup(toolUse: toolUse, toolResult: toolResult), showsBreakAfter: false))
                 }
 
                 index = next
             } else if message.role == .toolResult {
                 index += 1
             } else {
-                items.append(.message(message))
+                items.append(.message(message, showsBreakAfter: false))
                 index += 1
             }
         }
 
-        return items
+        return items.enumerated().map { index, item in
+            let showsBreakAfter: Bool
+            if index < items.count - 1 {
+                showsBreakAfter = needsBreak(after: item, before: items[index + 1])
+            } else {
+                showsBreakAfter = false
+            }
+
+            return item.with(showsBreakAfter: showsBreakAfter)
+        }
+    }
+
+    private static func needsBreak(after current: ChatDisplayItem, before next: ChatDisplayItem) -> Bool {
+        current.isUserMessage != next.isUserMessage
+    }
+
+    private var isUserMessage: Bool {
+        switch self {
+        case .message(let message, _):
+            return message.role == .user
+        case .toolGroup(_, _):
+            return false
+        }
+    }
+
+    private func with(showsBreakAfter: Bool) -> ChatDisplayItem {
+        switch self {
+        case .message(let message, _):
+            return .message(message, showsBreakAfter: showsBreakAfter)
+        case .toolGroup(let group, _):
+            return .toolGroup(group, showsBreakAfter: showsBreakAfter)
+        }
     }
 }
 

@@ -9,6 +9,14 @@ struct ChatMessage: Identifiable {
     let toolName: String?
     let attachmentCount: Int
     let thumbnails: [NSImage]
+    let attributedContent: AttributedString?
+    private let cachedResolvedToolName: String
+    private let cachedNormalizedToolKind: String
+    private let cachedToolPrimarySubject: String?
+    private let cachedToolInputPreview: String
+    private let cachedToolOutputPreview: String
+    private let cachedSingleLineContent: String
+    private let cachedContentSizeSummary: String
 
     enum Role {
         case user
@@ -34,6 +42,39 @@ struct ChatMessage: Identifiable {
         self.toolName = toolName
         self.attachmentCount = attachmentCount
         self.thumbnails = thumbnails
+
+        let sanitizedToolName = Self.sanitizedToolName(toolName)
+        let structuredContent =
+            role == .toolUse || role == .toolResult
+            ? Self.parseJSONObject(from: content)
+            : nil
+        let singleLineContent = Self.compactWhitespace(content)
+        let normalizedToolKind = Self.resolveNormalizedToolKind(
+            sanitizedToolName: sanitizedToolName,
+            structuredContent: structuredContent
+        )
+        let toolPrimarySubject = Self.resolveToolPrimarySubject(
+            normalizedToolKind: normalizedToolKind,
+            structuredContent: structuredContent
+        )
+
+        attributedContent = Self.makeAttributedContent(for: role, content: content)
+        cachedResolvedToolName = Self.resolveToolName(
+            sanitizedToolName: sanitizedToolName,
+            normalizedToolKind: normalizedToolKind
+        )
+        cachedNormalizedToolKind = normalizedToolKind
+        cachedToolPrimarySubject = toolPrimarySubject
+        cachedToolInputPreview = toolPrimarySubject ?? singleLineContent
+        cachedToolOutputPreview = Self.resolveToolOutputPreview(
+            structuredContent: structuredContent,
+            fallback: singleLineContent
+        )
+        cachedSingleLineContent = singleLineContent
+        cachedContentSizeSummary = ByteCountFormatter.string(
+            fromByteCount: Int64(content.utf8.count),
+            countStyle: .file
+        )
     }
 }
 
@@ -43,8 +84,62 @@ extension ChatMessage {
     }
 
     var resolvedToolName: String {
-        if let toolName = sanitizedToolName {
-            return toolName
+        cachedResolvedToolName
+    }
+
+    var normalizedToolKind: String {
+        cachedNormalizedToolKind
+    }
+
+    var toolPrimarySubject: String? {
+        cachedToolPrimarySubject
+    }
+
+    var toolInputPreview: String {
+        cachedToolInputPreview
+    }
+
+    var toolOutputPreview: String {
+        cachedToolOutputPreview
+    }
+
+    var singleLineContent: String {
+        cachedSingleLineContent
+    }
+
+    var contentSizeSummary: String {
+        cachedContentSizeSummary
+    }
+
+    func updatingContent(_ content: String) -> ChatMessage {
+        guard content != self.content else { return self }
+
+        return ChatMessage(
+            id: id,
+            role: role,
+            content: content,
+            timestamp: timestamp,
+            toolName: toolName,
+            attachmentCount: attachmentCount,
+            thumbnails: thumbnails
+        )
+    }
+
+    private static func makeAttributedContent(for role: Role, content: String) -> AttributedString? {
+        guard (role == .ghost || role == .system),
+              !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        return try? AttributedString(
+            markdown: content,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )
+    }
+
+    private static func resolveToolName(sanitizedToolName: String?, normalizedToolKind: String) -> String {
+        if let sanitizedToolName {
+            return sanitizedToolName
         }
 
         switch normalizedToolKind {
@@ -59,8 +154,12 @@ extension ChatMessage {
         }
     }
 
-    var normalizedToolKind: String {
-        let rawName = (sanitizedToolName ?? inferredToolName ?? "").lowercased()
+    private static func resolveNormalizedToolKind(
+        sanitizedToolName: String?,
+        structuredContent: Any?
+    ) -> String {
+        let rawName = (sanitizedToolName ?? structuredValue(in: structuredContent, forKeys: ["tool", "tool_name", "toolName", "name"]) ?? "")
+            .lowercased()
 
         if rawName.contains("bash") || rawName.contains("shell") || rawName.contains("terminal") {
             return "bash"
@@ -77,8 +176,11 @@ extension ChatMessage {
         return rawName.isEmpty ? "tool" : rawName
     }
 
-    var toolPrimarySubject: String? {
-        if let path = structuredValue(forKeys: [
+    private static func resolveToolPrimarySubject(
+        normalizedToolKind: String,
+        structuredContent: Any?
+    ) -> String? {
+        if let path = structuredValue(in: structuredContent, forKeys: [
             "path",
             "file_path",
             "filepath",
@@ -88,27 +190,23 @@ extension ChatMessage {
             "absolute_path",
             "absolutePath",
         ]) {
-            return Self.compactWhitespace(path)
+            return compactWhitespace(path)
         }
 
         if normalizedToolKind == "bash",
-           let command = structuredValue(forKeys: ["command", "cmd"]) {
-            return Self.compactWhitespace(command)
+           let command = structuredValue(in: structuredContent, forKeys: ["command", "cmd"]) {
+            return compactWhitespace(command)
         }
 
-        if let value = structuredValue(forKeys: ["url", "uri", "query", "prompt", "pattern"]) {
-            return Self.compactWhitespace(value)
+        if let value = structuredValue(in: structuredContent, forKeys: ["url", "uri", "query", "prompt", "pattern"]) {
+            return compactWhitespace(value)
         }
 
         return nil
     }
 
-    var toolInputPreview: String {
-        toolPrimarySubject ?? singleLineContent
-    }
-
-    var toolOutputPreview: String {
-        if let value = structuredValue(forKeys: [
+    private static func resolveToolOutputPreview(structuredContent: Any?, fallback: String) -> String {
+        if let value = structuredValue(in: structuredContent, forKeys: [
             "summary",
             "message",
             "result",
@@ -117,21 +215,13 @@ extension ChatMessage {
             "stderr",
             "text",
         ]) {
-            return Self.compactWhitespace(value)
+            return compactWhitespace(value)
         }
 
-        return singleLineContent
+        return fallback
     }
 
-    var singleLineContent: String {
-        Self.compactWhitespace(content)
-    }
-
-    var contentSizeSummary: String {
-        ByteCountFormatter.string(fromByteCount: Int64(content.utf8.count), countStyle: .file)
-    }
-
-    private var sanitizedToolName: String? {
+    private static func sanitizedToolName(_ toolName: String?) -> String? {
         guard let toolName else { return nil }
 
         let trimmed = toolName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -142,16 +232,12 @@ extension ChatMessage {
         return trimmed
     }
 
-    private var inferredToolName: String? {
-        structuredValue(forKeys: ["tool", "tool_name", "toolName", "name"])
+    private static func structuredValue(in object: Any?, forKeys keys: [String]) -> String? {
+        guard let object else { return nil }
+        return findValue(in: object, keys: Set(keys.map { $0.lowercased() }))
     }
 
-    private func structuredValue(forKeys keys: [String]) -> String? {
-        guard let jsonObject = parsedJSONObject else { return nil }
-        return Self.findValue(in: jsonObject, keys: Set(keys.map { $0.lowercased() }))
-    }
-
-    private var parsedJSONObject: Any? {
+    private static func parseJSONObject(from content: String) -> Any? {
         guard let data = content.data(using: .utf8) else { return nil }
         return try? JSONSerialization.jsonObject(with: data)
     }

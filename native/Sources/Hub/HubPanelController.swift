@@ -27,10 +27,14 @@ final class HubPanelController {
         isVisible ? hide() : show()
     }
 
-    func show() {
+    func show(animated: Bool = true) {
         if let panel {
             NSApp.activate(ignoringOtherApps: true)
-            panel.snapIn()
+            if animated {
+                panel.snapIn()
+            } else {
+                panel.showInstant()
+            }
             return
         }
 
@@ -45,12 +49,37 @@ final class HubPanelController {
         panel = glassPanel
 
         NSApp.activate(ignoringOtherApps: true)
-        glassPanel.slideFromCenter()
+        if animated {
+            glassPanel.slideFromCenter()
+        } else {
+            glassPanel.showInstant()
+        }
     }
 
     func hide() {
         guard let panel else { return }
         panel.snapOut()
+    }
+
+    /// Create panel offscreen so SwiftUI mounts and begins loading data
+    func createPanelHidden() {
+        guard panel == nil, let targetFrame = centeredFrame(for: panelSize) else { return }
+
+        let glassPanel = GlassPanel(contentRect: targetFrame, title: "Ghostbox")
+        glassPanel.setSwiftUIContent(
+            HubView(client: client)
+                .environmentObject(appState)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        )
+        glassPanel.alphaValue = 0
+        glassPanel.orderFrontRegardless()
+        panel = glassPanel
+    }
+
+    /// Reveal the pre-created panel with a fade
+    func revealPanel() {
+        guard let panel else { return }
+        panel.snapIn()
     }
 
     private func centeredFrame(for size: NSSize) -> NSRect? {

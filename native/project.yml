@@ -6,6 +6,11 @@ options:
   xcodeVersion: "16.0"
   minimumXcodeGenVersion: "2.40.0"
 
+packages:
+  MarkdownUI:
+    url: https://github.com/gonzalezreal/swift-markdown-ui
+    exactVersion: 2.4.1
+
 targets:
   Ghostbox:
     type: application
@@ -21,10 +26,14 @@ targets:
       - path: Resources/Images
         buildPhase: resources
         type: folder
+      - path: Resources/Assets.xcassets
+    dependencies:
+      - package: MarkdownUI
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ghostbox.app
         PRODUCT_NAME: Ghostbox
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         MACOSX_DEPLOYMENT_TARGET: "14.0"

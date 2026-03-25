@@ -17,7 +17,7 @@ final class ChatPanelController: NSObject, NSWindowDelegate {
 
     private let defaultPanelSize = NSSize(width: 380, height: 550)
     private let hubSize = NSSize(width: 400, height: 600)
-    private let panelResizeAnimationDuration: TimeInterval = 0.2
+    private let panelResizeAnimationDuration: TimeInterval = 0.1
 
     private var lastKnownFrame: NSRect?
     private var isAnimatingPanel = false

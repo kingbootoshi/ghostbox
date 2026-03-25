@@ -38,6 +38,7 @@ export interface GhostboxConfig {
   defaultModel: string;
   defaultProvider: string;
   imageName: string;
+  observerModel: string;
 }
 
 export interface GhostboxConfigSensitiveStatus {
@@ -59,6 +60,7 @@ export type GhostboxConfigUpdate = Partial<{
   defaultModel: string;
   defaultProvider: string;
   imageName: string;
+  observerModel: string;
 }>;
 
 export interface TelegramState {
