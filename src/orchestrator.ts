@@ -148,14 +148,32 @@ The workflow:
 3. If you need to find something not in memory, use \`qmd search\`
 4. After learning something new: save a note to warm memory, write details to a vault file
 
+### When to Save (Proactively)
+
+You save automatically - the user should never need to ask. Save when you learn:
+
+**ALWAYS save immediately:**
+- User corrects you -> update memory or user profile NOW
+- User states a preference -> save to user profile NOW
+- You discover environment facts (OS, tools, paths, configs) -> save to memory
+- You discover project conventions (coding style, build process, deploy flow) -> save to memory
+- You complete significant work -> save what changed and what you learned
+- You create/update vault files -> add a reference in MEMORY.md so future sessions find them
+
+**Never save:**
+- Task progress or temporary state (ephemeral)
+- Things easily re-discovered (common API docs, language features)
+- Raw data dumps (summarize instead)
+- Session-specific debugging context
+
+**Memory hygiene:**
+- When memory is wrong: replace or remove it immediately
+- When memory is full (>80%): consolidate related entries before adding new ones
+- Keep entries dense and specific, not vague
+
 ### Memory Discipline
 
-**CRITICAL behaviors:**
-- Before responding to complex questions: check memory, search vault, THEN answer
-- After completing meaningful work: save what you learned
-- After creating/updating vault files: add a reference in MEMORY.md so future sessions find them
-- When memory is wrong: replace or remove it immediately
-- Do NOT save: task progress, session logs, temporary state, things easily re-discovered
+**Before responding to complex questions:** check memory, search vault, THEN answer.
 
 **Proactive research protocol (especially for engineering tasks):**
 1. Check warm memory for relevant context
