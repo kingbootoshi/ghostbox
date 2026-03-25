@@ -92,14 +92,16 @@ const observerModelEnv = process.env.GHOSTBOX_OBSERVER_MODEL || '';
 // Memory observer is the first handler. Future: scheduled hooks, sub-agent
 // callbacks, agent self-activation.
 
-type NudgeEvent =
-  | 'message-complete'     // After each user message is processed
-  | 'pre-compact'          // Before context compaction
-  | 'pre-new-session'      // Before new session
-  | 'idle'                 // Agent has been idle for N seconds
-  | 'timer'                // Periodic timer fire
-  | 'self'                 // Agent-triggered (via tool or API)
-  | 'session-start';       // Session just started
+const NUDGE_EVENTS = [
+  'message-complete',     // After each user message is processed
+  'pre-compact',          // Before context compaction
+  'pre-new-session',      // Before new session
+  'idle',                 // Agent has been idle for N seconds
+  'timer',                // Periodic timer fire
+  'self',                 // Agent-triggered (via tool or API)
+  'session-start',        // Session just started
+] as const;
+type NudgeEvent = (typeof NUDGE_EVENTS)[number];
 
 type NudgeHandler = {
   id: string;
@@ -117,6 +119,7 @@ type NudgeContext = {
   reason: string;
   messageCount: number;
   sessionAge: number; // ms since session start
+  payload?: Record<string, unknown>; // For sub-agent callbacks, scheduled hooks
 };
 
 class NudgeRegistry {
@@ -138,6 +141,7 @@ class NudgeRegistry {
     this.sessionStartTime = Date.now();
     for (const handler of this.handlers) {
       this.handlerMessageCounters.set(handler.id, 0);
+      this.handlerLastFired.set(handler.id, Date.now());
     }
   }
 
@@ -201,15 +205,11 @@ class NudgeRegistry {
 
       this.handlerLastFired.set(handler.id, Date.now());
 
-      if (handler.background) {
-        Promise.resolve(handler.handler(event, context)).catch((error: unknown) => {
-          log.error('Nudge: background handler failed', {
-            id: handler.id,
-            event,
-            ...serializeError(error),
-          });
-        });
-      } else {
+      // Critical events always await - background flag only applies to non-critical events
+      const criticalEvents: NudgeEvent[] = ['pre-compact', 'pre-new-session'];
+      const shouldAwait = !handler.background || criticalEvents.includes(event);
+
+      if (shouldAwait) {
         try {
           await handler.handler(event, context);
         } catch (error) {
@@ -219,6 +219,14 @@ class NudgeRegistry {
             ...serializeError(error),
           });
         }
+      } else {
+        Promise.resolve(handler.handler(event, context)).catch((error: unknown) => {
+          log.error('Nudge: background handler failed', {
+            id: handler.id,
+            event,
+            ...serializeError(error),
+          });
+        });
       }
     }
   }
@@ -1759,14 +1767,10 @@ const handleRequest = async (
       const event = (parsed.event ?? 'self') as NudgeEvent;
       const reason = parsed.reason ?? 'api-trigger';
 
-      // Validate event type
-      const validEvents: NudgeEvent[] = [
-        'message-complete', 'pre-compact', 'pre-new-session',
-        'idle', 'timer', 'self', 'session-start',
-      ];
-      if (!validEvents.includes(event)) {
+      // Validate event type (derived from NUDGE_EVENTS const)
+      if (!(NUDGE_EVENTS as readonly string[]).includes(event)) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `Invalid event: ${event}`, valid: validEvents }));
+        res.end(JSON.stringify({ error: `Invalid event: ${event}`, valid: NUDGE_EVENTS }));
         log.info('Response sent', { method: req.method, url: req.url, status: 400 });
         return;
       }

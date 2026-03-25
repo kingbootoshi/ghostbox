@@ -275,6 +275,11 @@ const getGhostboxApiKeysEnv = (ghost: GhostState): string => {
   return `GHOSTBOX_API_KEYS=${JSON.stringify(getGhostApiKeyValues(ghost))}`;
 };
 
+const getGhostNudgeKeyEnv = (ghost: GhostState): string => {
+  const firstKey = ghost.apiKeys[0]?.key ?? '';
+  return `GHOST_API_KEY=${firstKey}`;
+};
+
 const getGhostAuthorizationHeader = (ghost: GhostState): string | null => {
   const apiKey = ghost.apiKeys[0];
   return apiKey ? `Bearer ${apiKey.key}` : null;
@@ -590,6 +595,7 @@ export const spawnGhost = async (
         `GHOSTBOX_USER_PORTS=8001-8009`,
         `GHOSTBOX_OBSERVER_MODEL=${state.config.observerModel || ''}`,
         getGhostboxApiKeysEnv(ghost),
+        getGhostNudgeKeyEnv(ghost),
       ],
       ExposedPorts: buildExposedPorts(),
       HostConfig: {
@@ -673,6 +679,7 @@ export const wakeGhost = async (name: string): Promise<void> => {
         `GHOSTBOX_USER_PORTS=8001-8009`,
         `GHOSTBOX_OBSERVER_MODEL=${state.config.observerModel || ''}`,
         getGhostboxApiKeysEnv(ghost),
+        getGhostNudgeKeyEnv(ghost),
       ],
       ExposedPorts: buildExposedPorts(),
       HostConfig: {
