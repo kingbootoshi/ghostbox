@@ -141,6 +141,35 @@ class NudgeRegistry {
     }
   }
 
+  status(): {
+    handlers: Array<{ id: string; event: NudgeEvent | NudgeEvent[]; messageInterval?: number; timeInterval?: number; background?: boolean }>;
+    messageCount: number;
+    sessionAge: number;
+    handlerCounters: Record<string, number>;
+    handlerLastFired: Record<string, string>;
+  } {
+    const counters: Record<string, number> = {};
+    const lastFired: Record<string, string> = {};
+    for (const handler of this.handlers) {
+      counters[handler.id] = this.handlerMessageCounters.get(handler.id) ?? 0;
+      const ts = this.handlerLastFired.get(handler.id) ?? 0;
+      lastFired[handler.id] = ts ? new Date(ts).toISOString() : 'never';
+    }
+    return {
+      handlers: this.handlers.map((h) => ({
+        id: h.id,
+        event: h.event,
+        messageInterval: h.messageInterval,
+        timeInterval: h.timeInterval,
+        background: h.background,
+      })),
+      messageCount: this.messageCount,
+      sessionAge: Date.now() - this.sessionStartTime,
+      handlerCounters: counters,
+      handlerLastFired: lastFired,
+    };
+  }
+
   async emit(event: NudgeEvent, reason: string): Promise<void> {
     if (event === 'message-complete') {
       this.messageCount++;
@@ -1711,6 +1740,14 @@ const handleRequest = async (
       ),
     );
     log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
+    return;
+  }
+
+  // Nudge status - observability for the nudge system
+  if (req.method === 'GET' && req.url === '/nudge/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(nudges.status()));
+    log.info('Response sent', { method: req.method, url: req.url, status: 200 });
     return;
   }
 
