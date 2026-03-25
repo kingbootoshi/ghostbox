@@ -7,3 +7,4 @@ docker/ghost-server.js
 .DS_Store
 handoffs/
 native/Ghostbox.xcodeproj/
+autoresearch-results.tsv

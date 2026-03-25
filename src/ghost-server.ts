@@ -84,8 +84,118 @@ type ObserverOperation = {
 };
 
 const observerModelEnv = process.env.GHOSTBOX_OBSERVER_MODEL || '';
-const observerNudgeInterval = 10;
-let messagesSinceObserver = 0;
+
+// ---------------------------------------------------------------------------
+// Nudge Registry - centralized event bus for proactive agent behavior
+// ---------------------------------------------------------------------------
+// Nudges are internal events that trigger actions without user instruction.
+// Memory observer is the first handler. Future: scheduled hooks, sub-agent
+// callbacks, agent self-activation.
+
+type NudgeEvent =
+  | 'message-complete'     // After each user message is processed
+  | 'pre-compact'          // Before context compaction
+  | 'pre-new-session'      // Before new session
+  | 'idle'                 // Agent has been idle for N seconds
+  | 'timer'                // Periodic timer fire
+  | 'self'                 // Agent-triggered (via tool or API)
+  | 'session-start';       // Session just started
+
+type NudgeHandler = {
+  id: string;
+  event: NudgeEvent | NudgeEvent[];
+  handler: (event: NudgeEvent, context: NudgeContext) => Promise<void> | void;
+  // For message-count-gated handlers
+  messageInterval?: number;
+  // For time-gated handlers (ms)
+  timeInterval?: number;
+  // Background (non-blocking) vs foreground (blocks the event)
+  background?: boolean;
+};
+
+type NudgeContext = {
+  reason: string;
+  messageCount: number;
+  sessionAge: number; // ms since session start
+};
+
+class NudgeRegistry {
+  private handlers: NudgeHandler[] = [];
+  private messageCount = 0;
+  private handlerMessageCounters: Map<string, number> = new Map();
+  private handlerLastFired: Map<string, number> = new Map();
+  private sessionStartTime = Date.now();
+
+  register(handler: NudgeHandler): void {
+    this.handlers.push(handler);
+    this.handlerMessageCounters.set(handler.id, 0);
+    this.handlerLastFired.set(handler.id, Date.now());
+    log.info('Nudge: registered handler', { id: handler.id, event: handler.event });
+  }
+
+  resetCounters(): void {
+    this.messageCount = 0;
+    this.sessionStartTime = Date.now();
+    for (const handler of this.handlers) {
+      this.handlerMessageCounters.set(handler.id, 0);
+    }
+  }
+
+  async emit(event: NudgeEvent, reason: string): Promise<void> {
+    if (event === 'message-complete') {
+      this.messageCount++;
+    }
+
+    const context: NudgeContext = {
+      reason,
+      messageCount: this.messageCount,
+      sessionAge: Date.now() - this.sessionStartTime,
+    };
+
+    for (const handler of this.handlers) {
+      const events = Array.isArray(handler.event) ? handler.event : [handler.event];
+      if (!events.includes(event)) continue;
+
+      // Check message-interval gate
+      if (handler.messageInterval && event === 'message-complete') {
+        const count = (this.handlerMessageCounters.get(handler.id) ?? 0) + 1;
+        this.handlerMessageCounters.set(handler.id, count);
+        if (count < handler.messageInterval) continue;
+        this.handlerMessageCounters.set(handler.id, 0);
+      }
+
+      // Check time-interval gate
+      if (handler.timeInterval) {
+        const lastFired = this.handlerLastFired.get(handler.id) ?? 0;
+        if (Date.now() - lastFired < handler.timeInterval) continue;
+      }
+
+      this.handlerLastFired.set(handler.id, Date.now());
+
+      if (handler.background) {
+        handler.handler(event, context).catch?.((error: unknown) => {
+          log.error('Nudge: background handler failed', {
+            id: handler.id,
+            event,
+            ...serializeError(error),
+          });
+        });
+      } else {
+        try {
+          await handler.handler(event, context);
+        } catch (error) {
+          log.error('Nudge: handler failed', {
+            id: handler.id,
+            event,
+            ...serializeError(error),
+          });
+        }
+      }
+    }
+  }
+}
+
+const nudges = new NudgeRegistry();
 
 const readAuthEntry = (provider: string): AuthEntry | null => {
   try {
@@ -1069,14 +1179,10 @@ const streamPrompt = async (
 
     await completion;
 
-    // Periodic observer nudge (background, non-blocking)
-    messagesSinceObserver++;
-    if (observerModelEnv && messagesSinceObserver >= observerNudgeInterval) {
-      messagesSinceObserver = 0;
-      runMemoryObserver('periodic-nudge').catch((error) => {
-        log.error('Observer periodic nudge failed', serializeError(error));
-      });
-    }
+    // Emit nudge event - registered handlers decide what to do
+    nudges.emit('message-complete', 'post-prompt').catch((error) => {
+      log.error('Nudge emit failed', serializeError(error));
+    });
   } catch (error) {
     unsubscribe();
     log.error('Message processing failed', serializeError(error));
@@ -1104,7 +1210,7 @@ registerSlashCommand({
   handler: async (res) => {
     try {
       log.info('Pi slash compact start', { sessionId: session.sessionId });
-      await runMemoryObserver('pre-compact');
+      await nudges.emit('pre-compact', 'slash-command');
       await session.compact();
       await session.reload();
       log.info('Pi slash compact complete', { sessionId: session.sessionId });
@@ -1198,7 +1304,7 @@ registerSlashCommand({
   handler: async (res) => {
     try {
       log.info('Pi slash new start', { sessionId: session.sessionId });
-      await runMemoryObserver('pre-new-session');
+      await nudges.emit('pre-new-session', 'slash-command');
       await session.reload();
       await session.newSession();
       log.info('Pi slash new complete', { sessionId: session.sessionId });
@@ -1465,7 +1571,7 @@ const handleCompact = async (res: ServerResponse): Promise<void> => {
   try {
     log.info('Pi compact start', { sessionId: session.sessionId });
     await runQueued(async () => {
-      await runMemoryObserver('pre-compact-api');
+      await nudges.emit('pre-compact', 'api');
       await session.compact();
       await session.reload();
     });
@@ -1625,7 +1731,7 @@ const handleRequest = async (
   if (req.method === 'POST' && req.url === '/new') {
     try {
       log.info('Pi new session start', { sessionId: session.sessionId });
-      await runMemoryObserver('pre-new-session-api');
+      await nudges.emit('pre-new-session', 'api');
       await session.reload();
       await session.newSession();
       log.info('Pi new session complete', { sessionId: session.sessionId });
@@ -1644,6 +1750,42 @@ const handleRequest = async (
   res.end(JSON.stringify({ error: 'Not found' }));
   log.info('Response sent', { method: req.method, url: req.url, status: 404 });
 };
+
+// ---------------------------------------------------------------------------
+// Register nudge handlers
+// ---------------------------------------------------------------------------
+
+// Memory observer: fires on compaction, new session, and every N messages
+nudges.register({
+  id: 'memory-observer',
+  event: ['pre-compact', 'pre-new-session', 'message-complete'],
+  messageInterval: 8, // Fire every 8 messages (was 10 - more frequent for better capture)
+  handler: async (event, context) => {
+    await runMemoryObserver(`nudge:${event}:${context.reason}`);
+  },
+  background: true, // Non-blocking for message-complete, but emit() awaits for pre-compact/pre-new-session
+});
+
+// Memory review nudge: after 20+ messages, if memory is empty, inject a stronger nudge
+nudges.register({
+  id: 'memory-review',
+  event: 'message-complete',
+  messageInterval: 20,
+  handler: async (_event, context) => {
+    const memoryContent = readMemoryFile('/vault/MEMORY.md');
+    const userContent = readMemoryFile('/vault/USER.md');
+    const totalChars = memoryContent.length + userContent.length;
+    if (totalChars < 100 && context.messageCount > 15) {
+      // Memory is nearly empty after significant conversation - observer gets extra context
+      log.info('Nudge: memory-review triggered - memory nearly empty after conversation', {
+        messageCount: context.messageCount,
+        memoryChars: totalChars,
+      });
+      await runMemoryObserver('nudge:memory-review:empty-after-conversation');
+    }
+  },
+  background: true,
+});
 
 const server = http.createServer((req, res) => {
   handleRequest(req, res).catch((error) => {
