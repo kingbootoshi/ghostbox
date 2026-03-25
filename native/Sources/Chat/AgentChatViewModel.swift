@@ -93,6 +93,16 @@ final class AgentChatViewModel: ObservableObject {
         let submittedImages = pendingImages.filter { !$0.isProcessing }
         guard (!prompt.isEmpty || !submittedImages.isEmpty), !isLoadingHistory, !isCompacting else { return }
 
+        inputText = ""
+        pendingImages = []
+
+        if isStreaming {
+            // Queue it - don't show in chat yet. It fires when the agent finishes.
+            queuedMessages.append((prompt: prompt, images: submittedImages))
+            return
+        }
+
+        // Not streaming - show in chat and send immediately
         messages.append(
             ChatMessage(
                 role: .user,
@@ -101,14 +111,6 @@ final class AgentChatViewModel: ObservableObject {
                 thumbnails: submittedImages.map { $0.thumbnail }
             )
         )
-        inputText = ""
-        pendingImages = []
-
-        if isStreaming {
-            queuedMessages.append((prompt: prompt, images: submittedImages))
-            return
-        }
-
         startStream(prompt: prompt, images: submittedImages)
     }
 
@@ -212,10 +214,10 @@ final class AgentChatViewModel: ObservableObject {
             guard let imageData = Self.extractImageData(from: item) else { continue }
             let placeholderID = UUID()
 
-            // Quick 48px thumbnail for instant display - small and fast
+            // Quick thumbnail for instant display - 200px is crisp in the strip
             let quickThumb: NSImage
             if let fullImage = NSImage(data: imageData) {
-                quickThumb = fullImage.thumbnailImage(maxDimension: 48) ?? fullImage
+                quickThumb = fullImage.thumbnailImage(maxDimension: 200) ?? fullImage
             } else {
                 quickThumb = NSImage(size: NSSize(width: 48, height: 48))
             }
@@ -292,6 +294,17 @@ final class AgentChatViewModel: ObservableObject {
         guard !isStreaming, !isLoadingHistory, !isCompacting, !queuedMessages.isEmpty else { return }
 
         let nextMessage = queuedMessages.removeFirst()
+
+        // Message fires into chat NOW - when it's actually being sent
+        messages.append(
+            ChatMessage(
+                role: .user,
+                content: nextMessage.prompt,
+                attachmentCount: nextMessage.images.count,
+                thumbnails: nextMessage.images.map { $0.thumbnail }
+            )
+        )
+
         startStream(
             prompt: nextMessage.prompt,
             images: nextMessage.images,
@@ -336,10 +349,11 @@ final class AgentChatViewModel: ObservableObject {
         var compactResponseMessageID: UUID?
 
         defer {
-            guard activeStreamID == streamID else { return }
-            activeStreamID = nil
-            streamTask = nil
-            isStreaming = false
+            if activeStreamID == streamID {
+                activeStreamID = nil
+                streamTask = nil
+                isStreaming = false
+            }
         }
 
         do {
@@ -581,7 +595,7 @@ final class AgentChatViewModel: ObservableObject {
 
         return PendingImage(
             data: imageData,
-            thumbnail: image.thumbnailImage(maxDimension: 96) ?? image,
+            thumbnail: image.thumbnailImage(maxDimension: 200) ?? image,
             mediaType: imageData.isJPEGData ? "image/jpeg" : "image/png"
         )
     }
