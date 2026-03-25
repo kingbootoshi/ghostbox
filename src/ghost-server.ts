@@ -1700,6 +1700,39 @@ const handleRequest = async (
     return;
   }
 
+  // Nudge endpoint - external triggers for proactive agent behavior
+  if (req.method === 'POST' && req.url === '/nudge') {
+    try {
+      const body = await readBody(req);
+      const parsed = JSON.parse(body) as { event?: string; reason?: string };
+      const event = (parsed.event ?? 'self') as NudgeEvent;
+      const reason = parsed.reason ?? 'api-trigger';
+
+      // Validate event type
+      const validEvents: NudgeEvent[] = [
+        'message-complete', 'pre-compact', 'pre-new-session',
+        'idle', 'timer', 'self', 'session-start',
+      ];
+      if (!validEvents.includes(event)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Invalid event: ${event}`, valid: validEvents }));
+        log.info('Response sent', { method: req.method, url: req.url, status: 400 });
+        return;
+      }
+
+      await nudges.emit(event, reason);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, event, reason }));
+      log.info('Response sent', { method: req.method, url: req.url, status: 200 });
+    } catch (error) {
+      log.error('Nudge endpoint failed', serializeError(error));
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Nudge failed' }));
+      log.info('Response sent', { method: req.method, url: req.url, status: 500 });
+    }
+    return;
+  }
+
   if (req.method === 'POST' && req.url === '/reload') {
     await handleReload(res);
     log.info('Response sent', { method: req.method, url: req.url, status: res.statusCode });
