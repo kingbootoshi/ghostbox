@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ghost-nudge: Agent self-activation via the nudge system.
+# Triggers nudge events on the local ghost-server.
+#
+# Usage:
+#   ghost-nudge memory              Trigger memory review nudge
+#   ghost-nudge timer "reason"      Trigger a timer event
+#   ghost-nudge self "reason"       Trigger a self-scheduled event
+#   ghost-nudge list                Show registered nudge handlers
+
+PORT="${GHOST_PORT:-3000}"
+BASE="http://localhost:$PORT"
+
+case "${1:-help}" in
+  memory)
+    curl -sS -X POST "$BASE/nudge" \
+      -H "Content-Type: application/json" \
+      -d '{"event":"self","reason":"agent-memory-review"}' \
+      2>/dev/null
+    ;;
+  timer)
+    reason="${2:-agent-timer}"
+    curl -sS -X POST "$BASE/nudge" \
+      -H "Content-Type: application/json" \
+      -d "{\"event\":\"timer\",\"reason\":\"$reason\"}" \
+      2>/dev/null
+    ;;
+  self)
+    reason="${2:-agent-self-nudge}"
+    curl -sS -X POST "$BASE/nudge" \
+      -H "Content-Type: application/json" \
+      -d "{\"event\":\"self\",\"reason\":\"$reason\"}" \
+      2>/dev/null
+    ;;
+  help|--help|-h)
+    cat <<'USAGE'
+ghost-nudge - Agent self-activation via the nudge system
+
+Commands:
+  memory            Trigger memory review (observer extracts facts now)
+  timer "reason"    Fire a timer nudge with given reason
+  self "reason"     Fire a self-scheduled nudge
+
+Examples:
+  ghost-nudge memory
+  ghost-nudge self "check-on-deploy-status"
+  ghost-nudge timer "daily-review"
+USAGE
+    ;;
+  *)
+    echo "Unknown command: $1" >&2
+    echo "Run 'ghost-nudge help' for usage" >&2
+    exit 1
+    ;;
+esac

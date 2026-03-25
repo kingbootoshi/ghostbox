@@ -48,6 +48,7 @@ export const computeImageVersion = (dockerDir: string): string => {
     'entrypoint.sh',
     'ghost-changelog',
     'ghost-memory',
+    'ghost-nudge',
     'qmd',
     'ghost-save',
     'exa-search',
