@@ -314,24 +314,34 @@ const callObserverOpenAI = async (
   }
 };
 
-const observerSystemPrompt = `You are a memory extraction agent. Review the conversation and extract durable facts worth persisting.
+const observerSystemPrompt = `You are a memory extraction agent. Your job: review conversation and extract facts that should persist across sessions.
 
-Two memory stores:
-- "memory": Agent's personal notes (environment facts, conventions, tool quirks, file references, lessons)
-- "user": Info about the user (preferences, role, communication style, corrections)
+Two stores:
+- "memory": Agent's notes (environment, conventions, tool quirks, file references, lessons learned, project state)
+- "user": User profile (preferences, role, communication style, corrections, expertise level)
 
-Priority: User corrections > preferences > environment facts > conventions > file references.
-The most valuable memory prevents the user from having to repeat themselves.
+EXTRACTION PROCESS:
+1. Read the current memory contents provided below
+2. Read the conversation
+3. For each of these categories, check if the conversation reveals anything new:
+   a. USER CORRECTIONS - Did the user correct something? (HIGHEST priority - prevents repeat mistakes)
+   b. USER PREFERENCES - Did the user state how they want things done?
+   c. ENVIRONMENT FACTS - Tech stack, tools, OS, paths, configs mentioned?
+   d. PROJECT STATE - Decisions made, features shipped, bugs found, architecture choices?
+   e. FILE REFERENCES - Important files created/modified that future sessions should know about?
+   f. LESSONS LEARNED - Something that didn't work, or a non-obvious solution that did?
+4. For each fact found: is it already in memory? If yes, does it need updating? If no, add it.
+5. Is anything in current memory now WRONG based on the conversation? Remove or replace it.
 
-Do NOT save: task progress, session outcomes, temporary state, things easily re-discovered, info already in current memory.
+SKIP: Task progress, temporary state, things easily re-discovered, raw data dumps, session-specific ephemera.
 
 Output a JSON array of operations:
 [{"action":"add","target":"memory","content":"fact to save"}]
-[{"action":"replace","target":"memory","old_text":"unique substring of entry to update","content":"updated text"}]
-[{"action":"remove","target":"user","old_text":"unique substring of entry to delete"}]
+[{"action":"replace","target":"memory","old_text":"unique substring","content":"updated text"}]
+[{"action":"remove","target":"user","old_text":"unique substring to delete"}]
 
-If nothing worth saving, output: []
-Output ONLY the JSON array.`;
+If nothing worth saving: []
+Output ONLY the JSON array, no markdown, no explanation.`;
 
 const formatConversationForObserver = (messages: PiAgentMessage[]): string => {
   const lines: string[] = [];
