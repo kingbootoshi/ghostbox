@@ -199,7 +199,7 @@ struct VaultBrowserView: View {
     private func markdownPreview(_ content: String) -> some View {
         Markdown(content)
             .font(Theme.Typography.body())
-            .markdownTheme(.gitHub)
+            .markdownTheme(.basic)
             .markdownTextStyle(\.text) {
                 FontSize(Theme.FontSize.md)
                 ForegroundColor(Color.white.opacity(Theme.Text.primary))

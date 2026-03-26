@@ -21,8 +21,11 @@ struct ChatHeaderView: View {
                 )
                 .frame(width: 64, height: 64)
 
+                Text(viewModel.ghostName)
+                    .font(Theme.Typography.display())
+                    .foregroundColor(Theme.Colors.accentLight)
+
                 ModelSwitcherMenu(
-                    ghostName: viewModel.ghostName,
                     currentModel: viewModel.ghost?.model ?? "Loading...",
                     currentProvider: viewModel.ghost?.provider ?? "anthropic",
                     onSelect: { model in
@@ -227,21 +230,12 @@ private struct SessionSwitcherRow: View {
             return currentSession.displayLabel
         }
 
-        if let currentId = sessions?.current, !currentId.isEmpty {
-            return String(currentId.prefix(12))
-        }
-
-        return "Loading session..."
+        return "Session"
     }
 
     private var currentSubtitle: String? {
-        guard let currentSession,
-              let name = currentSession.name?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !name.isEmpty else {
-            return nil
-        }
-
-        return currentSession.shortID
+        guard let currentSession else { return nil }
+        return currentSession.relativeDate
     }
 }
 
@@ -288,7 +282,6 @@ private struct RenameSessionSheet: View {
 }
 
 struct ModelSwitcherMenu: View {
-    let ghostName: String
     let currentModel: String
     let currentProvider: String
     let onSelect: (GhostModel) -> Void
@@ -312,23 +305,28 @@ struct ModelSwitcherMenu: View {
                 }
             }
         } label: {
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(ghostName)
-                    .font(Theme.Typography.display())
-                    .foregroundColor(Theme.Colors.accentLight)
+            HStack(spacing: 6) {
+                Image(systemName: "cpu")
+                    .font(.system(size: Theme.FontSize.xs, weight: .semibold))
 
                 Text(displayModelName)
-                    .font(Theme.Typography.caption(Theme.FontSize.xs, weight: .medium))
-                    .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
-                    .baselineOffset(6)
+                    .font(Theme.Typography.label(weight: .regular))
 
                 Image(systemName: "chevron.down")
-                    .font(.system(size: 7, weight: .semibold))
+                    .font(.system(size: 8, weight: .semibold))
                     .foregroundColor(Color.white.opacity(Theme.Text.quaternary))
             }
+            .foregroundColor(Theme.Colors.accentLightest)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(Color.white.opacity(0.05))
+            .overlay(
+                Capsule()
+                    .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
+            )
+            .clipShape(Capsule())
         }
         .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
         .fixedSize()
     }
 
@@ -347,7 +345,7 @@ private extension SessionInfo {
             return name
         }
 
-        return relativeDate
+        return "Session"
     }
 
     var shortID: String {
@@ -372,9 +370,7 @@ private extension SessionInfo {
     }
 
     var menuLabel: String {
-        let msgs = messageCount ?? 0
-        let countLabel = msgs > 0 ? " - \(msgs) msgs" : ""
-        return "\(displayLabel)\(countLabel)"
+        return "\(displayLabel) - \(relativeDate)"
     }
 }
 
