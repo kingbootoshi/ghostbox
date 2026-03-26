@@ -26,6 +26,9 @@ targets:
       - path: Resources/Images
         buildPhase: resources
         type: folder
+      - path: Resources/GhostSprites
+        buildPhase: resources
+        type: folder
       - path: Resources/Assets.xcassets
     dependencies:
       - package: MarkdownUI

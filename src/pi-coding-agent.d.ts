@@ -1,4 +1,4 @@
-declare module '@mariozechner/pi-coding-agent' {
+declare module "@mariozechner/pi-coding-agent" {
   export type PiModel = {
     provider: string;
     id: string;
@@ -12,7 +12,7 @@ declare module '@mariozechner/pi-coding-agent' {
 
   export type PiAgentSessionEvent =
     | {
-        type: 'message_update';
+        type: "message_update";
         message?: PiAgentMessage;
         assistantMessageEvent: {
           type: string;
@@ -20,22 +20,22 @@ declare module '@mariozechner/pi-coding-agent' {
         };
       }
     | {
-        type: 'message_end';
+        type: "message_end";
         message?: PiAgentMessage;
       }
     | {
-        type: 'tool_execution_start';
+        type: "tool_execution_start";
         toolName: string;
         args: unknown;
       }
     | {
-        type: 'tool_execution_end';
+        type: "tool_execution_end";
         toolName: string;
         result: unknown;
         isError: boolean;
       }
     | {
-        type: 'agent_end';
+        type: "agent_end";
         messages?: unknown[];
       }
     | {
@@ -55,6 +55,36 @@ declare module '@mariozechner/pi-coding-agent' {
     percent: number;
   };
 
+  export type ToolDefinition<TParams = unknown, TDetails = unknown> = {
+    name: string;
+    label?: string;
+    description: string;
+    parameters: {
+      type: string;
+      properties?: Record<string, unknown>;
+      required?: string[];
+      additionalProperties?: boolean;
+      [key: string]: unknown;
+    };
+    execute: (
+      toolCallId: string,
+      params: TParams,
+      signal?: AbortSignal,
+      onUpdate?: unknown,
+      ctx?: unknown
+    ) =>
+      | Promise<{
+          content?: Array<{ type: string; text?: string; [key: string]: unknown }>;
+          details?: TDetails;
+          [key: string]: unknown;
+        }>
+      | {
+          content?: Array<{ type: string; text?: string; [key: string]: unknown }>;
+          details?: TDetails;
+          [key: string]: unknown;
+        };
+  };
+
   export class AuthStorage {
     static create(path?: string): AuthStorage;
   }
@@ -65,6 +95,20 @@ declare module '@mariozechner/pi-coding-agent' {
   }
 
   export class SessionManager {
+    static list(
+      cwd: string,
+      sessionDir?: string
+    ): Promise<
+      Array<{
+        name?: string | null;
+        path: string;
+        cwd: string;
+        created?: string | Date;
+        modified?: string | Date;
+        messageCount?: number;
+      }>
+    >;
+    static open(path: string): SessionManager;
     static continueRecent(cwd: string, sessionDir?: string): SessionManager;
     static create(cwd: string, sessionDir?: string): SessionManager;
     getSessionFile(): string | undefined;
@@ -87,15 +131,15 @@ declare module '@mariozechner/pi-coding-agent' {
     readonly sessionFile: string | undefined;
     readonly pendingMessageCount: number;
     subscribe(listener: (event: PiAgentSessionEvent) => void): () => void;
-    prompt(text: string, options?: {
-      images?: Array<{ type: 'image'; mimeType: string; data: string }>;
-      streamingBehavior?: 'steer' | 'followUp';
-      source?: string;
-    }): Promise<void>;
-    steer(
+    prompt(
       text: string,
-      images?: Array<{ type: 'image'; mimeType: string; data: string }>,
+      options?: {
+        images?: Array<{ type: "image"; mimeType: string; data: string }>;
+        streamingBehavior?: "steer" | "followUp";
+        source?: string;
+      }
     ): Promise<void>;
+    steer(text: string, images?: Array<{ type: "image"; mimeType: string; data: string }>): Promise<void>;
     setModel(model: PiModel): Promise<void>;
     reload(): Promise<void>;
     compact(customInstructions?: string): Promise<void>;
@@ -120,6 +164,7 @@ declare module '@mariozechner/pi-coding-agent' {
     authStorage?: AuthStorage;
     modelRegistry?: ModelRegistry;
     tools?: unknown[];
+    customTools?: ToolDefinition<any, any>[];
     resourceLoader?: DefaultResourceLoader;
   }): Promise<{ session: AgentSession }>;
 }

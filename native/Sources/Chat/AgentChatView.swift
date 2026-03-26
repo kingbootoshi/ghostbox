@@ -39,13 +39,19 @@ struct AgentChatView: View {
                         ChatInputView(
                             inputText: $viewModel.inputText,
                             ghostName: viewModel.ghostName,
+                            isWakingGhost: viewModel.isWakingGhost,
                             isLoadingHistory: viewModel.isLoadingHistory,
                             isCompacting: viewModel.isCompacting,
+                            isCreatingSession: viewModel.isCreatingSession,
+                            isHistoryModeActive: viewModel.isHistoryModeActive,
+                            isInputDisabled: viewModel.isInputDisabled,
                             isInputFocused: $isInputFocused,
                             showsSlashCommandPopup: showsSlashCommandPopup,
                             firstFilteredSlashCommand: filteredSlashCommands.first,
                             stats: viewModel.stats,
                             onPasteCommand: viewModel.addImageFromPasteboard,
+                            onHistoryBack: viewModel.browseSentHistoryBackward,
+                            onHistoryForward: viewModel.browseSentHistoryForward,
                             onSubmit: submitInput
                         )
                         .overlay(alignment: .bottomTrailing) {
@@ -157,7 +163,19 @@ struct AgentChatView: View {
     private var chatContent: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                if viewModel.isLoadingHistory && viewModel.messages.isEmpty {
+                if viewModel.isWakingGhost && viewModel.messages.isEmpty {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(Theme.Colors.accentLight)
+
+                        Text("Waking ghost...")
+                            .font(Theme.Typography.body())
+                            .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 40)
+                } else if viewModel.isLoadingHistory && viewModel.messages.isEmpty {
                     VStack(spacing: 12) {
                         ProgressView()
                             .controlSize(.small)
@@ -166,6 +184,18 @@ struct AgentChatView: View {
                         Text("Loading chat history...")
                             .font(Theme.Typography.body())
                             .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 40)
+                } else if viewModel.isCreatingSession && viewModel.messages.isEmpty {
+                    VStack(spacing: 10) {
+                        Text("Starting new session...")
+                            .font(Theme.Typography.body(weight: .medium))
+                            .foregroundColor(Theme.Colors.accentLight)
+
+                        Text("You can start typing right away.")
+                            .font(Theme.Typography.body())
+                            .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.top, 40)
@@ -206,20 +236,29 @@ struct AgentChatView: View {
 
                         if viewModel.isStreaming {
                             GhostTypingBlock(name: viewModel.ghostName)
+                                .id(ChatScrollAnchor.typing)
                         }
-
-                        Color.clear
-                            .frame(height: 1)
-                            .id(ChatScrollAnchor.bottom)
                     }
                     .padding(.top, 20)
                     .padding(.bottom, 16)
                 }
             }
             .onChange(of: viewModel.messages.count) {
+                scrollToLatest(using: proxy)
+            }
+            .onChange(of: viewModel.messagesVersion) {
+                guard viewModel.isStreaming else { return }
+                scrollToLatest(using: proxy)
+            }
+            .onChange(of: viewModel.historySelectionMessageID) {
+                guard let selectionID = viewModel.historySelectionMessageID else { return }
                 withAnimation(.easeOut(duration: 0.2)) {
-                    proxy.scrollTo(ChatScrollAnchor.bottom, anchor: .bottom)
+                    proxy.scrollTo(ChatScrollAnchor.message(selectionID), anchor: .center)
                 }
+            }
+            .onChange(of: viewModel.isStreaming) {
+                guard viewModel.isStreaming else { return }
+                scrollToLatest(using: proxy)
             }
         }
     }
@@ -281,6 +320,7 @@ struct AgentChatView: View {
 
     private func submitInput() {
         dismissSlashCommandPopup()
+        guard !viewModel.commitHistorySelection() else { return }
         viewModel.send()
     }
 
@@ -319,24 +359,31 @@ struct AgentChatView: View {
     }
 
     private func handleEscapeKey() -> KeyPress.Result {
+        if viewModel.exitHistoryModeIfNeeded() {
+            return .handled
+        }
+
         if expandedImage != nil {
             withAnimation(.easeOut(duration: 0.15)) {
                 expandedImage = nil
             }
+            _ = viewModel.handleEscapeForHistory()
             return .handled
         }
 
         if showHotkeyHelp {
             dismissHotkeyHelp()
+            _ = viewModel.handleEscapeForHistory()
             return .handled
         }
 
         if viewModel.isStreaming {
             viewModel.cancelStream()
+            _ = viewModel.handleEscapeForHistory()
             return .handled
         }
 
-        return .ignored
+        return viewModel.handleEscapeForHistory() ? .handled : .ignored
     }
 
     private func showFullscreenToolGroup(_ id: UUID) {
@@ -369,6 +416,7 @@ struct AgentChatView: View {
             ChatDisplayRow(
                 item: item,
                 ghostName: viewModel.ghostName,
+                selectedMessageID: viewModel.historySelectionMessageID,
                 isToolGroupExpanded: { groupID in
                     expandedToolMessages.contains(groupID)
                 },
@@ -380,6 +428,7 @@ struct AgentChatView: View {
                     }
                 }
             )
+            .id(ChatScrollAnchor.message(item.id))
         }
     }
 
@@ -422,15 +471,35 @@ struct AgentChatView: View {
         }
         .buttonStyle(.plain)
     }
+
+    private func scrollToLatest(using proxy: ScrollViewProxy) {
+        guard let target = latestScrollTarget else { return }
+        withAnimation(.easeOut(duration: 0.2)) {
+            proxy.scrollTo(target, anchor: .bottom)
+        }
+    }
+
+    private var latestScrollTarget: String? {
+        if viewModel.isStreaming {
+            return ChatScrollAnchor.typing
+        }
+
+        return viewModel.messages.last.map { ChatScrollAnchor.message($0.id) }
+    }
 }
 
 private enum ChatScrollAnchor {
-    static let bottom = "chat-bottom-anchor"
+    static let typing = "chat-typing-anchor"
+
+    static func message(_ id: UUID) -> String {
+        "chat-message-\(id.uuidString)"
+    }
 }
 
 private struct ChatDisplayRow: View {
     let item: ChatDisplayItem
     let ghostName: String
+    let selectedMessageID: UUID?
     let isToolGroupExpanded: (UUID) -> Bool
     let onToggleToolGroup: (UUID) -> Void
     let onShowFullscreenToolGroup: (UUID) -> Void
@@ -455,6 +524,7 @@ private struct ChatDisplayRow: View {
             AgentMessageBlock(
                 message: message,
                 ghostName: ghostName,
+                isSelected: selectedMessageID == message.id,
                 onThumbnailTap: onThumbnailTap
             )
         case .toolGroup(let group, _):

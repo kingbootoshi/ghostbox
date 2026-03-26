@@ -96,7 +96,7 @@ struct ToolCallGroup: Identifiable {
     let toolUse: ChatMessage
     let toolResult: ChatMessage?
 
-    var id: UUID { toolUse.id }
+    var id: UUID { toolResult?.id ?? toolUse.id }
 
     var toolName: String {
         toolUse.resolvedToolName

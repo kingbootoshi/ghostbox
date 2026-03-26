@@ -64,6 +64,8 @@ struct GhostTypingBlock: View {
                 }
             }
         }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 20)
         .onAppear {

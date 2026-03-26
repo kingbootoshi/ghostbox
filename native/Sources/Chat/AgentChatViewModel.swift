@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import UniformTypeIdentifiers
+import UserNotifications
 
 struct PendingImage: Identifiable {
     let id: UUID
@@ -16,6 +17,13 @@ struct PendingImage: Identifiable {
         self.mediaType = mediaType
         self.isProcessing = isProcessing
     }
+}
+
+struct QueuedChatMessage {
+    let prompt: String
+    let images: [PendingImage]
+    let streamingBehavior: String?
+    let isAlreadyDisplayed: Bool
 }
 
 @MainActor
@@ -41,14 +49,20 @@ final class AgentChatViewModel: ObservableObject {
     @Published private(set) var compactionSummary: String?
     @Published private(set) var messagesVersion = 0
     @Published private(set) var preCompactionDisplayVersion = 0
+    @Published var sessions: SessionListResponse?
 
     static let olderMessagesBatchSize = 25
     @Published var inputText = ""
     @Published var pendingImages: [PendingImage] = []
-    @Published var queuedMessages: [(prompt: String, images: [PendingImage])] = []
+    @Published private(set) var queuedMessages: [QueuedChatMessage] = []
+    @Published private(set) var historySelectionMessageID: UUID?
+    @Published var lastEscapeTime: Date?
     @Published var isStreaming = false
+    @Published private(set) var isWakingGhost = false
+    @Published private(set) var isHistoryModeActive = false
     @Published private(set) var isLoadingHistory = false
     @Published private(set) var isCompacting = false
+    @Published private(set) var isCreatingSession = false
     @Published private(set) var ghost: Ghost?
     @Published private(set) var error: String?
     @Published private(set) var stats: GhostStats?
@@ -57,6 +71,9 @@ final class AgentChatViewModel: ObservableObject {
     private var streamTask: Task<Void, Never>?
     private var activeStreamID: UUID?
     private var lastAbortTime: Date?
+    private var historyDraft = ""
+    private var hasLoadedInitialState = false
+    private var isPreparingForOpening = false
     private static let timestampFormatterWithFractionalSeconds: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -70,13 +87,13 @@ final class AgentChatViewModel: ObservableObject {
     private static let maximumAPIImageEdge: CGFloat = 1_568
     private static let maximumAPIImagePixels: CGFloat = 1_150_000
     private static let maximumAPIImageBytes = 4_500_000
-
-    init(ghostName: String, client: GhostboxClient) {
+    init(ghostName: String, client: GhostboxClient, initialGhost: Ghost? = nil) {
         self.ghostName = ghostName
         self.client = client
+        self.ghost = initialGhost
 
         Task { [weak self] in
-            await self?.loadInitialState()
+            await self?.prepareForOpeningTask(ghostHint: initialGhost)
         }
     }
 
@@ -88,21 +105,57 @@ final class AgentChatViewModel: ObservableObject {
         client
     }
 
+    var currentSession: SessionInfo? {
+        guard let sessions else { return nil }
+        return sessions.sessions.first { $0.id == sessions.current }
+    }
+
+    var isInputDisabled: Bool {
+        isWakingGhost || isLoadingHistory || isCompacting || ghost?.status == .stopped
+    }
+
     func send() {
         let prompt = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let submittedImages = pendingImages.filter { !$0.isProcessing }
-        guard (!prompt.isEmpty || !submittedImages.isEmpty), !isLoadingHistory, !isCompacting else { return }
+        guard (!prompt.isEmpty || !submittedImages.isEmpty), !isInputDisabled else { return }
+
+        _ = exitHistoryModeIfNeeded(restoreDraft: false)
 
         inputText = ""
         pendingImages = []
 
-        if isStreaming {
-            // Queue it - don't show in chat yet. It fires when the agent finishes.
-            queuedMessages.append((prompt: prompt, images: submittedImages))
+        if isCreatingSession {
+            messages.append(
+                ChatMessage(
+                    role: .user,
+                    content: prompt,
+                    attachmentCount: submittedImages.count,
+                    thumbnails: submittedImages.map { $0.thumbnail }
+                )
+            )
+            queuedMessages.append(
+                QueuedChatMessage(
+                    prompt: prompt,
+                    images: submittedImages,
+                    streamingBehavior: queuedMessages.isEmpty ? nil : "followUp",
+                    isAlreadyDisplayed: true
+                )
+            )
             return
         }
 
-        // Not streaming - show in chat and send immediately
+        if isStreaming {
+            queuedMessages.append(
+                QueuedChatMessage(
+                    prompt: prompt,
+                    images: submittedImages,
+                    streamingBehavior: "followUp",
+                    isAlreadyDisplayed: false
+                )
+            )
+            return
+        }
+
         messages.append(
             ChatMessage(
                 role: .user,
@@ -111,6 +164,7 @@ final class AgentChatViewModel: ObservableObject {
                 thumbnails: submittedImages.map { $0.thumbnail }
             )
         )
+        SoundManager.shared.play(.messageSent)
         startStream(prompt: prompt, images: submittedImages)
     }
 
@@ -175,6 +229,95 @@ final class AgentChatViewModel: ObservableObject {
         }
     }
 
+    func prepareForOpening(ghost: Ghost? = nil) {
+        Task { [weak self] in
+            await self?.prepareForOpeningTask(ghostHint: ghost)
+        }
+    }
+
+    @discardableResult
+    func handleEscapeForHistory() -> Bool {
+        if isHistoryModeActive {
+            exitHistoryModeIfNeeded()
+            return true
+        }
+
+        let now = Date()
+        if let lastEscapeTime, now.timeIntervalSince(lastEscapeTime) <= 0.5 {
+            self.lastEscapeTime = nil
+            return enterHistoryMode()
+        }
+
+        lastEscapeTime = now
+        return true
+    }
+
+    @discardableResult
+    func browseSentHistoryBackward() -> Bool {
+        guard isHistoryModeActive, !selectableHistoryMessages.isEmpty else { return false }
+
+        let nextIndex: Int
+        if let currentIndex = selectedHistoryIndex {
+            nextIndex = max(0, currentIndex - 1)
+        } else {
+            nextIndex = selectableHistoryMessages.count - 1
+        }
+
+        historySelectionMessageID = selectableHistoryMessages[nextIndex].id
+        return true
+    }
+
+    @discardableResult
+    func browseSentHistoryForward() -> Bool {
+        guard isHistoryModeActive, !selectableHistoryMessages.isEmpty else { return false }
+
+        guard let currentIndex = selectedHistoryIndex else {
+            historySelectionMessageID = selectableHistoryMessages.first?.id
+            return true
+        }
+
+        let nextIndex = currentIndex + 1
+        if nextIndex < selectableHistoryMessages.count {
+            historySelectionMessageID = selectableHistoryMessages[nextIndex].id
+            return true
+        }
+
+        exitHistoryModeIfNeeded()
+        return true
+    }
+
+    @discardableResult
+    func exitHistoryModeIfNeeded(restoreDraft: Bool = true) -> Bool {
+        guard isHistoryModeActive else { return false }
+
+        isHistoryModeActive = false
+        historySelectionMessageID = nil
+        lastEscapeTime = nil
+
+        if restoreDraft {
+            inputText = historyDraft
+        }
+
+        historyDraft = ""
+        return true
+    }
+
+    @discardableResult
+    func commitHistorySelection() -> Bool {
+        guard isHistoryModeActive,
+              let historySelectionMessageID,
+              let selectedIndex = messages.firstIndex(where: { $0.id == historySelectionMessageID }) else {
+            return false
+        }
+
+        if selectedIndex < messages.count - 1 {
+            messages.removeSubrange((selectedIndex + 1)..<messages.count)
+        }
+
+        queuedMessages.removeAll()
+        return exitHistoryModeIfNeeded()
+    }
+
     func compact() {
         guard !isStreaming, !isLoadingHistory, !isCompacting else { return }
 
@@ -190,7 +333,8 @@ final class AgentChatViewModel: ObservableObject {
 
             do {
                 try await client.compactGhost(name: ghostName)
-                await loadHistory()
+                hasLoadedInitialState = await reloadConversationState()
+                await loadStats()
             } catch {
                 self.error = error.localizedDescription
                 self.messages.append(
@@ -291,24 +435,25 @@ final class AgentChatViewModel: ObservableObject {
     }
 
     private func processNextQueued() {
-        guard !isStreaming, !isLoadingHistory, !isCompacting, !queuedMessages.isEmpty else { return }
+        guard !isStreaming, !isLoadingHistory, !isCompacting, !isCreatingSession, !queuedMessages.isEmpty else { return }
 
         let nextMessage = queuedMessages.removeFirst()
 
-        // Message fires into chat NOW - when it's actually being sent
-        messages.append(
-            ChatMessage(
-                role: .user,
-                content: nextMessage.prompt,
-                attachmentCount: nextMessage.images.count,
-                thumbnails: nextMessage.images.map { $0.thumbnail }
+        if !nextMessage.isAlreadyDisplayed {
+            messages.append(
+                ChatMessage(
+                    role: .user,
+                    content: nextMessage.prompt,
+                    attachmentCount: nextMessage.images.count,
+                    thumbnails: nextMessage.images.map { $0.thumbnail }
+                )
             )
-        )
+        }
 
         startStream(
             prompt: nextMessage.prompt,
             images: nextMessage.images,
-            streamingBehavior: "followUp"
+            streamingBehavior: nextMessage.streamingBehavior
         )
     }
 
@@ -381,6 +526,7 @@ final class AgentChatViewModel: ObservableObject {
                     guard !chunk.isEmpty else { continue }
 
                     currentAssistantText += chunk
+                    let shouldNotify = !NSApp.isActive || NSApp.keyWindow?.title != ghostName
 
                     if let index = currentAssistantIndex, messages.indices.contains(index) {
                         let existingMessage = messages[index]
@@ -392,6 +538,10 @@ final class AgentChatViewModel: ObservableObject {
                         let assistantMessage = ChatMessage(role: .ghost, content: currentAssistantText)
                         messages.append(assistantMessage)
                         currentAssistantIndex = messages.count - 1
+                        SoundManager.shared.play(.messageReceived)
+                        if shouldNotify {
+                            fireNotification(for: currentAssistantText)
+                        }
                         if isCompactCommand {
                             compactResponseMessageID = assistantMessage.id
                         }
@@ -448,13 +598,66 @@ final class AgentChatViewModel: ObservableObject {
         }
     }
 
-    private func loadInitialState() async {
-        await loadHistory()
+    private func fireNotification(for messageText: String) {
+        let preview = String(messageText.prefix(100))
+        guard !preview.isEmpty else { return }
+
+        SoundManager.shared.play(.notification)
+
+        let content = UNMutableNotificationContent()
+        content.title = ghostName
+        content.body = preview
+        content.sound = .none
+        content.categoryIdentifier = "GHOST_MESSAGE"
+        content.userInfo = ["ghostName": ghostName]
+
+        let request = UNNotificationRequest(
+            identifier: "ghost-message-\(ghostName)-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    private func prepareForOpeningTask(ghostHint: Ghost?) async {
+        guard !isPreparingForOpening else { return }
+
+        isPreparingForOpening = true
+        defer { isPreparingForOpening = false }
+
+        if let ghostHint {
+            ghost = ghostHint
+        }
+
+        if ghostHint?.status == .stopped {
+            await wakeGhostAndLoadHistory()
+            return
+        }
+
+        do {
+            let latestGhost = try await client.getGhost(name: ghostName)
+            ghost = latestGhost
+
+            if latestGhost.status == .stopped {
+                await wakeGhostAndLoadHistory()
+                return
+            }
+        } catch {
+            self.error = error.localizedDescription
+            return
+        }
+
+        if !hasLoadedInitialState {
+            hasLoadedInitialState = await reloadConversationState()
+        }
+
         await loadGhost()
         await loadStats()
     }
 
-    private func loadHistory() async {
+    @discardableResult
+    private func loadHistory() async -> Bool {
         isLoadingHistory = true
         error = nil
 
@@ -473,8 +676,10 @@ final class AgentChatViewModel: ObservableObject {
             if !history.compactions.isEmpty && messages.isEmpty && !preCompactionMessages.isEmpty {
                 messages = [ChatMessage(role: .system, content: "Session compacted")]
             }
+            return true
         } catch {
             self.error = error.localizedDescription
+            return false
         }
     }
 
@@ -523,9 +728,111 @@ final class AgentChatViewModel: ObservableObject {
         await handleCompaction(compactResponseMessageID: nil)
     }
 
+    func loadSessions() async -> Bool {
+        do {
+            sessions = try await client.fetchSessions(name: ghostName)
+            return true
+        } catch {
+            if self.error == nil {
+                self.error = error.localizedDescription
+            }
+            return false
+        }
+    }
+
+    func switchSession(sessionId: String) {
+        guard !isStreaming, !isLoadingHistory, !isCompacting, !isCreatingSession else { return }
+        guard sessions?.current != sessionId else { return }
+
+        error = nil
+        _ = exitHistoryModeIfNeeded()
+
+        Task { [weak self] in
+            guard let self else { return }
+
+            do {
+                try await client.switchSession(name: ghostName, sessionId: sessionId)
+                hasLoadedInitialState = await reloadConversationState()
+                await loadStats()
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
+    func newSession() {
+        guard !isStreaming, !isLoadingHistory, !isCompacting, !isCreatingSession else { return }
+
+        error = nil
+        _ = exitHistoryModeIfNeeded()
+        messages = []
+        preCompactionMessages = []
+        compactionSummary = nil
+        visiblePreCompactionCount = 0
+        showingPreCompactionMessages = false
+        queuedMessages.removeAll()
+        isCreatingSession = true
+        SoundManager.shared.play(.sessionNew)
+
+        Task { [weak self] in
+            guard let self else { return }
+
+            do {
+                let sessionId = try await client.newGhostSession(name: ghostName)
+                if let sessions {
+                    let existingSession = sessions.sessions.first { $0.id == sessionId }
+                    self.sessions = SessionListResponse(
+                        current: sessionId,
+                        sessions: existingSession.map { [ $0 ] + sessions.sessions.filter { $0.id != sessionId } } ?? sessions.sessions
+                    )
+                }
+                _ = await loadSessions()
+                await loadStats()
+                isCreatingSession = false
+                if !queuedMessages.isEmpty {
+                    processNextQueued()
+                }
+            } catch {
+                isCreatingSession = false
+                self.error = error.localizedDescription
+                hasLoadedInitialState = await reloadConversationState()
+                await loadStats()
+            }
+        }
+    }
+
+    func renameSession(sessionId: String, name: String) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await client.renameSession(name: ghostName, sessionId: sessionId, sessionName: name)
+                _ = await loadSessions()
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
+    func deleteSession(sessionId: String) {
+        guard sessions?.current != sessionId else {
+            error = "Cannot delete the active session"
+            return
+        }
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await client.deleteSession(name: ghostName, sessionId: sessionId)
+                _ = await loadSessions()
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
     private func handleCompaction(compactResponseMessageID: UUID?) async {
         showingPreCompactionMessages = false
-        await loadHistory()
+        hasLoadedInitialState = await reloadConversationState()
     }
 
     private func loadGhost() async {
@@ -542,6 +849,53 @@ final class AgentChatViewModel: ObservableObject {
         } catch {
             // Stats are best-effort, don't surface errors
         }
+    }
+
+    private func wakeGhostAndLoadHistory() async {
+        isWakingGhost = true
+        SoundManager.shared.play(.ghostWake)
+        error = nil
+
+        defer {
+            isWakingGhost = false
+        }
+
+        do {
+            try await client.wakeGhost(name: ghostName)
+            hasLoadedInitialState = await reloadConversationState()
+            await loadGhost()
+            await loadStats()
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    private func reloadConversationState() async -> Bool {
+        async let historyLoaded = loadHistory()
+        async let sessionsLoaded = loadSessions()
+
+        let didLoadHistory = await historyLoaded
+        _ = await sessionsLoaded
+        return didLoadHistory
+    }
+
+    private func enterHistoryMode() -> Bool {
+        guard !selectableHistoryMessages.isEmpty else { return false }
+
+        historyDraft = inputText
+        historySelectionMessageID = nil
+        isHistoryModeActive = true
+        return true
+    }
+
+    private var selectableHistoryMessages: [ChatMessage] {
+        messages.filter { !$0.isToolMessage }
+    }
+
+    private var selectedHistoryIndex: Int? {
+        guard let historySelectionMessageID else { return nil }
+        return selectableHistoryMessages.firstIndex { $0.id == historySelectionMessageID }
     }
 
     private func mapRole(_ role: String) -> ChatMessage.Role {

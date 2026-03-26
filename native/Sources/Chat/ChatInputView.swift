@@ -3,23 +3,51 @@ import SwiftUI
 struct ChatInputView: View {
     @Binding var inputText: String
     let ghostName: String
+    let isWakingGhost: Bool
     let isLoadingHistory: Bool
     let isCompacting: Bool
+    let isCreatingSession: Bool
+    let isHistoryModeActive: Bool
+    let isInputDisabled: Bool
     let isInputFocused: FocusState<Bool>.Binding
     let showsSlashCommandPopup: Bool
     let firstFilteredSlashCommand: GhostSlashCommand?
     let stats: GhostStats?
     let onPasteCommand: () -> Bool
+    let onHistoryBack: () -> Bool
+    let onHistoryForward: () -> Bool
     let onSubmit: () -> Void
 
     var body: some View {
         VStack(spacing: 8) {
+            if isHistoryModeActive {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.up.arrow.down")
+                        .font(.system(size: Theme.FontSize.xs, weight: .semibold))
+
+                    Text("History mode - up/down select, return rewinds, esc exits")
+                        .font(Theme.Typography.caption(weight: .medium))
+
+                    Spacer(minLength: 0)
+                }
+                .foregroundColor(Theme.Colors.accentLightest)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Theme.Colors.accent.opacity(0.2))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(Theme.Colors.accentLight.opacity(0.35), lineWidth: 0.8)
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.horizontal, 18)
+            }
+
             TextField(inputPlaceholder, text: $inputText)
                 .textFieldStyle(.plain)
                 .font(Theme.Typography.body(Theme.FontSize.lg))
                 .foregroundColor(Color.white.opacity(Theme.Text.primary))
                 .focused(isInputFocused)
-                .disabled(isLoadingHistory || isCompacting)
+                .disabled(isInputDisabled)
                 .onSubmit { submitInput() }
                 .onKeyPress(.tab) {
                     guard showsSlashCommandPopup, let firstFilteredSlashCommand else {
@@ -28,6 +56,12 @@ struct ChatInputView: View {
 
                     inputText = "/\(firstFilteredSlashCommand.name) "
                     return .handled
+                }
+                .onKeyPress(.upArrow) {
+                    onHistoryBack() ? .handled : .ignored
+                }
+                .onKeyPress(.downArrow) {
+                    onHistoryForward() ? .handled : .ignored
                 }
                 .onKeyPress { keyPress in
                     guard keyPress.modifiers.contains(.command),
@@ -61,6 +95,10 @@ struct ChatInputView: View {
     }
 
     private var inputPlaceholder: String {
+        if isWakingGhost {
+            return "Waking ghost..."
+        }
+
         if isLoadingHistory {
             return "Loading chat history..."
         }
@@ -73,12 +111,20 @@ struct ChatInputView: View {
     }
 
     private var footerHint: String {
+        if isWakingGhost {
+            return "Please wait"
+        }
+
         if isLoadingHistory {
             return "Please wait"
         }
 
         if isCompacting {
             return "Refreshing conversation"
+        }
+
+        if isCreatingSession {
+            return "Starting a new session in the background"
         }
 
         return "Press return to send"

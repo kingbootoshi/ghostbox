@@ -89,6 +89,20 @@ struct GhostStatsContext: Decodable {
     let percent: Double
 }
 
+struct SessionInfo: Decodable, Identifiable, Hashable {
+    let id: String
+    let name: String?
+    let path: String?
+    let messageCount: Int?
+    let createdAt: String
+    let lastActiveAt: String
+}
+
+struct SessionListResponse: Decodable {
+    let current: String
+    let sessions: [SessionInfo]
+}
+
 struct GhostboxMessageImage: Encodable {
     let mediaType: String
     let data: String
@@ -244,13 +258,63 @@ final class GhostboxClient {
         _ = try await perform(request)
     }
 
-    func newGhostSession(name: String) async throws {
+    func newGhostSession(name: String) async throws -> String {
         let request = makeRequest(
             path: ["api", "ghosts", name, "new"],
             method: "POST",
             body: Data("{}".utf8)
         )
-        _ = try await perform(request)
+        let response = try await decodeResponse(for: request, as: NewGhostSessionResponse.self)
+        return response.sessionId
+    }
+
+    func fetchSessions(name: String) async throws -> SessionListResponse {
+        let request = makeRequest(path: ["api", "ghosts", name, "sessions"])
+        return try await decodeResponse(for: request, as: SessionListResponse.self)
+    }
+
+    func switchSession(name: String, sessionId: String) async throws {
+        struct SwitchSessionRequest: Encodable {
+            let sessionId: String
+        }
+
+        let body = try encoder.encode(SwitchSessionRequest(sessionId: sessionId))
+        let request = makeRequest(
+            path: ["api", "ghosts", name, "sessions", "switch"],
+            method: "POST",
+            body: body
+        )
+        _ = try await decodeResponse(for: request, as: SwitchSessionResponse.self)
+    }
+
+    func renameSession(name: String, sessionId: String, sessionName: String) async throws {
+        struct RenameRequest: Encodable {
+            let sessionId: String
+            let name: String
+        }
+        struct RenameResponse: Decodable {
+            let status: String
+        }
+
+        let body = try encoder.encode(RenameRequest(sessionId: sessionId, name: sessionName))
+        let request = makeRequest(
+            path: ["api", "ghosts", name, "sessions", "rename"],
+            method: "POST",
+            body: body
+        )
+        _ = try await decodeResponse(for: request, as: RenameResponse.self)
+    }
+
+    func deleteSession(name: String, sessionId: String) async throws {
+        struct DeleteResponse: Decodable {
+            let status: String
+        }
+
+        let request = makeRequest(
+            path: ["api", "ghosts", name, "sessions", sessionId],
+            method: "DELETE"
+        )
+        _ = try await decodeResponse(for: request, as: DeleteResponse.self)
     }
 
     func steerGhost(
@@ -456,6 +520,16 @@ private struct HistoryResponse: Decodable {
 
 private struct CompactResponse: Decodable {
     let status: String
+}
+
+private struct NewGhostSessionResponse: Decodable {
+    let status: String
+    let sessionId: String
+}
+
+private struct SwitchSessionResponse: Decodable {
+    let status: String
+    let sessionId: String
 }
 
 private struct VaultEntriesResponse: Decodable {

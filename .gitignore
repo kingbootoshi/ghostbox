@@ -9,3 +9,4 @@ handoffs/
 native/Ghostbox.xcodeproj/
 autoresearch-results.tsv
 .superpowers/
+native/build/

@@ -1,63 +1,50 @@
-import Docker from 'dockerode';
-import { spawn as nodeSpawn } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
-import { homedir } from 'node:os';
-import { copyFile, mkdir, writeFile } from 'node:fs/promises';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { spawn as nodeSpawn } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { copyFile, mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import Docker from "dockerode";
+import { createLogger } from "./logger";
+import type {
+  GhostApiKey,
+  GhostboxConfig,
+  GhostboxState,
+  GhostImage,
+  GhostMessage,
+  GhostQueueClearResponse,
+  GhostQueueEnqueueResponse,
+  GhostQueueState,
+  GhostState,
+  GhostStreamingBehavior,
+  HistoryResponse,
+  SessionListResponse
+} from "./types";
+import { getHomeDirectory, isNodeError, sleep } from "./utils";
+import { commitVault, getVaultPath, initVault, mergeVaults } from "./vault";
 
-import {
-  type GhostApiKey,
-  type GhostImage,
-  type GhostQueueClearResponse,
-  type GhostQueueEnqueueResponse,
-  type GhostQueueState,
-  type GhostStreamingBehavior,
-  type GhostboxConfig,
-  type HistoryResponse,
-  type GhostMessage,
-  type GhostState,
-  type GhostboxState,
-} from './types';
-import {
-  commitVault,
-  getVaultPath,
-  initVault,
-  mergeVaults,
-} from './vault';
-import { createLogger } from './logger';
-
-const defaultImageName = 'ghostbox-agent';
-const defaultProvider = 'anthropic';
-const getHomeDirectory = (): string => process.env.HOME ?? homedir();
-const getGhostPiAgentPath = (name: string): string =>
-  join(getHomeDirectory(), '.ghostbox', 'ghosts', name, 'pi-agent');
-const getSharedPiAgentPath = (): string =>
-  join(getHomeDirectory(), '.pi', 'agent');
-const getBasePath = (): string =>
-  join(getHomeDirectory(), '.ghostbox', 'base');
-export const getBaseExtensionsPath = (): string =>
-  join(getBasePath(), 'extensions');
-const getBaseAgentsPath = (): string =>
-  join(getBasePath(), 'AGENTS.md');
+const defaultImageName = "ghostbox-agent";
+const defaultProvider = "anthropic";
+const getGhostPiAgentPath = (name: string): string => join(getHomeDirectory(), ".ghostbox", "ghosts", name, "pi-agent");
+const getSharedPiAgentPath = (): string => join(getHomeDirectory(), ".pi", "agent");
+const getBasePath = (): string => join(getHomeDirectory(), ".ghostbox", "base");
+const getBaseExtensionsPath = (): string => join(getBasePath(), "extensions");
+const getBaseAgentsPath = (): string => join(getBasePath(), "AGENTS.md");
 
 export const computeImageVersion = (dockerDir: string): string => {
   // Accept both absolute and relative paths
-  const resolvedDockerDir = dockerDir.startsWith('/') ? dockerDir : join(process.cwd(), dockerDir);
+  const resolvedDockerDir = dockerDir.startsWith("/") ? dockerDir : join(process.cwd(), dockerDir);
   const files = [
-    'ghost-server.js',
-    'Dockerfile',
-    'entrypoint.sh',
-    'ghost-changelog',
-    'ghost-nudge',
-    'qmd',
-    'ghost-save',
-    'exa-search',
+    "ghost-server.js",
+    "Dockerfile",
+    "entrypoint.sh",
+    "ghost-changelog",
+    "ghost-nudge",
+    "qmd",
+    "ghost-save",
+    "exa-search"
   ];
-  const contents = files
-    .map((file) => readFileSync(join(resolvedDockerDir, file), 'utf8'))
-    .join('');
-  const hash = createHash('sha256').update(contents).digest('hex');
+  const contents = files.map((file) => readFileSync(join(resolvedDockerDir, file), "utf8")).join("");
+  const hash = createHash("sha256").update(contents).digest("hex");
 
   return `gb-${hash.slice(0, 8)}`;
 };
@@ -240,19 +227,19 @@ const ensureGhostPiAgent = async (name: string): Promise<void> => {
   await mkdir(ghostPiPath, { recursive: true });
 
   const sharedPath = getSharedPiAgentPath();
-  const settingsSource = join(sharedPath, 'settings.json');
-  const settingsDest = join(ghostPiPath, 'settings.json');
+  const settingsSource = join(sharedPath, "settings.json");
+  const settingsDest = join(ghostPiPath, "settings.json");
   if (existsSync(settingsSource) && !existsSync(settingsDest)) {
     await copyFile(settingsSource, settingsDest);
   }
 
-  const authSource = join(getHomeDirectory(), '.ghostbox', 'auth.json');
+  const authSource = join(getHomeDirectory(), ".ghostbox", "auth.json");
   if (existsSync(authSource)) {
-    await copyFile(authSource, join(ghostPiPath, 'auth.json'));
+    await copyFile(authSource, join(ghostPiPath, "auth.json"));
   }
 
   const baseAgentsSource = getBaseAgentsPath();
-  const agentsDest = join(ghostPiPath, 'AGENTS.md');
+  const agentsDest = join(ghostPiPath, "AGENTS.md");
   if (existsSync(baseAgentsSource)) {
     await copyFile(baseAgentsSource, agentsDest);
   }
@@ -274,16 +261,16 @@ export const ensureBaseExtensions = async (): Promise<void> => {
   await writeFileIfMissing(getBaseAgentsPath(), baseAgentsContent);
 };
 
-const log = createLogger('orchestrator');
+const log = createLogger("orchestrator");
 
 const docker = new Docker();
 
 const createGhostApiKey = (label: string): GhostApiKey => {
   return {
-    id: randomBytes(4).toString('hex'),
-    key: `gbox_${randomBytes(16).toString('hex')}`,
+    id: randomBytes(4).toString("hex"),
+    key: `gbox_${randomBytes(16).toString("hex")}`,
     label,
-    createdAt: new Date().toISOString(),
+    createdAt: new Date().toISOString()
   };
 };
 
@@ -299,8 +286,12 @@ const getGhostboxApiKeysEnv = (ghost: GhostState): string => {
   return `GHOSTBOX_API_KEYS=${JSON.stringify(getGhostApiKeyValues(ghost))}`;
 };
 
+const getGhostboxApiPortEnv = (): string => {
+  return `GHOSTBOX_API_PORT=${process.env.GHOSTBOX_API_PORT || "8008"}`;
+};
+
 const getGhostNudgeKeyEnv = (ghost: GhostState): string => {
-  const firstKey = ghost.apiKeys[0]?.key ?? '';
+  const firstKey = ghost.apiKeys[0]?.key ?? "";
   return `GHOST_API_KEY=${firstKey}`;
 };
 
@@ -310,18 +301,16 @@ const getGhostAuthorizationHeader = (ghost: GhostState): string | null => {
 };
 
 const getGhostAuthHeaders = (ghost: GhostState): Record<string, string> => {
-  return getGhostAuthorizationHeader(ghost)
-    ? { Authorization: getGhostAuthorizationHeader(ghost) as string }
-    : {};
+  return getGhostAuthorizationHeader(ghost) ? { Authorization: getGhostAuthorizationHeader(ghost) as string } : {};
 };
 
 const normalizeGhostState = (
-  ghost: GhostState | (Omit<GhostState, 'apiKeys'> & { apiKeys?: GhostApiKey[] }),
+  ghost: GhostState | (Omit<GhostState, "apiKeys"> & { apiKeys?: GhostApiKey[] })
 ): GhostState => {
   return {
     ...ghost,
-    imageVersion: ghost.imageVersion || '',
-    apiKeys: Array.isArray(ghost.apiKeys) ? ghost.apiKeys : [],
+    imageVersion: ghost.imageVersion || "",
+    apiKeys: Array.isArray(ghost.apiKeys) ? ghost.apiKeys : []
   };
 };
 
@@ -330,84 +319,70 @@ const normalizeState = (state: GhostboxState): GhostboxState => {
     ...state,
     config: {
       ...state.config,
-      imageVersion: state.config.imageVersion || '',
+      imageVersion: state.config.imageVersion || ""
     },
-    ghosts: Object.fromEntries(
-      Object.entries(state.ghosts).map(([name, ghost]) => [name, normalizeGhostState(ghost)]),
-    ),
+    ghosts: Object.fromEntries(Object.entries(state.ghosts).map(([name, ghost]) => [name, normalizeGhostState(ghost)]))
   };
 };
 
-const isNodeError = (value: unknown): value is { code?: string } => {
-  return typeof value === 'object' && value !== null && 'code' in value;
-};
-
 const isDockerConnectionIssue = (error: unknown): boolean => {
-  if (!isNodeError(error) || typeof error.code !== 'string') {
+  if (!isNodeError(error) || typeof error.code !== "string") {
     return false;
   }
 
-  return ['ENOENT', 'ECONNREFUSED', 'EACCES', 'ENOTFOUND', 'EPIPE', 'ECONNRESET', 'ETIMEDOUT']
-    .includes(error.code);
+  return ["ENOENT", "ECONNREFUSED", "EACCES", "ENOTFOUND", "EPIPE", "ECONNRESET", "ETIMEDOUT"].includes(error.code);
 };
 
-const logDockerConnectionIssue = (
-  error: unknown,
-  context: { name: string; operation: string },
-): void => {
+const logDockerConnectionIssue = (error: unknown, context: { name: string; operation: string }): void => {
   if (isDockerConnectionIssue(error)) {
-    log.error({ err: error, ...context }, 'Docker connection issue');
+    log.error({ err: error, ...context }, "Docker connection issue");
   }
 };
 
 const loadStateFile = async (path: string): Promise<GhostboxState> => {
   try {
-    const { readFile } = await import('node:fs/promises');
-    const contents = await readFile(path, 'utf8');
+    const { readFile } = await import("node:fs/promises");
+    const contents = await readFile(path, "utf8");
     return normalizeState(JSON.parse(contents) as GhostboxState);
   } catch (error: unknown) {
-    if (isNodeError(error) && error.code === 'ENOENT') {
-      throw new Error(
-        `State file not found at ${path}. Run ghostbox init to create it first.`,
-      );
+    if (isNodeError(error) && error.code === "ENOENT") {
+      throw new Error(`State file not found at ${path}. Run ghostbox init to create it first.`);
     }
     throw error;
   }
 };
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
-
 const parseGhostMessage = (line: string): GhostMessage => {
   const parsed = JSON.parse(line) as unknown;
-  if (typeof parsed !== 'object' || parsed === null || typeof (parsed as { type?: unknown }).type !== 'string') {
-    throw new Error('Invalid ghost message');
+  if (typeof parsed !== "object" || parsed === null || typeof (parsed as { type?: unknown }).type !== "string") {
+    throw new Error("Invalid ghost message");
   }
 
   const record = parsed as Record<string, unknown>;
   const type = record.type;
 
-  if (type === 'assistant') {
-    if (typeof record.text !== 'string') throw new Error('Invalid assistant message');
-    return { type: 'assistant', text: record.text };
+  if (type === "assistant") {
+    if (typeof record.text !== "string") throw new Error("Invalid assistant message");
+    return { type: "assistant", text: record.text };
   }
 
-  if (type === 'tool_use') {
-    if (typeof record.tool !== 'string') throw new Error('Invalid tool_use message');
-    return { type: 'tool_use', tool: record.tool, input: record.input ?? null };
+  if (type === "tool_use") {
+    if (typeof record.tool !== "string") throw new Error("Invalid tool_use message");
+    return { type: "tool_use", tool: record.tool, input: record.input ?? null };
   }
 
-  if (type === 'tool_result') {
-    return { type: 'tool_result', output: record.output ?? null };
+  if (type === "tool_result") {
+    return { type: "tool_result", output: record.output ?? null };
   }
 
-  if (type === 'result') {
-    if (typeof record.text !== 'string' || typeof record.sessionId !== 'string') {
-      throw new Error('Invalid result message');
+  if (type === "result") {
+    if (typeof record.text !== "string" || typeof record.sessionId !== "string") {
+      throw new Error("Invalid result message");
     }
     return {
-      type: 'result',
+      type: "result",
       text: record.text,
-      sessionId: record.sessionId,
+      sessionId: record.sessionId
     };
   }
 
@@ -424,7 +399,7 @@ const getGhostFromState = (state: GhostboxState, name: string): GhostState => {
 
 const buildPortBindings = (portBase: number): Record<string, [{ HostPort: string }]> => {
   const ports: Record<string, [{ HostPort: string }]> = {
-    '3000/tcp': [{ HostPort: String(portBase) }],
+    "3000/tcp": [{ HostPort: String(portBase) }]
   };
 
   for (let index = 1; index <= 9; index++) {
@@ -436,7 +411,7 @@ const buildPortBindings = (portBase: number): Record<string, [{ HostPort: string
 
 const buildExposedPorts = (): Record<string, Record<string, never>> => {
   const ports: Record<string, Record<string, never>> = {
-    '3000/tcp': {},
+    "3000/tcp": {}
   };
 
   for (let index = 1; index <= 9; index++) {
@@ -449,30 +424,29 @@ const buildExposedPorts = (): Record<string, Record<string, never>> => {
 const resolveProviderModel = (
   provider: string | null | undefined,
   model: string,
-  fallbackProvider = defaultProvider,
+  fallbackProvider = defaultProvider
 ): { provider: string; model: string; fullModel: string } => {
-  const separatorIndex = model.indexOf('/');
+  const separatorIndex = model.indexOf("/");
   if (separatorIndex > 0 && separatorIndex < model.length - 1) {
     return {
       provider: model.slice(0, separatorIndex),
       model: model.slice(separatorIndex + 1),
-      fullModel: model,
+      fullModel: model
     };
   }
 
-  const resolvedProvider =
-    typeof provider === 'string' && provider.length > 0 ? provider : fallbackProvider;
+  const resolvedProvider = typeof provider === "string" && provider.length > 0 ? provider : fallbackProvider;
 
   return {
     provider: resolvedProvider,
     model,
-    fullModel: `${resolvedProvider}/${model}`,
+    fullModel: `${resolvedProvider}/${model}`
   };
 };
 
 const waitForHealth = async (name: string, port: number): Promise<void> => {
   for (let attempt = 0; attempt < 30; attempt++) {
-    log.debug({ name, attempt: attempt + 1 }, 'Health check');
+    log.debug({ name, attempt: attempt + 1 }, "Health check");
     try {
       const response = await fetch(`http://localhost:${port}/health`);
       if (response.ok) return;
@@ -486,8 +460,59 @@ const waitForHealth = async (name: string, port: number): Promise<void> => {
   throw new Error(`Ghost did not become healthy on port ${port}`);
 };
 
+const startGhostContainer = async (
+  state: GhostboxState,
+  name: string,
+  ghost: GhostState,
+  fullModel: string,
+  systemPrompt: string | null | undefined,
+  operation: string
+): Promise<string> => {
+  const vaultPath = getVaultPath(name);
+  const piAgentPath = getGhostPiAgentPath(name);
+  const baseExtensionsPath = getBaseExtensionsPath();
+
+  try {
+    const container = await docker.createContainer({
+      Image: state.config.imageName || defaultImageName,
+      name: `ghostbox-${name}`,
+      Env: [
+        `GHOSTBOX_MODEL=${fullModel}`,
+        `GHOSTBOX_SYSTEM_PROMPT=${systemPrompt || ""}`,
+        `GHOSTBOX_GHOST_NAME=${name}`,
+        `GHOSTBOX_GITHUB_TOKEN=${state.config.githubToken || ""}`,
+        `GHOSTBOX_GITHUB_REMOTE=${state.config.githubRemote || ""}`,
+        `GHOSTBOX_HOST_BASE_PORT=${ghost.portBase}`,
+        getGhostboxApiPortEnv(),
+        `GHOSTBOX_USER_PORTS=8001-8009`,
+        `GHOSTBOX_OBSERVER_MODEL=${state.config.observerModel || ""}`,
+        getGhostboxApiKeysEnv(ghost),
+        getGhostNudgeKeyEnv(ghost)
+      ],
+      ExposedPorts: buildExposedPorts(),
+      HostConfig: {
+        Binds: [
+          `${vaultPath}:/vault`,
+          `${piAgentPath}:/root/.pi/agent`,
+          `${baseExtensionsPath}:/root/.pi/agent/extensions:ro`
+        ],
+        PortBindings: buildPortBindings(ghost.portBase),
+        Memory: 1024 * 1024 * 1024,
+        CpuShares: 512
+      }
+    });
+
+    await container.start();
+    await waitForHealth(name, ghost.portBase);
+    return container.id;
+  } catch (error: unknown) {
+    logDockerConnectionIssue(error, { name, operation });
+    throw error;
+  }
+};
+
 export const getStatePath = (): string => {
-  return join(getHomeDirectory(), '.ghostbox', 'state.json');
+  return join(getHomeDirectory(), ".ghostbox", "state.json");
 };
 
 export const loadState = async (): Promise<GhostboxState> => {
@@ -497,6 +522,49 @@ export const loadState = async (): Promise<GhostboxState> => {
 export const saveState = async (state: GhostboxState): Promise<void> => {
   const statePath = getStatePath();
   await writeFile(statePath, JSON.stringify(state, null, 2));
+};
+
+type GhostCallOptions = Omit<RequestInit, "headers"> & {
+  decodeError?: boolean;
+  errorMessage: string;
+  headers?: Record<string, string>;
+};
+
+const callGhost = async (name: string, path: string, options: GhostCallOptions): Promise<Response> => {
+  const { decodeError = true, errorMessage, headers, ...requestInit } = options;
+  const state = await loadState();
+  const ghost = getGhostFromState(state, name);
+
+  if (ghost.status !== "running") {
+    throw new Error(`Ghost "${name}" is not running.`);
+  }
+
+  const response = await fetch(`http://localhost:${ghost.portBase}${path}`, {
+    ...requestInit,
+    headers: {
+      ...headers,
+      ...getGhostAuthHeaders(ghost)
+    }
+  });
+
+  if (response.ok) {
+    return response;
+  }
+
+  let message = `${errorMessage} with status ${response.status}.`;
+
+  if (decodeError) {
+    try {
+      const payload = (await response.json()) as { error?: unknown };
+      if (typeof payload.error === "string" && payload.error.length > 0) {
+        message = payload.error;
+      }
+    } catch {
+      // Ignore invalid JSON error payloads.
+    }
+  }
+
+  throw new Error(message);
 };
 
 export const getNextPortBase = (state: GhostboxState): number => {
@@ -519,7 +587,7 @@ export const reconcileGhostStates = async (): Promise<{ started: string[]; marke
   const marked: string[] = [];
 
   for (const [name, ghost] of Object.entries(state.ghosts)) {
-    if (ghost.status !== 'running') continue;
+    if (ghost.status !== "running") continue;
 
     // Check if container is actually running
     try {
@@ -541,9 +609,9 @@ export const reconcileGhostStates = async (): Promise<{ started: string[]; marke
       // No lingering container with that name
     }
 
-    ghost.status = 'stopped';
+    ghost.status = "stopped";
     marked.push(name);
-    log.info({ name }, 'Ghost container not running - restarting');
+    log.info({ name }, "Ghost container not running - restarting");
   }
 
   await saveState(state);
@@ -553,10 +621,10 @@ export const reconcileGhostStates = async (): Promise<{ started: string[]; marke
     try {
       await wakeGhost(name);
       started.push(name);
-      log.info({ name }, 'Ghost restarted');
+      log.info({ name }, "Ghost restarted");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      log.error({ name, err: message }, 'Failed to restart ghost');
+      log.error({ name, err: message }, "Failed to restart ghost");
     }
   }
 
@@ -578,10 +646,7 @@ export const getConfig = async (): Promise<GhostboxConfig> => {
   return state.config;
 };
 
-export const generateApiKey = async (
-  name: string,
-  label: string,
-): Promise<GhostApiKey> => {
+export const generateApiKey = async (name: string, label: string): Promise<GhostApiKey> => {
   const state = await loadState();
   const ghost = getGhostFromState(state, name);
   const apiKey = createGhostApiKey(label);
@@ -611,7 +676,7 @@ export const listApiKeys = async (name: string): Promise<GhostApiKey[]> => {
 
   return ghost.apiKeys.map((apiKey) => ({
     ...apiKey,
-    key: maskGhostApiKey(apiKey.key),
+    key: maskGhostApiKey(apiKey.key)
   }));
 };
 
@@ -619,7 +684,7 @@ export const spawnGhost = async (
   name: string,
   provider: string,
   model: string,
-  systemPrompt?: string,
+  systemPrompt?: string
 ): Promise<void> => {
   const state = await loadState();
   if (state.ghosts[name]) {
@@ -631,67 +696,20 @@ export const spawnGhost = async (
   await ensureBaseExtensions();
 
   const portBase = getNextPortBase(state);
-  const resolvedModel = resolveProviderModel(
-    provider,
-    model,
-    state.config.defaultProvider,
-  );
-  log.info(
-    { name, model: resolvedModel.fullModel, portBase, provider: resolvedModel.provider },
-    'Spawning ghost',
-  );
+  const resolvedModel = resolveProviderModel(provider, model, state.config.defaultProvider);
+  log.info({ name, model: resolvedModel.fullModel, portBase, provider: resolvedModel.provider }, "Spawning ghost");
   const ghost: GhostState = {
-    containerId: '',
+    containerId: "",
     portBase,
     model: resolvedModel.model,
     provider: resolvedModel.provider,
-    imageVersion: '',
-    status: 'running',
+    imageVersion: "",
+    status: "running",
     createdAt: new Date().toISOString(),
     systemPrompt: systemPrompt ?? null,
-    apiKeys: [createGhostApiKey('default')],
+    apiKeys: [createGhostApiKey("default")]
   };
-  const vaultPath = getVaultPath(name);
-  const piAgentPath = getGhostPiAgentPath(name);
-  const baseExtensionsPath = getBaseExtensionsPath();
-  let containerId = '';
-
-  try {
-    const container = await docker.createContainer({
-      Image: state.config.imageName || defaultImageName,
-      name: `ghostbox-${name}`,
-      Env: [
-        `GHOSTBOX_MODEL=${resolvedModel.fullModel}`,
-        `GHOSTBOX_SYSTEM_PROMPT=${systemPrompt || ''}`,
-        `GHOSTBOX_GHOST_NAME=${name}`,
-        `GHOSTBOX_GITHUB_TOKEN=${state.config.githubToken || ''}`,
-        `GHOSTBOX_GITHUB_REMOTE=${state.config.githubRemote || ''}`,
-        `GHOSTBOX_HOST_BASE_PORT=${portBase}`,
-        `GHOSTBOX_USER_PORTS=8001-8009`,
-        `GHOSTBOX_OBSERVER_MODEL=${state.config.observerModel || ''}`,
-        getGhostboxApiKeysEnv(ghost),
-        getGhostNudgeKeyEnv(ghost),
-      ],
-      ExposedPorts: buildExposedPorts(),
-      HostConfig: {
-        Binds: [
-          `${vaultPath}:/vault`,
-          `${piAgentPath}:/root/.pi/agent`,
-          `${baseExtensionsPath}:/root/.pi/agent/extensions:ro`,
-        ],
-        PortBindings: buildPortBindings(portBase),
-        Memory: 1024 * 1024 * 1024,
-        CpuShares: 512,
-      },
-    });
-
-    containerId = container.id;
-    await container.start();
-    await waitForHealth(name, portBase);
-  } catch (error: unknown) {
-    logDockerConnectionIssue(error, { name, operation: 'spawn' });
-    throw error;
-  }
+  const containerId = await startGhostContainer(state, name, ghost, resolvedModel.fullModel, systemPrompt, "spawn");
 
   ghost.containerId = containerId;
   ghost.imageVersion = state.config.imageVersion;
@@ -702,7 +720,7 @@ export const spawnGhost = async (
 export const killGhost = async (name: string): Promise<void> => {
   const state = await loadState();
   const ghost = getGhostFromState(state, name);
-  log.info({ name }, 'Killing ghost');
+  log.info({ name }, "Killing ghost");
 
   await commitVault(name);
 
@@ -710,20 +728,20 @@ export const killGhost = async (name: string): Promise<void> => {
     const container = docker.getContainer(ghost.containerId);
     await container.remove({ force: true });
   } catch (error: unknown) {
-    logDockerConnectionIssue(error, { name, operation: 'kill' });
+    logDockerConnectionIssue(error, { name, operation: "kill" });
     throw error;
   }
 
-  ghost.status = 'stopped';
+  ghost.status = "stopped";
   await saveState(state);
 };
 
 export const wakeGhost = async (name: string): Promise<void> => {
   const state = await loadState();
   const ghost = getGhostFromState(state, name);
-  log.info({ name }, 'Waking ghost');
+  log.info({ name }, "Waking ghost");
 
-  if (ghost.status !== 'stopped') {
+  if (ghost.status !== "stopped") {
     throw new Error(`Ghost "${name}" is not stopped.`);
   }
 
@@ -744,55 +762,18 @@ export const wakeGhost = async (name: string): Promise<void> => {
   await ensureGhostPiAgent(name);
   await ensureBaseExtensions();
 
-  const vaultPath = getVaultPath(name);
-  const piAgentPath = getGhostPiAgentPath(name);
-  const baseExtensionsPath = getBaseExtensionsPath();
-  const resolvedModel = resolveProviderModel(
-    ghost.provider,
-    ghost.model,
-    state.config.defaultProvider,
+  const resolvedModel = resolveProviderModel(ghost.provider, ghost.model, state.config.defaultProvider);
+  const containerId = await startGhostContainer(
+    state,
+    name,
+    ghost,
+    resolvedModel.fullModel,
+    ghost.systemPrompt,
+    "wake"
   );
-  let containerId = '';
-
-  try {
-    const container = await docker.createContainer({
-      Image: state.config.imageName || defaultImageName,
-      name: `ghostbox-${name}`,
-      Env: [
-        `GHOSTBOX_MODEL=${resolvedModel.fullModel}`,
-        `GHOSTBOX_SYSTEM_PROMPT=${ghost.systemPrompt || ''}`,
-        `GHOSTBOX_GHOST_NAME=${name}`,
-        `GHOSTBOX_GITHUB_TOKEN=${state.config.githubToken || ''}`,
-        `GHOSTBOX_GITHUB_REMOTE=${state.config.githubRemote || ''}`,
-        `GHOSTBOX_HOST_BASE_PORT=${ghost.portBase}`,
-        `GHOSTBOX_USER_PORTS=8001-8009`,
-        `GHOSTBOX_OBSERVER_MODEL=${state.config.observerModel || ''}`,
-        getGhostboxApiKeysEnv(ghost),
-        getGhostNudgeKeyEnv(ghost),
-      ],
-      ExposedPorts: buildExposedPorts(),
-      HostConfig: {
-        Binds: [
-          `${vaultPath}:/vault`,
-          `${piAgentPath}:/root/.pi/agent`,
-          `${baseExtensionsPath}:/root/.pi/agent/extensions:ro`,
-        ],
-        PortBindings: buildPortBindings(ghost.portBase),
-        Memory: 1024 * 1024 * 1024,
-        CpuShares: 512,
-      },
-    });
-
-    containerId = container.id;
-    await container.start();
-    await waitForHealth(name, ghost.portBase);
-  } catch (error: unknown) {
-    logDockerConnectionIssue(error, { name, operation: 'wake' });
-    throw error;
-  }
 
   ghost.containerId = containerId;
-  ghost.status = 'running';
+  ghost.status = "running";
   ghost.imageVersion = state.config.imageVersion;
   await saveState(state);
 };
@@ -802,7 +783,7 @@ const refreshGhostAuth = async (name: string): Promise<void> => {
   await mkdir(ghostPiPath, { recursive: true });
 
   const sharedPath = getSharedPiAgentPath();
-  for (const file of ['auth.json', 'settings.json']) {
+  for (const file of ["auth.json", "settings.json"]) {
     await copyFile(join(sharedPath, file), join(ghostPiPath, file));
   }
 };
@@ -812,40 +793,31 @@ export const sendMessage = async function* (
   prompt: string,
   model?: string,
   images?: GhostImage[],
-  streamingBehavior?: GhostStreamingBehavior,
+  streamingBehavior?: GhostStreamingBehavior
 ): AsyncGenerator<GhostMessage> {
-  const state = await loadState();
-  const ghost = getGhostFromState(state, name);
-  if (ghost.status !== 'running') {
-    throw new Error(`Ghost "${name}" is not running.`);
-  }
-
-  const response = await fetch(`http://localhost:${ghost.portBase}/message`, {
-    method: 'POST',
+  const response = await callGhost(name, "/message", {
+    method: "POST",
     headers: {
-      'Content-Type': 'application/json',
-      ...getGhostAuthHeaders(ghost),
+      "Content-Type": "application/json"
     },
     body: JSON.stringify({
       prompt,
       ...(model ? { model } : {}),
       ...(images ? { images } : {}),
-      ...(streamingBehavior ? { streamingBehavior } : {}),
+      ...(streamingBehavior ? { streamingBehavior } : {})
     }),
     signal: AbortSignal.timeout(1_800_000),
+    errorMessage: "Ghost message request failed",
+    decodeError: false
   });
 
-  if (!response.ok) {
-    throw new Error(`Ghost message request failed with status ${response.status}.`);
-  }
-
   if (!response.body) {
-    throw new Error('Ghost message response did not include a body.');
+    throw new Error("Ghost message response did not include a body.");
   }
 
   const decoder = new TextDecoder();
   const reader = response.body.getReader();
-  let buffer = '';
+  let buffer = "";
 
   while (true) {
     const { value, done } = await reader.read();
@@ -854,8 +826,8 @@ export const sendMessage = async function* (
     }
 
     buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
 
     for (const line of lines) {
       const trimmed = line.trim();
@@ -875,105 +847,38 @@ export const sendMessage = async function* (
 export const steerGhost = async (
   name: string,
   prompt: string,
-  images?: GhostImage[],
+  images?: GhostImage[]
 ): Promise<GhostQueueEnqueueResponse> => {
-  const state = await loadState();
-  const ghost = getGhostFromState(state, name);
-  if (ghost.status !== 'running') {
-    throw new Error(`Ghost "${name}" is not running.`);
-  }
-
-  const response = await fetch(`http://localhost:${ghost.portBase}/steer`, {
-    method: 'POST',
+  const response = await callGhost(name, "/steer", {
+    method: "POST",
     headers: {
-      'Content-Type': 'application/json',
-      ...getGhostAuthHeaders(ghost),
+      "Content-Type": "application/json"
     },
     body: JSON.stringify({
       prompt,
-      ...(images ? { images } : {}),
+      ...(images ? { images } : {})
     }),
+    errorMessage: "Ghost steer failed"
   });
 
-  if (response.ok) {
-    return await response.json() as GhostQueueEnqueueResponse;
-  }
-
-  let message = `Ghost steer failed with status ${response.status}.`;
-
-  try {
-    const payload = (await response.json()) as { error?: unknown };
-    if (typeof payload.error === 'string' && payload.error.length > 0) {
-      message = payload.error;
-    }
-  } catch {
-    // Ignore invalid JSON error payloads.
-  }
-
-  throw new Error(message);
+  return (await response.json()) as GhostQueueEnqueueResponse;
 };
 
 export const getGhostQueue = async (name: string): Promise<GhostQueueState> => {
-  const state = await loadState();
-  const ghost = getGhostFromState(state, name);
-  if (ghost.status !== 'running') {
-    throw new Error(`Ghost "${name}" is not running.`);
-  }
-
-  const response = await fetch(`http://localhost:${ghost.portBase}/queue`, {
-    headers: {
-      ...getGhostAuthHeaders(ghost),
-    },
+  const response = await callGhost(name, "/queue", {
+    errorMessage: "Ghost queue failed"
   });
 
-  if (response.ok) {
-    return await response.json() as GhostQueueState;
-  }
-
-  let message = `Ghost queue failed with status ${response.status}.`;
-
-  try {
-    const payload = (await response.json()) as { error?: unknown };
-    if (typeof payload.error === 'string' && payload.error.length > 0) {
-      message = payload.error;
-    }
-  } catch {
-    // Ignore invalid JSON error payloads.
-  }
-
-  throw new Error(message);
+  return (await response.json()) as GhostQueueState;
 };
 
 export const clearGhostQueue = async (name: string): Promise<GhostQueueClearResponse> => {
-  const state = await loadState();
-  const ghost = getGhostFromState(state, name);
-  if (ghost.status !== 'running') {
-    throw new Error(`Ghost "${name}" is not running.`);
-  }
-
-  const response = await fetch(`http://localhost:${ghost.portBase}/clear-queue`, {
-    method: 'POST',
-    headers: {
-      ...getGhostAuthHeaders(ghost),
-    },
+  const response = await callGhost(name, "/clear-queue", {
+    method: "POST",
+    errorMessage: "Ghost clear queue failed"
   });
 
-  if (response.ok) {
-    return await response.json() as GhostQueueClearResponse;
-  }
-
-  let message = `Ghost clear queue failed with status ${response.status}.`;
-
-  try {
-    const payload = (await response.json()) as { error?: unknown };
-    if (typeof payload.error === 'string' && payload.error.length > 0) {
-      message = payload.error;
-    }
-  } catch {
-    // Ignore invalid JSON error payloads.
-  }
-
-  throw new Error(message);
+  return (await response.json()) as GhostQueueClearResponse;
 };
 
 export const getGhostHealth = async (name: string): Promise<boolean> => {
@@ -989,229 +894,144 @@ export const getGhostHealth = async (name: string): Promise<boolean> => {
 };
 
 export const getGhostHistory = async (name: string): Promise<HistoryResponse> => {
-  const state = await loadState();
-  const ghost = getGhostFromState(state, name);
-  if (ghost.status !== 'running') {
-    throw new Error(`Ghost "${name}" is not running.`);
-  }
-
-  const response = await fetch(`http://localhost:${ghost.portBase}/history`, {
-    headers: {
-      ...getGhostAuthHeaders(ghost),
-    },
+  const response = await callGhost(name, "/history", {
+    errorMessage: "Ghost history request failed",
+    decodeError: false
   });
 
-  if (!response.ok) {
-    throw new Error(`Ghost history request failed with status ${response.status}.`);
-  }
+  return (await response.json()) as HistoryResponse;
+};
 
-  return await response.json() as HistoryResponse;
+export const getGhostSessions = async (name: string): Promise<SessionListResponse> => {
+  const response = await callGhost(name, "/sessions", {
+    errorMessage: "Ghost sessions request failed",
+    decodeError: false
+  });
+
+  return (await response.json()) as SessionListResponse;
 };
 
 export const getGhostStats = async (name: string): Promise<Record<string, unknown>> => {
-  const state = await loadState();
-  const ghost = getGhostFromState(state, name);
-  if (ghost.status !== 'running') {
-    throw new Error(`Ghost "${name}" is not running.`);
-  }
-
-  const response = await fetch(`http://localhost:${ghost.portBase}/stats`, {
-    headers: {
-      ...getGhostAuthHeaders(ghost),
-    },
+  const response = await callGhost(name, "/stats", {
+    errorMessage: "Ghost stats request failed",
+    decodeError: false
   });
 
-  if (!response.ok) {
-    throw new Error(`Ghost stats request failed with status ${response.status}.`);
-  }
-
-  return await response.json() as Record<string, unknown>;
+  return (await response.json()) as Record<string, unknown>;
 };
 
 export const reloadGhost = async (name: string): Promise<void> => {
-  const state = await loadState();
-  const ghost = getGhostFromState(state, name);
-  if (ghost.status !== 'running') {
-    throw new Error(`Ghost "${name}" is not running.`);
-  }
-
-  const response = await fetch(`http://localhost:${ghost.portBase}/reload`, {
-    method: 'POST',
-    headers: {
-      ...getGhostAuthHeaders(ghost),
-    },
+  await callGhost(name, "/reload", {
+    method: "POST",
+    errorMessage: "Ghost reload failed"
   });
-
-  if (response.ok) {
-    return;
-  }
-
-  let message = `Ghost reload failed with status ${response.status}.`;
-
-  try {
-    const payload = (await response.json()) as { error?: unknown };
-    if (typeof payload.error === 'string' && payload.error.length > 0) {
-      message = payload.error;
-    }
-  } catch {
-    // Ignore invalid JSON error payloads.
-  }
-
-  throw new Error(message);
 };
 
 export const compactGhost = async (name: string): Promise<void> => {
-  const state = await loadState();
-  const ghost = getGhostFromState(state, name);
-  if (ghost.status !== 'running') {
-    throw new Error(`Ghost "${name}" is not running.`);
-  }
-
-  const response = await fetch(`http://localhost:${ghost.portBase}/compact`, {
-    method: 'POST',
-    headers: {
-      ...getGhostAuthHeaders(ghost),
-    },
+  await callGhost(name, "/compact", {
+    method: "POST",
+    errorMessage: "Ghost compact failed"
   });
-
-  if (response.ok) {
-    return;
-  }
-
-  let message = `Ghost compact failed with status ${response.status}.`;
-
-  try {
-    const payload = (await response.json()) as { error?: unknown };
-    if (typeof payload.error === 'string' && payload.error.length > 0) {
-      message = payload.error;
-    }
-  } catch {
-    // Ignore invalid JSON error payloads.
-  }
-
-  throw new Error(message);
 };
 
 export const abortGhost = async (name: string): Promise<void> => {
-  const state = await loadState();
-  const ghost = getGhostFromState(state, name);
-  if (ghost.status !== 'running') {
-    throw new Error(`Ghost "${name}" is not running.`);
-  }
-
-  const response = await fetch(`http://localhost:${ghost.portBase}/abort`, {
-    method: 'POST',
-    headers: {
-      ...getGhostAuthHeaders(ghost),
-    },
+  await callGhost(name, "/abort", {
+    method: "POST",
+    errorMessage: "Ghost abort failed"
   });
-
-  if (response.ok) {
-    return;
-  }
-
-  let message = `Ghost abort failed with status ${response.status}.`;
-
-  try {
-    const payload = (await response.json()) as { error?: unknown };
-    if (typeof payload.error === 'string' && payload.error.length > 0) {
-      message = payload.error;
-    }
-  } catch {
-    // Ignore invalid JSON error payloads.
-  }
-
-  throw new Error(message);
 };
 
-export const newGhostSession = async (name: string): Promise<void> => {
-  const state = await loadState();
-  const ghost = getGhostFromState(state, name);
-  if (ghost.status !== 'running') {
-    throw new Error(`Ghost "${name}" is not running.`);
-  }
-
-  const response = await fetch(`http://localhost:${ghost.portBase}/new`, {
-    method: 'POST',
-    headers: {
-      ...getGhostAuthHeaders(ghost),
-    },
+export const newGhostSession = async (name: string): Promise<{ status: "new_session"; sessionId: string }> => {
+  const response = await callGhost(name, "/new", {
+    method: "POST",
+    errorMessage: "Ghost new session failed"
   });
 
-  if (response.ok) {
-    return;
-  }
+  return (await response.json()) as { status: "new_session"; sessionId: string };
+};
 
-  let message = `Ghost new session failed with status ${response.status}.`;
+export const switchGhostSession = async (
+  name: string,
+  sessionId: string
+): Promise<{ status: "switched"; sessionId: string }> => {
+  const response = await callGhost(name, "/sessions/switch", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ sessionId }),
+    errorMessage: "Ghost switch session failed"
+  });
 
-  try {
-    const payload = (await response.json()) as { error?: unknown };
-    if (typeof payload.error === 'string' && payload.error.length > 0) {
-      message = payload.error;
-    }
-  } catch {
-    // Ignore invalid JSON error payloads.
-  }
+  return (await response.json()) as { status: "switched"; sessionId: string };
+};
 
-  throw new Error(message);
+export const renameGhostSession = async (
+  name: string,
+  sessionId: string,
+  sessionName: string
+): Promise<{ status: "renamed"; sessionId: string; name: string | null }> => {
+  const response = await callGhost(name, "/sessions/rename", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ sessionId, name: sessionName }),
+    errorMessage: "Ghost rename session failed"
+  });
+
+  return (await response.json()) as { status: "renamed"; sessionId: string; name: string | null };
+};
+
+export const deleteGhostSession = async (
+  name: string,
+  sessionId: string
+): Promise<{ status: "deleted"; sessionId: string }> => {
+  const response = await callGhost(name, `/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+    errorMessage: "Ghost delete session failed"
+  });
+
+  return (await response.json()) as { status: "deleted"; sessionId: string };
 };
 
 export const nudgeGhost = async (
   name: string,
-  event: string = 'self',
-  reason: string = 'orchestrator',
+  event: string = "self",
+  reason: string = "orchestrator"
 ): Promise<void> => {
-  const state = await loadState();
-  const ghost = getGhostFromState(state, name);
-  if (ghost.status !== 'running') {
-    throw new Error(`Ghost "${name}" is not running.`);
-  }
-
-  const response = await fetch(`http://localhost:${ghost.portBase}/nudge`, {
-    method: 'POST',
+  await callGhost(name, "/nudge", {
+    method: "POST",
     headers: {
-      'Content-Type': 'application/json',
-      ...getGhostAuthHeaders(ghost),
+      "Content-Type": "application/json"
     },
     body: JSON.stringify({ event, reason }),
+    errorMessage: "Ghost nudge failed"
   });
-
-  if (response.ok) {
-    return;
-  }
-
-  let message = `Ghost nudge failed with status ${response.status}.`;
-
-  try {
-    const payload = (await response.json()) as { error?: unknown };
-    if (typeof payload.error === 'string' && payload.error.length > 0) {
-      message = payload.error;
-    }
-  } catch {
-    // Ignore invalid JSON error payloads.
-  }
-
-  throw new Error(message);
 };
 
 export const removeGhost = async (name: string): Promise<void> => {
   const state = await loadState();
   const ghost = getGhostFromState(state, name);
 
-  if (ghost.status === 'running') {
+  if (ghost.status === "running") {
     await killGhost(name);
   }
 
   const refreshedState = await loadState();
   const vaultPath = getVaultPath(name);
 
-  const { exitCode, stderr: trashStdErr } = await new Promise<{ exitCode: number; stderr: string }>((resolve, reject) => {
-    const proc = nodeSpawn('trash', [vaultPath], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let stderr = '';
-    proc.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
-    proc.on('error', reject);
-    proc.on('close', (code: number | null) => resolve({ exitCode: code ?? 1, stderr }));
-  });
+  const { exitCode, stderr: trashStdErr } = await new Promise<{ exitCode: number; stderr: string }>(
+    (resolve, reject) => {
+      const proc = nodeSpawn("trash", [vaultPath], { stdio: ["ignore", "pipe", "pipe"] });
+      let stderr = "";
+      proc.stderr?.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      proc.on("error", reject);
+      proc.on("close", (code: number | null) => resolve({ exitCode: code ?? 1, stderr }));
+    }
+  );
 
   if (exitCode !== 0) {
     throw new Error(`Trash command failed: ${trashStdErr.trim()}`);
@@ -1226,15 +1046,15 @@ export const mergeGhosts = async (source: string, target: string): Promise<strin
   const sourceGhost = getGhostFromState(state, source);
   const targetGhost = getGhostFromState(state, target);
 
-  if (sourceGhost.status !== 'stopped' || targetGhost.status !== 'stopped') {
-    throw new Error('Both ghosts must be stopped before merge.');
+  if (sourceGhost.status !== "stopped" || targetGhost.status !== "stopped") {
+    throw new Error("Both ghosts must be stopped before merge.");
   }
 
   return mergeVaults(source, target);
 };
 
 export const upgradeGhosts = async (
-  dockerDir: string,
+  dockerDir: string
 ): Promise<{ upgraded: string[]; skipped: string[]; failed: string[] }> => {
   const state = await loadState();
   const imageVersion = computeImageVersion(dockerDir);
@@ -1246,13 +1066,13 @@ export const upgradeGhosts = async (
   const failed: string[] = [];
 
   for (const [name, ghost] of Object.entries(state.ghosts)) {
-    if (ghost.status !== 'running') continue;
+    if (ghost.status !== "running") continue;
     if (ghost.imageVersion === imageVersion) {
       skipped.push(name);
       continue;
     }
 
-    log.info({ name, from: ghost.imageVersion, to: imageVersion }, 'Upgrading ghost');
+    log.info({ name, from: ghost.imageVersion, to: imageVersion }, "Upgrading ghost");
 
     try {
       await refreshGhostAuth(name);
@@ -1262,9 +1082,9 @@ export const upgradeGhosts = async (
       freshState.ghosts[name].imageVersion = imageVersion;
       await saveState(freshState);
       upgraded.push(name);
-      log.info({ name }, 'Upgrade complete');
+      log.info({ name }, "Upgrade complete");
     } catch (error) {
-      log.error({ name, err: error }, 'Upgrade failed');
+      log.error({ name, err: error }, "Upgrade failed");
       failed.push(name);
     }
   }

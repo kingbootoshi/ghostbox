@@ -49,7 +49,7 @@ struct HubView: View {
                     .padding(.bottom, 18)
                 }
 
-                if !showsSettings {
+                if !showsSettings && !appState.isStartingServer {
                     footer
                 }
             }
@@ -64,7 +64,15 @@ struct HubView: View {
         }
         .background(Color.clear)
         .onAppear {
-            viewModel.startPolling()
+            if !appState.isStartingServer {
+                viewModel.startPolling()
+            }
+        }
+        .onChange(of: appState.isStartingServer) {
+            if !appState.isStartingServer {
+                viewModel.error = nil
+                viewModel.startPolling()
+            }
         }
         .onDisappear {
             viewModel.stopPolling()
@@ -86,13 +94,13 @@ struct HubView: View {
 
     private var ghostListContent: some View {
         Group {
-            if appState.isStartingServer {
-                serverStartingView
-            } else if let error = viewModel.error {
+            if appState.isStartingServer, let serverStatus = appState.serverStatus {
+                serverStatusView(serverStatus, isFailure: false)
+            } else if !appState.isStartingServer, let error = viewModel.error {
                 errorView(error)
             }
 
-            if displayGhosts.isEmpty && !appState.isStartingServer {
+            if displayGhosts.isEmpty && !appState.isStartingServer && appState.serverStatus == nil {
                 emptyState
             } else {
                 ForEach(displayGhosts) { ghost in
@@ -214,14 +222,17 @@ struct HubView: View {
         }
     }
 
-    private var serverStartingView: some View {
+    private func serverStatusView(_ message: String, isFailure: Bool) -> some View {
         HStack(spacing: 10) {
-            ProgressView()
-                .controlSize(.small)
-                .tint(Theme.Colors.accentLight)
-            Text("Starting server...")
+            if appState.isStartingServer {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(Theme.Colors.accentLight)
+            }
+
+            Text(message)
                 .font(Theme.Typography.body(weight: .medium))
-                .foregroundColor(Theme.Colors.accentLight)
+                .foregroundColor(isFailure ? Color.orange.opacity(0.9) : Theme.Colors.accentLight)
         }
         .padding(.vertical, 16)
         .frame(maxWidth: .infinity)

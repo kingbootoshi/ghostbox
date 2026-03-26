@@ -29,13 +29,14 @@ final class ChatPanelController: NSObject, NSWindowDelegate {
     init(
         ghostName: String,
         client: GhostboxClient,
+        initialGhost: Ghost? = nil,
         stackIndex: Int = 0,
         hubCenterProvider: @escaping @MainActor () -> NSPoint?,
         userDefaults: UserDefaults = .standard
     ) {
         self.ghostName = ghostName
         self.stackIndex = stackIndex
-        self.viewModel = AgentChatViewModel(ghostName: ghostName, client: client)
+        self.viewModel = AgentChatViewModel(ghostName: ghostName, client: client, initialGhost: initialGhost)
         self.hubCenterProvider = hubCenterProvider
         self.userDefaults = userDefaults
 
@@ -70,6 +71,10 @@ final class ChatPanelController: NSObject, NSWindowDelegate {
 
     func show() {
         showFromCenter(hubCenter: resolvedHubCenter())
+    }
+
+    func prepareForOpening(ghost: Ghost?) {
+        viewModel.prepareForOpening(ghost: ghost)
     }
 
     func showFromCenter(hubCenter: NSPoint) {

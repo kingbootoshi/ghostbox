@@ -1,16 +1,16 @@
-import pino, { type Logger } from 'pino';
+import pino, { type Logger } from "pino";
 
 const baseLogger = pino({
-  level: process.env.LOG_LEVEL ?? 'info',
+  level: process.env.LOG_LEVEL ?? "info",
   timestamp: pino.stdTimeFunctions.isoTime,
   transport: {
-    target: 'pino-pretty',
+    target: "pino-pretty",
     options: {
       colorize: true,
-      translateTime: 'SYS:standard',
-      ignore: 'pid,hostname',
-    },
-  },
+      translateTime: "SYS:standard",
+      ignore: "pid,hostname"
+    }
+  }
 });
 
 export const createLogger = (module: string): Logger => {

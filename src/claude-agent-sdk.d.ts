@@ -1,4 +1,4 @@
-declare module '@anthropic-ai/claude-agent-sdk' {
+declare module "@anthropic-ai/claude-agent-sdk" {
   export type QueryOptions = {
     cwd: string;
     permissionMode: string;

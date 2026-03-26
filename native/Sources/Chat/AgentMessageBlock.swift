@@ -3,6 +3,7 @@ import SwiftUI
 struct AgentMessageBlock: View {
     let message: ChatMessage
     let ghostName: String
+    let isSelected: Bool
     var onThumbnailTap: ((NSImage) -> Void)?
 
     private static let formatter: DateFormatter = {
@@ -26,6 +27,17 @@ struct AgentMessageBlock: View {
                 .foregroundColor(Color.white.opacity(0.1))
                 .padding(.top, 1)
         }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(isSelected ? Theme.Colors.accent.opacity(0.18) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(isSelected ? Theme.Colors.accentLight.opacity(0.65) : Color.clear, lineWidth: 1)
+        )
+        .shadow(color: isSelected ? Theme.Colors.accent.opacity(0.2) : Color.clear, radius: 18, x: 0, y: 8)
         .frame(maxWidth: .infinity, alignment: message.role == .user ? .trailing : .leading)
         .padding(.horizontal, 20)
     }

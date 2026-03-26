@@ -8,6 +8,7 @@ final class AppState: ObservableObject {
     @Published var ghosts: [Ghost] = []
     @Published var isLoading = false
     @Published var isStartingServer = false
+    @Published var serverStatus: String?
     @Published var error: String?
 
     init(client: GhostboxClient = GhostboxClient()) {

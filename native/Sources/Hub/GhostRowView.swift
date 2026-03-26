@@ -18,14 +18,24 @@ struct GhostRow: View {
                     .frame(width: 8, height: 8)
 
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(ghost.name)
-                        .font(Theme.Typography.display())
-                        .foregroundColor(Theme.Colors.accentLight)
+                    HStack(alignment: .center, spacing: 8) {
+                        AnimatedGhostView(
+                            state: ghost.status == .running ? .blink : .idle,
+                            size: 80
+                        )
+                        .frame(width: 80, height: 80)
+
+                        Text(ghost.name)
+                            .font(Theme.Typography.display())
+                            .foregroundColor(Theme.Colors.accentLight)
+                    }
 
                     HStack(spacing: 6) {
                         Text(ghost.status.rawValue.capitalized)
                         Text("·")
                         Text(ghost.model)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                     }
                     .font(Theme.Typography.label(weight: .regular))
                     .foregroundColor(Color.white.opacity(0.35))

@@ -1,32 +1,29 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
-import app from '../../src/api';
-import {
-  createConfig,
-  createGhostState,
-  createState,
-  createTestHome,
-} from '../support/test-state';
+import app, { ScheduleManager } from "../../src/api";
+import { createConfig, createGhostState, createState, createTestHome } from "../support/test-state";
 
 type TestHome = Awaited<ReturnType<typeof createTestHome>>;
 
 const postJson = (path: string, body: unknown): Promise<Response> => {
   return app.request(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
   });
 };
 
 const putJson = (path: string, body: unknown): Promise<Response> => {
   return app.request(path, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
   });
 };
 
-describe('api route validation', () => {
+describe("api route validation", () => {
   let testHome: TestHome;
 
   beforeEach(async () => {
@@ -37,192 +34,286 @@ describe('api route validation', () => {
     await testHome.cleanup();
   });
 
-  test('GET /api/config masks sensitive values and reports status flags', async () => {
+  test("GET /api/config masks sensitive values and reports status flags", async () => {
     await testHome.writeState(
       createState({
         config: createConfig({
-          githubToken: 'github-token-1234567890',
-          telegramToken: 'telegram-token-1234567890',
-        }),
-      }),
+          githubToken: "github-token-1234567890",
+          telegramToken: "telegram-token-1234567890"
+        })
+      })
     );
 
-    const response = await app.request('/api/config');
+    const response = await app.request("/api/config");
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
-      telegramToken: 'telegram-tok...7890',
-      githubToken: 'github-token...7890',
-      githubRemote: 'https://github.com/example/repo.git',
-      defaultModel: 'anthropic/claude-sonnet-4-6',
-      defaultProvider: 'anthropic',
-      imageName: 'ghostbox-agent',
-      imageVersion: 'gb-deadbeef',
-      observerModel: 'openai/gpt-4o-mini',
+      telegramToken: "telegram-tok...7890",
+      githubToken: "github-token...7890",
+      githubRemote: "https://github.com/example/repo.git",
+      defaultModel: "anthropic/claude-sonnet-4-6",
+      defaultProvider: "anthropic",
+      imageName: "ghostbox-agent",
+      imageVersion: "gb-deadbeef",
+      observerModel: "openai/gpt-4o-mini",
       hasSensitive: {
         githubToken: true,
-        telegramToken: true,
-      },
+        telegramToken: true
+      }
     });
   });
 
-  test('PUT /api/config trims values, clears nullable fields, and preserves masked secrets', async () => {
+  test("PUT /api/config trims values, clears nullable fields, and preserves masked secrets", async () => {
     await testHome.writeState(
       createState({
         config: createConfig({
-          githubToken: 'github-token-1234567890',
-          telegramToken: 'telegram-token-1234567890',
-          githubRemote: 'https://github.com/example/repo.git',
-        }),
-      }),
+          githubToken: "github-token-1234567890",
+          telegramToken: "telegram-token-1234567890",
+          githubRemote: "https://github.com/example/repo.git"
+        })
+      })
     );
 
-    const response = await putJson('/api/config', {
-      defaultProvider: 'openai',
-      defaultModel: ' openai/gpt-4.1 ',
-      imageName: ' ghostbox-next ',
-      githubRemote: '   ',
-      githubToken: 'github-token...7890',
-      telegramToken: null,
+    const response = await putJson("/api/config", {
+      defaultProvider: "openai",
+      defaultModel: " openai/gpt-4.1 ",
+      imageName: " ghostbox-next ",
+      githubRemote: "   ",
+      githubToken: "github-token...7890",
+      telegramToken: null
     });
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
-      telegramToken: '',
-      githubToken: 'github-token...7890',
+      telegramToken: "",
+      githubToken: "github-token...7890",
       githubRemote: null,
-      defaultModel: 'openai/gpt-4.1',
-      defaultProvider: 'openai',
-      imageName: 'ghostbox-next',
-      imageVersion: 'gb-deadbeef',
-      observerModel: 'openai/gpt-4o-mini',
+      defaultModel: "openai/gpt-4.1",
+      defaultProvider: "openai",
+      imageName: "ghostbox-next",
+      imageVersion: "gb-deadbeef",
+      observerModel: "openai/gpt-4o-mini",
       hasSensitive: {
         githubToken: true,
-        telegramToken: false,
-      },
+        telegramToken: false
+      }
     });
 
     const savedState = JSON.parse(await Bun.file(testHome.statePath).text());
-    expect(savedState.config.githubToken).toBe('github-token-1234567890');
-    expect(savedState.config.telegramToken).toBe('');
+    expect(savedState.config.githubToken).toBe("github-token-1234567890");
+    expect(savedState.config.telegramToken).toBe("");
     expect(savedState.config.githubRemote).toBeNull();
   });
 
-  test('PUT /api/config rejects invalid JSON bodies', async () => {
-    const response = await app.request('/api/config', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{',
-    });
-
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: 'Invalid JSON body' });
-  });
-
-  test('POST /api/ghosts rejects requests with a missing name', async () => {
-    const response = await postJson('/api/ghosts', {
-      provider: 'anthropic',
-      model: 'claude-sonnet-4-6',
-    });
-
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: 'Missing name' });
-  });
-
-  test('POST /api/ghosts rejects provider and model mismatches before spawning', async () => {
-    const response = await postJson('/api/ghosts', {
-      name: 'mismatch',
-      provider: 'openai',
-      model: 'anthropic/claude-sonnet-4-6',
+  test("PUT /api/config rejects invalid JSON bodies", async () => {
+    const response = await app.request("/api/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: "{"
     });
 
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({
-      error: 'Provider mismatch: model uses "anthropic" but provider was "openai".',
+      error: expect.stringContaining("Invalid JSON body")
     });
   });
 
-  test('POST /api/ghosts/:name/message rejects invalid streaming behavior', async () => {
-    const response = await postJson('/api/ghosts/demo/message', {
-      prompt: 'hello',
-      streamingBehavior: 'invalid',
-    });
-
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: 'Invalid streamingBehavior' });
-  });
-
-  test('POST /api/ghosts/:name/message rejects malformed image payloads', async () => {
-    const response = await postJson('/api/ghosts/demo/message', {
-      prompt: 'hello',
-      images: [{ mediaType: 'image/png' }],
+  test("POST /api/ghosts rejects requests with a missing name", async () => {
+    const response = await postJson("/api/ghosts", {
+      provider: "anthropic",
+      model: "claude-sonnet-4-6"
     });
 
     expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: 'Invalid images' });
+    expect(await response.json()).toEqual({ error: "Missing name" });
   });
 
-  test('GET /api/ghosts/:name/vault/read rejects path traversal attempts', async () => {
+  test("POST /api/ghosts rejects provider and model mismatches before spawning", async () => {
+    const response = await postJson("/api/ghosts", {
+      name: "mismatch",
+      provider: "openai",
+      model: "anthropic/claude-sonnet-4-6"
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: 'Provider mismatch: model uses "anthropic" but provider was "openai".'
+    });
+  });
+
+  test("POST /api/ghosts/:name/message rejects invalid streaming behavior", async () => {
+    const response = await postJson("/api/ghosts/demo/message", {
+      prompt: "hello",
+      streamingBehavior: "invalid"
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "Invalid streamingBehavior" });
+  });
+
+  test("POST /api/ghosts/:name/message rejects malformed image payloads", async () => {
+    const response = await postJson("/api/ghosts/demo/message", {
+      prompt: "hello",
+      images: [{ mediaType: "image/png" }]
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "Invalid images" });
+  });
+
+  test("GET /api/ghosts/:name/vault/read rejects path traversal attempts", async () => {
     await testHome.writeState(
       createState({
         ghosts: {
-          demo: createGhostState(),
-        },
-      }),
+          demo: createGhostState()
+        }
+      })
     );
 
-    const response = await app.request('/api/ghosts/demo/vault/read?path=../../secret.txt');
+    const response = await app.request("/api/ghosts/demo/vault/read?path=../../secret.txt");
 
     expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: 'Invalid path' });
+    expect(await response.json()).toEqual({ error: "Invalid path" });
   });
 
-  test('GET /api/ghosts/:name/vault lists directories before files with API paths', async () => {
+  test("GET /api/ghosts/:name/vault lists directories before files with API paths", async () => {
     await testHome.writeState(
       createState({
         ghosts: {
-          demo: createGhostState(),
-        },
-      }),
+          demo: createGhostState()
+        }
+      })
     );
-    await testHome.createVaultFile('demo', 'notes/todo.md', 'todo');
-    await testHome.createVaultFile('demo', 'README.md', 'hello');
+    await testHome.createVaultFile("demo", "notes/todo.md", "todo");
+    await testHome.createVaultFile("demo", "README.md", "hello");
 
-    const response = await app.request('/api/ghosts/demo/vault');
+    const response = await app.request("/api/ghosts/demo/vault");
     const payload = await response.json();
 
     expect(response.status).toBe(200);
     expect(payload.entries).toHaveLength(2);
     expect(payload.entries[0]).toMatchObject({
-      name: 'notes',
-      path: '/notes',
-      type: 'directory',
+      name: "notes",
+      path: "/notes",
+      type: "directory"
     });
     expect(payload.entries[1]).toMatchObject({
-      name: 'README.md',
-      path: '/README.md',
-      type: 'file',
-      size: 5,
+      name: "README.md",
+      path: "/README.md",
+      type: "file",
+      size: 5
     });
   });
 
-  test('GET /api/ghosts/:name/vault/read returns file contents and normalized path', async () => {
+  test("GET /api/ghosts/:name/vault/read returns file contents and normalized path", async () => {
     await testHome.writeState(
       createState({
         ghosts: {
-          demo: createGhostState(),
-        },
-      }),
+          demo: createGhostState()
+        }
+      })
     );
-    await testHome.createVaultFile('demo', 'notes/todo.md', 'remember this');
+    await testHome.createVaultFile("demo", "notes/todo.md", "remember this");
 
-    const response = await app.request('/api/ghosts/demo/vault/read?path=/notes/todo.md');
+    const response = await app.request("/api/ghosts/demo/vault/read?path=/notes/todo.md");
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
-      path: '/notes/todo.md',
-      content: 'remember this',
-      size: 13,
+      path: "/notes/todo.md",
+      content: "remember this",
+      size: 13
     });
+  });
+
+  test("schedule routes create, list, and delete schedules on the host", async () => {
+    await testHome.writeState(
+      createState({
+        ghosts: {
+          demo: createGhostState()
+        }
+      })
+    );
+
+    const createResponse = await postJson("/api/ghosts/demo/schedules", {
+      cron: "0 10 * * *",
+      prompt: "Morning check-in",
+      timezone: "UTC",
+      once: true
+    });
+
+    expect(createResponse.status).toBe(201);
+    const createdSchedule = await createResponse.json();
+    expect(createdSchedule).toMatchObject({
+      ghostName: "demo",
+      cron: "0 10 * * *",
+      prompt: "Morning check-in",
+      timezone: "UTC",
+      once: true,
+      enabled: true,
+      lastFired: null
+    });
+    expect(createdSchedule.id).toEqual(expect.any(String));
+    expect(createdSchedule.nextFire).toEqual(expect.any(String));
+
+    const listResponse = await app.request("/api/ghosts/demo/schedules");
+    expect(listResponse.status).toBe(200);
+    expect(await listResponse.json()).toEqual([createdSchedule]);
+
+    const schedulesPath = join(testHome.homeDir, ".ghostbox", "schedules.json");
+    expect(JSON.parse(await readFile(schedulesPath, "utf8"))).toEqual([createdSchedule]);
+
+    const deleteResponse = await app.request(`/api/ghosts/demo/schedules/${createdSchedule.id}`, {
+      method: "DELETE"
+    });
+    expect(deleteResponse.status).toBe(200);
+    expect(await deleteResponse.json()).toEqual({ status: "deleted" });
+
+    const finalListResponse = await app.request("/api/ghosts/demo/schedules");
+    expect(finalListResponse.status).toBe(200);
+    expect(await finalListResponse.json()).toEqual([]);
+  });
+
+  test("ScheduleManager disables one-shot schedules after they fire", async () => {
+    const schedulesPath = join(testHome.homeDir, ".ghostbox", "schedules.json");
+    await writeFile(
+      schedulesPath,
+      JSON.stringify(
+        [
+          {
+            id: "schedule-1",
+            ghostName: "demo",
+            cron: "* * * * *",
+            prompt: "Ping",
+            timezone: "UTC",
+            once: true,
+            enabled: true,
+            createdAt: "2026-03-25T11:00:00.000Z",
+            lastFired: null,
+            nextFire: "2026-03-25T11:59:00.000Z"
+          }
+        ],
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const fired: string[] = [];
+    const manager = new ScheduleManager(async (schedule) => {
+      fired.push(schedule.id);
+    });
+
+    await manager.processDueSchedules(Date.parse("2026-03-25T12:00:00.000Z"));
+
+    expect(fired).toEqual(["schedule-1"]);
+
+    const savedSchedules = JSON.parse(await readFile(schedulesPath, "utf8"));
+    expect(savedSchedules).toHaveLength(1);
+    expect(savedSchedules[0]).toMatchObject({
+      id: "schedule-1",
+      enabled: false,
+      nextFire: null
+    });
+    expect(savedSchedules[0].lastFired).toBe("2026-03-25T12:00:00.000Z");
   });
 });

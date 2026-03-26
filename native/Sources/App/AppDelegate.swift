@@ -1,6 +1,7 @@
 import AppKit
 import Carbon
 import CoreText
+import UserNotifications
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -18,6 +19,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var serverLogHandle: FileHandle?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+        UNUserNotificationCenter.current().delegate = self
+
         registerFonts()
         setupMenuBar()
         setupNotifications()
@@ -28,14 +32,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task {
             appState.isStartingServer = true
+            appState.serverStatus = "Connecting to server..."
+
+            NSApp.activate(ignoringOtherApps: true)
+            hubPanelController?.revealPanel()
+
             await ensureServerRunning()
             appState.isStartingServer = false
+            appState.serverStatus = nil
             _ = try? await client.listGhosts()
-            try? await Task.sleep(for: .milliseconds(100))
-            await MainActor.run {
-                NSApp.activate(ignoringOtherApps: true)
-                hubPanelController?.revealPanel()
-            }
         }
     }
 
@@ -49,9 +54,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func ensureServerRunning() async {
-        if await client.healthCheck() { return }
+        if await client.healthCheck() {
+            appState.serverStatus = nil
+            return
+        }
 
-        guard let projectRoot = findProjectRoot() else { return }
+        appState.serverStatus = "Server not detected, starting..."
+        guard let projectRoot = findProjectRoot() else {
+            appState.serverStatus = "Failed to start server"
+            return
+        }
 
         let logDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".ghostbox")
@@ -78,14 +90,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try process.run()
             serverProcess = process
 
-            for _ in 0..<30 {
+            for attempt in 1...30 {
+                appState.serverStatus = "Starting server... (\(attempt)/30)"
                 try? await Task.sleep(for: .milliseconds(300))
-                if await client.healthCheck() { return }
+                if await client.healthCheck() {
+                    appState.serverStatus = nil
+                    return
+                }
             }
+            appState.serverStatus = "Failed to start server"
         } catch {
             try? serverLogHandle?.close()
             serverLogHandle = nil
-            // Server failed to start - app will show connection error
+            appState.serverStatus = "Failed to start server"
         }
     }
 
@@ -97,6 +114,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return url.path
             }
         }
+
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        for candidate in [
+            "\(home)/Dev/ghostbox",
+            "\(home)/dev/ghostbox",
+            "\(home)/Developer/ghostbox",
+            "\(home)/Projects/ghostbox",
+        ] {
+            if FileManager.default.fileExists(atPath: "\(candidate)/src/api.ts") {
+                return candidate
+            }
+        }
+
         return nil
     }
 
@@ -112,7 +142,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func openChat(ghostName: String) {
+        let ghost = appState.ghosts.first { $0.name == ghostName }
+
         if let controller = chatPanelControllers[ghostName] {
+            controller.prepareForOpening(ghost: ghost)
             NSApp.activate(ignoringOtherApps: true)
             controller.show()
             return
@@ -121,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = ChatPanelController(
             ghostName: ghostName,
             client: client,
+            initialGhost: ghost,
             stackIndex: chatPanelControllers.count,
             hubCenterProvider: { [weak self] in
                 self?.hubPanelController?.hubCenter
@@ -269,6 +303,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func handleCloseGhostChat(_ notification: Notification) {
         guard let ghostName = notification.userInfo?["ghostName"] as? String else { return }
         closeChat(ghostName: ghostName)
+    }
+}
+
+extension AppDelegate: @preconcurrency UNUserNotificationCenterDelegate {
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        if let ghostName = response.notification.request.content.userInfo["ghostName"] as? String {
+            openChat(ghostName: ghostName)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        completionHandler()
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        let ghostName = notification.request.content.userInfo["ghostName"] as? String
+        let shouldPresent = ghostName.map { NSApp.keyWindow?.title != $0 } ?? true
+        completionHandler(shouldPresent ? [.banner, .sound, .badge] : [])
     }
 }
 

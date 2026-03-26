@@ -81,12 +81,14 @@ final class HubViewModel: ObservableObject {
     }
 
     func kill(name: String) async {
+        SoundManager.shared.play(.ghostKill)
         await performGhostAction {
             try await client.killGhost(name: name)
         }
     }
 
     func wake(name: String) async {
+        SoundManager.shared.play(.ghostWake)
         await performGhostAction {
             try await client.wakeGhost(name: name)
         }

@@ -1,4 +1,4 @@
-export type GhostStatus = 'running' | 'stopped';
+export type GhostStatus = "running" | "stopped";
 
 export interface GhostApiKey {
   id: string;
@@ -12,7 +12,7 @@ export interface GhostImage {
   data: string;
 }
 
-export type GhostStreamingBehavior = 'steer' | 'followUp';
+export type GhostStreamingBehavior = "steer" | "followUp";
 
 export interface GhostQueueState {
   steering: string[];
@@ -21,7 +21,7 @@ export interface GhostQueueState {
 }
 
 export interface GhostQueueEnqueueResponse {
-  status: 'queued';
+  status: "queued";
   pendingCount: number;
 }
 
@@ -32,10 +32,23 @@ export interface GhostQueueClearResponse {
   };
 }
 
+export interface GhostSchedule {
+  id: string;
+  ghostName: string;
+  cron: string;
+  prompt: string;
+  timezone: string;
+  once: boolean;
+  enabled: boolean;
+  createdAt: string;
+  lastFired: string | null;
+  nextFire: string | null;
+}
+
 export interface VaultEntry {
   name: string;
   path: string;
-  type: 'file' | 'directory';
+  type: "file" | "directory";
   size?: number;
   modified?: string;
 }
@@ -68,8 +81,7 @@ export interface GhostboxConfigSensitiveStatus {
   telegramToken: boolean;
 }
 
-export interface GhostboxConfigResponse
-  extends Omit<GhostboxConfig, 'githubToken' | 'telegramToken'> {
+export interface GhostboxConfigResponse extends Omit<GhostboxConfig, "githubToken" | "telegramToken"> {
   githubToken: string;
   telegramToken: string;
   hasSensitive: GhostboxConfigSensitiveStatus;
@@ -97,29 +109,29 @@ export interface GhostboxState {
 }
 
 export type AssistantMessage = {
-  type: 'assistant';
+  type: "assistant";
   text: string;
 };
 
 export type ToolUseMessage = {
-  type: 'tool_use';
+  type: "tool_use";
   tool: string;
   input: unknown;
 };
 
 export type ToolResultMessage = {
-  type: 'tool_result';
+  type: "tool_result";
   output: unknown;
 };
 
 export type ResultMessage = {
-  type: 'result';
+  type: "result";
   text: string;
   sessionId: string;
 };
 
 export type HistoryMessage = {
-  role: 'user' | 'assistant' | 'system' | 'tool_use' | 'tool_result';
+  role: "user" | "assistant" | "system" | "tool_use" | "tool_result";
   text: string;
   toolName?: string;
   timestamp?: string;
@@ -139,6 +151,19 @@ export type HistoryResponse = {
   compactions: CompactionInfo[];
 };
 
+export type SessionInfo = {
+  id: string;
+  name: string | null;
+  path: string;
+  createdAt: string;
+  lastActiveAt: string;
+};
+
+export type SessionListResponse = {
+  current: string;
+  sessions: SessionInfo[];
+};
+
 export type GhostStats = {
   sessionId: string;
   model: string;
@@ -152,16 +177,12 @@ export type GhostStats = {
   } | null;
 };
 
-export type GhostMessage =
-  | AssistantMessage
-  | ToolUseMessage
-  | ToolResultMessage
-  | ResultMessage;
+export type GhostMessage = AssistantMessage | ToolUseMessage | ToolResultMessage | ResultMessage;
 
-export type AuthProvider = 'anthropic' | 'openai-codex';
+export type AuthProvider = "anthropic" | "openai-codex";
 
 export interface OAuthTokenRecord {
-  type: 'oauth';
+  type: "oauth";
   access: string;
   refresh: string;
   expires: number;
