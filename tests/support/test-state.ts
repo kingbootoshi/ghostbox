@@ -43,16 +43,16 @@ export const createState = (overrides: Partial<GhostboxState> = {}): GhostboxSta
   ...overrides
 });
 
-const trashPath = async (path: string): Promise<void> => {
-  const proc = Bun.spawn(["trash", path], {
-    stdout: "ignore",
-    stderr: "pipe"
-  });
+const removeTempDir = async (path: string): Promise<void> => {
+  // Use trash locally for safety, fall back to rm for CI where trash isn't installed
+  const cmd = await Bun.spawn(["which", "trash"], { stdout: "ignore", stderr: "ignore" }).exited === 0
+    ? ["trash", path]
+    : ["rm", "-rf", path];
+  const proc = Bun.spawn(cmd, { stdout: "ignore", stderr: "pipe" });
   const stderr = await new Response(proc.stderr).text();
   const exitCode = await proc.exited;
-
   if (exitCode !== 0) {
-    throw new Error(`Failed to trash ${path}: ${stderr.trim()}`);
+    throw new Error(`Failed to remove ${path}: ${stderr.trim()}`);
   }
 };
 
@@ -97,7 +97,7 @@ export const createTestHome = async (
         process.env.HOME = previousHome;
       }
 
-      await trashPath(homeDir);
+      await removeTempDir(homeDir);
     }
   };
 };
