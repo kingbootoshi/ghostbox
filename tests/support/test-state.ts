@@ -45,9 +45,10 @@ export const createState = (overrides: Partial<GhostboxState> = {}): GhostboxSta
 
 const removeTempDir = async (path: string): Promise<void> => {
   // Use trash locally for safety, fall back to rm for CI where trash isn't installed
-  const cmd = await Bun.spawn(["which", "trash"], { stdout: "ignore", stderr: "ignore" }).exited === 0
-    ? ["trash", path]
-    : ["rm", "-rf", path];
+  const cmd =
+    (await Bun.spawn(["which", "trash"], { stdout: "ignore", stderr: "ignore" }).exited) === 0
+      ? ["trash", path]
+      : ["rm", "-rf", path];
   const proc = Bun.spawn(cmd, { stdout: "ignore", stderr: "pipe" });
   const stderr = await new Response(proc.stderr).text();
   const exitCode = await proc.exited;
