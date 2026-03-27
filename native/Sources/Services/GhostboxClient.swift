@@ -131,13 +131,21 @@ struct ClearQueueResponse: Decodable {
 final class GhostboxClient {
     private static let logger = Logger(subsystem: "com.ghostbox.app", category: "network")
 
-    private let baseURL: URL
+    private static let defaultURL = URL(string: "http://localhost:8008")!
+
+    let baseURL: URL
+    let token: String?
     private let session: URLSession
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
-    init(baseURL: URL = URL(string: "http://localhost:8008")!, session: URLSession? = nil) {
-        self.baseURL = baseURL
+    var isRemote: Bool {
+        baseURL.host != "localhost" && baseURL.host != "127.0.0.1"
+    }
+
+    init(baseURL: URL? = nil, token: String? = nil, session: URLSession? = nil) {
+        self.baseURL = baseURL ?? Self.defaultURL
+        self.token = token
 
         if let session {
             self.session = session
@@ -147,6 +155,14 @@ final class GhostboxClient {
             configuration.timeoutIntervalForResource = 300
             self.session = URLSession(configuration: configuration)
         }
+    }
+
+    static func fromUserDefaults() -> GhostboxClient {
+        let defaults = UserDefaults.standard
+        let urlString = defaults.string(forKey: "serverURL") ?? ""
+        let token = defaults.string(forKey: "serverToken") ?? ""
+        let url = urlString.isEmpty ? nil : URL(string: urlString)
+        return GhostboxClient(baseURL: url, token: token.isEmpty ? nil : token)
     }
 
     func listGhosts() async throws -> [Ghost] {
@@ -481,6 +497,9 @@ final class GhostboxClient {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         request.httpBody = body
         return request
     }

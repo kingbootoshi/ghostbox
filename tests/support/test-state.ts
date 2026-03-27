@@ -8,6 +8,7 @@ export const createConfig = (overrides: Partial<GhostboxConfig> = {}): GhostboxC
   telegramToken: "telegram-token-1234567890",
   githubToken: "github-token-1234567890",
   githubRemote: "https://github.com/example/repo.git",
+  adminToken: "test-admin-token",
   defaultModel: "anthropic/claude-sonnet-4-6",
   defaultProvider: "anthropic",
   imageName: "ghostbox-agent",

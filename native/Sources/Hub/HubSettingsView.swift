@@ -89,6 +89,9 @@ struct HubSettingsView: View {
     let onRetry: () -> Void
     let onSave: () -> Void
 
+    @AppStorage("serverURL") private var serverURL = ""
+    @AppStorage("serverToken") private var serverToken = ""
+
     var body: some View {
         settingsContent
     }
@@ -150,6 +153,20 @@ struct HubSettingsView: View {
 
     var settingsForm: some View {
         VStack(alignment: .leading, spacing: 18) {
+            HubSettingsSection(title: "Connection") {
+                HubFieldLabel("Server URL")
+                HubTextField("http://localhost:8008", text: $serverURL)
+                Text("Leave empty for localhost. Restart app after changing.")
+                    .font(Theme.Typography.caption())
+                    .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+
+                HubFieldLabel("API Token")
+                HubSecureField("Not set", text: $serverToken)
+                Text("Required for remote servers. Get from ghostbox admin token.")
+                    .font(Theme.Typography.caption())
+                    .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+            }
+
             HubSettingsSection(title: "General") {
                 HubFieldLabel("Default Provider")
                 Picker("", selection: $settingsDraft.defaultProvider) {

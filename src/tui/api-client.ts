@@ -1,6 +1,7 @@
 import type { GhostMessage, GhostState, GhostStats, HistoryResponse, SessionListResponse } from "../types";
+import { readRemoteConfig } from "../remote-config";
 
-const API_BASE_URL = process.env.GHOSTBOX_API_URL?.trim() || "http://localhost:8008";
+const DEFAULT_API_BASE_URL = "http://localhost:8008";
 
 type ApiErrorPayload = {
   error?: unknown;
@@ -11,8 +12,31 @@ type SseEvent = {
   data: string;
 };
 
-const buildUrl = (path: string): string => {
-  return `${API_BASE_URL}${path}`;
+const readEnvValue = (value: string | undefined): string | null => {
+  const trimmed = value?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : null;
+};
+
+const getApiConfig = async (): Promise<{ baseUrl: string; token: string | null }> => {
+  const remoteConfig = await readRemoteConfig();
+
+  return {
+    baseUrl: readEnvValue(process.env.GHOSTBOX_API_URL) ?? remoteConfig?.url ?? DEFAULT_API_BASE_URL,
+    token: readEnvValue(process.env.GHOSTBOX_API_TOKEN) ?? remoteConfig?.token ?? null
+  };
+};
+
+const buildUrl = (baseUrl: string, path: string): string => {
+  return `${baseUrl}${path}`;
+};
+
+const buildHeaders = (headers: HeadersInit | undefined, token: string | null): Headers => {
+  const nextHeaders = new Headers(headers);
+  if (token) {
+    nextHeaders.set("Authorization", `Bearer ${token}`);
+  }
+
+  return nextHeaders;
 };
 
 const toError = async (response: Response): Promise<Error> => {
@@ -34,7 +58,11 @@ const toError = async (response: Response): Promise<Error> => {
 };
 
 const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
-  const response = await fetch(buildUrl(path), init);
+  const { baseUrl, token } = await getApiConfig();
+  const response = await fetch(buildUrl(baseUrl, path), {
+    ...init,
+    headers: buildHeaders(init?.headers, token)
+  });
   if (!response.ok) {
     throw await toError(response);
   }
@@ -111,11 +139,15 @@ export const apiClient = {
     prompt: string,
     options?: { model?: string; signal?: AbortSignal }
   ): AsyncGenerator<GhostMessage> {
-    const response = await fetch(buildUrl(`/api/ghosts/${encodeURIComponent(name)}/message`), {
+    const { baseUrl, token } = await getApiConfig();
+    const response = await fetch(buildUrl(baseUrl, `/api/ghosts/${encodeURIComponent(name)}/message`), {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
+      headers: buildHeaders(
+        {
+          "Content-Type": "application/json"
+        },
+        token
+      ),
       body: JSON.stringify({
         prompt,
         ...(options?.model ? { model: options.model } : {})

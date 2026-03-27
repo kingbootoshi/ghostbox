@@ -86,6 +86,8 @@ export interface GhostboxConfig {
   telegramToken: string;
   githubToken: string | null;
   githubRemote: string | null;
+  adminToken?: string;
+  corsOrigins?: string[];
   defaultModel: string;
   defaultProvider: string;
   imageName: string;
@@ -98,7 +100,7 @@ export interface GhostboxConfigSensitiveStatus {
   telegramToken: boolean;
 }
 
-export interface GhostboxConfigResponse extends Omit<GhostboxConfig, "githubToken" | "telegramToken"> {
+export interface GhostboxConfigResponse extends Omit<GhostboxConfig, "githubToken" | "telegramToken" | "adminToken"> {
   githubToken: string;
   telegramToken: string;
   hasSensitive: GhostboxConfigSensitiveStatus;

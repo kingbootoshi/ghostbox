@@ -25,6 +25,7 @@ import {
   upgradeGhosts,
   wakeGhost
 } from "./orchestrator";
+import { clearRemoteConfig, getRemoteConfigPath, readRemoteConfig, updateRemoteConfig } from "./remote-config";
 import { startBot } from "./telegram";
 import type { AuthProvider, GhostApiKey, GhostboxState, GhostState } from "./types";
 import { getHomeDirectory, sleep } from "./utils";
@@ -681,6 +682,10 @@ const printUsage = (): void => {
   log.info("  ghostbox keys <name>                    List API keys");
   log.info("  ghostbox keys generate <name> [label]   Create API key");
   log.info("  ghostbox keys revoke <name> <keyId>     Revoke API key");
+  log.info("  ghostbox remote set <url>               Save remote API URL");
+  log.info("  ghostbox remote token <token>           Save remote API token");
+  log.info("  ghostbox remote status                  Show remote config");
+  log.info("  ghostbox remote clear                   Clear remote config");
   log.info("  ghostbox tui                            Launch terminal UI");
   log.info("  ghostbox serve                          Start web dashboard");
   log.info("  ghostbox bot                            Start Telegram bot");
@@ -1181,6 +1186,60 @@ const logs = async (name: string): Promise<void> => {
   }
 };
 
+const remote = async (args: string[]): Promise<void> => {
+  const subcommand = args[0];
+
+  switch (subcommand) {
+    case "set": {
+      const url = args[1]?.trim();
+      if (!url || args.length !== 2) {
+        throw new Error("Usage: ghostbox remote set <url>");
+      }
+
+      const config = await updateRemoteConfig({ url });
+      log.info(chalk.green(`Saved remote URL to ${getRemoteConfigPath()}.`));
+      console.log(JSON.stringify(config, null, 2));
+      return;
+    }
+    case "token": {
+      const token = args[1]?.trim();
+      if (!token || args.length !== 2) {
+        throw new Error("Usage: ghostbox remote token <token>");
+      }
+
+      const config = await updateRemoteConfig({ token });
+      log.info(chalk.green(`Saved remote token to ${getRemoteConfigPath()}.`));
+      console.log(JSON.stringify(config, null, 2));
+      return;
+    }
+    case "status": {
+      if (args.length !== 1) {
+        throw new Error("Usage: ghostbox remote status");
+      }
+
+      const config = await readRemoteConfig();
+      if (!config) {
+        log.info("No remote config found.");
+        return;
+      }
+
+      console.log(JSON.stringify(config, null, 2));
+      return;
+    }
+    case "clear": {
+      if (args.length !== 1) {
+        throw new Error("Usage: ghostbox remote clear");
+      }
+
+      await clearRemoteConfig();
+      log.info(chalk.green(`Cleared remote config at ${getRemoteConfigPath()}.`));
+      return;
+    }
+    default:
+      throw new Error("Usage: ghostbox remote <set <url>|token <token>|status|clear>");
+  }
+};
+
 const bot = async (): Promise<void> => {
   const state = await loadState();
   log.info("Running bot pre-flight checks");
@@ -1315,6 +1374,9 @@ const main = async (): Promise<void> => {
         break;
       case "keys":
         await keys(args);
+        break;
+      case "remote":
+        await remote(args);
         break;
       case "serve":
         await launchServer();

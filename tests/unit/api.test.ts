@@ -2,15 +2,19 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import app, { ScheduleManager } from "../../src/api";
+import app, { ScheduleManager, ensureApiAdminToken } from "../../src/api";
 import { createConfig, createGhostState, createState, createTestHome } from "../support/test-state";
 
 type TestHome = Awaited<ReturnType<typeof createTestHome>>;
+const TEST_ADMIN_TOKEN = "test-admin-token";
 
 const postJson = (path: string, body: unknown): Promise<Response> => {
   return app.request(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
+      "Content-Type": "application/json"
+    },
     body: JSON.stringify(body)
   });
 };
@@ -18,12 +22,15 @@ const postJson = (path: string, body: unknown): Promise<Response> => {
 const putJson = (path: string, body: unknown): Promise<Response> => {
   return app.request(path, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
+      "Content-Type": "application/json"
+    },
     body: JSON.stringify(body)
   });
 };
 
-const mailHeaders = (token: string, headers: Record<string, string> = {}): Record<string, string> => ({
+const apiHeaders = (token: string, headers: Record<string, string> = {}): Record<string, string> => ({
   Authorization: `Bearer ${token}`,
   ...headers
 });
@@ -31,7 +38,7 @@ const mailHeaders = (token: string, headers: Record<string, string> = {}): Recor
 const postMailJson = (path: string, token: string, body: unknown): Promise<Response> => {
   return app.request(path, {
     method: "POST",
-    headers: mailHeaders(token, { "Content-Type": "application/json" }),
+    headers: apiHeaders(token, { "Content-Type": "application/json" }),
     body: JSON.stringify(body)
   });
 };
@@ -39,24 +46,51 @@ const postMailJson = (path: string, token: string, body: unknown): Promise<Respo
 const deleteWithMailAuth = (path: string, token: string): Promise<Response> => {
   return app.request(path, {
     method: "DELETE",
-    headers: mailHeaders(token)
+    headers: apiHeaders(token)
   });
 };
 
 const getWithMailAuth = (path: string, token: string): Promise<Response> => {
   return app.request(path, {
-    headers: mailHeaders(token)
+    headers: apiHeaders(token)
   });
 };
 
 describe("api route validation", () => {
   let testHome: TestHome;
+  let previousAdminTokenEnv: string | undefined;
+  let previousMailUserTokenEnv: string | undefined;
+  let previousCorsOriginsEnv: string | undefined;
 
   beforeEach(async () => {
+    previousAdminTokenEnv = process.env.GHOSTBOX_ADMIN_TOKEN;
+    previousMailUserTokenEnv = process.env.GHOSTBOX_MAIL_USER_TOKEN;
+    previousCorsOriginsEnv = process.env.GHOSTBOX_CORS_ORIGINS;
+    delete process.env.GHOSTBOX_ADMIN_TOKEN;
+    delete process.env.GHOSTBOX_MAIL_USER_TOKEN;
+    delete process.env.GHOSTBOX_CORS_ORIGINS;
     testHome = await createTestHome();
   });
 
   afterEach(async () => {
+    if (previousAdminTokenEnv === undefined) {
+      delete process.env.GHOSTBOX_ADMIN_TOKEN;
+    } else {
+      process.env.GHOSTBOX_ADMIN_TOKEN = previousAdminTokenEnv;
+    }
+
+    if (previousMailUserTokenEnv === undefined) {
+      delete process.env.GHOSTBOX_MAIL_USER_TOKEN;
+    } else {
+      process.env.GHOSTBOX_MAIL_USER_TOKEN = previousMailUserTokenEnv;
+    }
+
+    if (previousCorsOriginsEnv === undefined) {
+      delete process.env.GHOSTBOX_CORS_ORIGINS;
+    } else {
+      process.env.GHOSTBOX_CORS_ORIGINS = previousCorsOriginsEnv;
+    }
+
     await testHome.cleanup();
   });
 
@@ -70,7 +104,9 @@ describe("api route validation", () => {
       })
     );
 
-    const response = await app.request("/api/config");
+    const response = await app.request("/api/config", {
+      headers: apiHeaders(TEST_ADMIN_TOKEN)
+    });
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
@@ -134,7 +170,7 @@ describe("api route validation", () => {
   test("PUT /api/config rejects invalid JSON bodies", async () => {
     const response = await app.request("/api/config", {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: apiHeaders(TEST_ADMIN_TOKEN, { "Content-Type": "application/json" }),
       body: "{"
     });
 
@@ -142,6 +178,74 @@ describe("api route validation", () => {
     expect(await response.json()).toEqual({
       error: expect.stringContaining("Invalid JSON body")
     });
+  });
+
+  test("GET /api/health bypasses auth and returns ok", async () => {
+    const response = await app.request("/api/health");
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: "ok" });
+  });
+
+  test("non-mail API routes require bearer auth", async () => {
+    const unauthorizedResponse = await app.request("/api/config");
+    expect(unauthorizedResponse.status).toBe(401);
+    expect(await unauthorizedResponse.json()).toEqual({ error: "Unauthorized" });
+
+    const authorizedResponse = await app.request("/api/config", {
+      headers: apiHeaders(TEST_ADMIN_TOKEN)
+    });
+    expect(authorizedResponse.status).toBe(200);
+  });
+
+  test("ensureApiAdminToken generates and persists a token when config is missing one", async () => {
+    await testHome.writeState(
+      createState({
+        config: createConfig({
+          adminToken: undefined
+        })
+      })
+    );
+
+    const adminToken = await ensureApiAdminToken();
+    const savedState = JSON.parse(await Bun.file(testHome.statePath).text());
+
+    expect(adminToken).toMatch(/^[a-f0-9]{64}$/);
+    expect(savedState.config.adminToken).toBe(adminToken);
+  });
+
+  test("CORS allows configured origins and blocks unknown ones", async () => {
+    await testHome.writeState(
+      createState({
+        config: createConfig({
+          corsOrigins: ["https://app.example"]
+        })
+      })
+    );
+
+    const allowedResponse = await app.request("/api/health", {
+      headers: { Origin: "https://app.example" }
+    });
+    expect(allowedResponse.headers.get("Access-Control-Allow-Origin")).toBe("https://app.example");
+
+    const blockedResponse = await app.request("/api/health", {
+      headers: { Origin: "https://blocked.example" }
+    });
+    expect(blockedResponse.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  test("CORS merges env origins with default localhost allowlist", async () => {
+    process.env.GHOSTBOX_CORS_ORIGINS = "https://env.example";
+
+    const localhostResponse = await app.request("/api/health", {
+      headers: { Origin: "http://localhost:3000" }
+    });
+    expect(localhostResponse.headers.get("Access-Control-Allow-Origin")).toBe("http://localhost:3000");
+
+    const envResponse = await app.request("/api/health", {
+      headers: { Origin: "https://env.example" }
+    });
+    expect(envResponse.headers.get("Access-Control-Allow-Origin")).toBe("https://env.example");
   });
 
   test("POST /api/ghosts rejects requests with a missing name", async () => {
@@ -196,7 +300,9 @@ describe("api route validation", () => {
       })
     );
 
-    const response = await app.request("/api/ghosts/demo/vault/read?path=../../secret.txt");
+    const response = await app.request("/api/ghosts/demo/vault/read?path=../../secret.txt", {
+      headers: apiHeaders(TEST_ADMIN_TOKEN)
+    });
 
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: "Invalid path" });
@@ -213,7 +319,9 @@ describe("api route validation", () => {
     await testHome.createVaultFile("demo", "notes/todo.md", "todo");
     await testHome.createVaultFile("demo", "README.md", "hello");
 
-    const response = await app.request("/api/ghosts/demo/vault");
+    const response = await app.request("/api/ghosts/demo/vault", {
+      headers: apiHeaders(TEST_ADMIN_TOKEN)
+    });
     const payload = await response.json();
 
     expect(response.status).toBe(200);
@@ -241,7 +349,9 @@ describe("api route validation", () => {
     );
     await testHome.createVaultFile("demo", "notes/todo.md", "remember this");
 
-    const response = await app.request("/api/ghosts/demo/vault/read?path=/notes/todo.md");
+    const response = await app.request("/api/ghosts/demo/vault/read?path=/notes/todo.md", {
+      headers: apiHeaders(TEST_ADMIN_TOKEN)
+    });
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
@@ -281,7 +391,9 @@ describe("api route validation", () => {
     expect(createdSchedule.id).toEqual(expect.any(String));
     expect(createdSchedule.nextFire).toEqual(expect.any(String));
 
-    const listResponse = await app.request("/api/ghosts/demo/schedules");
+    const listResponse = await app.request("/api/ghosts/demo/schedules", {
+      headers: apiHeaders(TEST_ADMIN_TOKEN)
+    });
     expect(listResponse.status).toBe(200);
     expect(await listResponse.json()).toEqual([createdSchedule]);
 
@@ -289,12 +401,15 @@ describe("api route validation", () => {
     expect(JSON.parse(await readFile(schedulesPath, "utf8"))).toEqual([createdSchedule]);
 
     const deleteResponse = await app.request(`/api/ghosts/demo/schedules/${createdSchedule.id}`, {
-      method: "DELETE"
+      method: "DELETE",
+      headers: apiHeaders(TEST_ADMIN_TOKEN)
     });
     expect(deleteResponse.status).toBe(200);
     expect(await deleteResponse.json()).toEqual({ status: "deleted" });
 
-    const finalListResponse = await app.request("/api/ghosts/demo/schedules");
+    const finalListResponse = await app.request("/api/ghosts/demo/schedules", {
+      headers: apiHeaders(TEST_ADMIN_TOKEN)
+    });
     expect(finalListResponse.status).toBe(200);
     expect(await finalListResponse.json()).toEqual([]);
   });

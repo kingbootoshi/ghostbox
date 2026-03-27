@@ -5,7 +5,7 @@ import UserNotifications
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    let client = GhostboxClient()
+    let client = GhostboxClient.fromUserDefaults()
 
     private lazy var appState = AppState(client: client)
     private var hubPanelController: HubPanelController?
@@ -56,6 +56,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func ensureServerRunning() async {
         if await client.healthCheck() {
             appState.serverStatus = nil
+            return
+        }
+
+        if client.isRemote {
+            appState.serverStatus = "Remote server unreachable"
             return
         }
 

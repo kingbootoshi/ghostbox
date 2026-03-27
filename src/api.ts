@@ -1,5 +1,5 @@
 import { spawn as nodeSpawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -60,14 +60,14 @@ const DEFAULT_PORT = 8008;
 const port = Number(process.env.GHOSTBOX_PORT) || DEFAULT_PORT;
 const log = createLogger("api");
 
-type MailAuthContext = {
+type ApiAuthContext = {
   authenticatedBy: string;
   ghostName: string | null;
 };
 
 const app = new Hono<{
   Variables: {
-    mailAuth: MailAuthContext;
+    apiAuth: ApiAuthContext;
   };
 }>();
 
@@ -179,14 +179,78 @@ const MAIL_RATE_LIMIT_MAX_MESSAGES = 10;
 const MAIL_SUBJECT_MAX_LENGTH = 200;
 const MAIL_BODY_MAX_LENGTH = 10_000;
 const MAILBOX_MAX_MESSAGES_PER_RECIPIENT = 500;
+const DEFAULT_CORS_ORIGINS = ["http://localhost:8008", "http://localhost:3000"];
 const mailRateLimitState = new Map<string, { count: number; windowStart: number }>();
 
 const getSchedulePath = (): string => resolve(getHomeDirectory(), ".ghostbox", "schedules.json");
 const getMailboxPath = (): string => join(getHomeDirectory(), ".ghostbox", "mailbox.json");
-const getMailUserToken = (): string | null => {
+const getLegacyApiUserToken = (): string | null => {
   const configured =
     process.env.GHOSTBOX_MAIL_USER_TOKEN?.trim() || process.env.GHOSTBOX_ADMIN_TOKEN?.trim() || "";
   return configured || null;
+};
+
+const normalizeConfiguredOrigins = (origins: unknown): string[] => {
+  if (!Array.isArray(origins)) {
+    return [];
+  }
+
+  return Array.from(
+    new Set(
+      origins
+        .filter((origin): origin is string => typeof origin === "string")
+        .map((origin) => origin.trim())
+        .filter((origin) => origin.length > 0)
+    )
+  );
+};
+
+const parseCorsOriginsEnv = (): string[] => {
+  const configured = process.env.GHOSTBOX_CORS_ORIGINS?.trim() || "";
+  if (!configured) {
+    return [];
+  }
+
+  return Array.from(
+    new Set(
+      configured
+        .split(",")
+        .map((origin) => origin.trim())
+        .filter((origin) => origin.length > 0)
+    )
+  );
+};
+
+const resolveAllowedCorsOrigins = (config: GhostboxConfig): string[] => {
+  const configuredOrigins = normalizeConfiguredOrigins(config.corsOrigins);
+  const baseOrigins = configuredOrigins.length > 0 ? configuredOrigins : DEFAULT_CORS_ORIGINS;
+
+  return Array.from(new Set([...baseOrigins, ...parseCorsOriginsEnv()]));
+};
+
+const resolveConfigAdminToken = (config: GhostboxConfig): string | null => {
+  const token = config.adminToken?.trim() || "";
+  return token || null;
+};
+
+export const ensureApiAdminToken = async (): Promise<string> => {
+  const state = await loadState();
+  const existingToken = resolveConfigAdminToken(state.config);
+
+  if (existingToken) {
+    if (state.config.adminToken !== existingToken) {
+      state.config.adminToken = existingToken;
+      await saveState(state);
+    }
+
+    return existingToken;
+  }
+
+  const adminToken = randomBytes(32).toString("hex");
+  state.config.adminToken = adminToken;
+  await saveState(state);
+  log.info({ adminToken }, "Generated API admin token");
+  return adminToken;
 };
 
 const normalizeScheduleTimezone = (value: unknown): string => {
@@ -690,8 +754,10 @@ const toConfigSensitiveStatus = (config: GhostboxConfig): GhostboxConfigSensitiv
 };
 
 const toConfigResponse = (config: GhostboxConfig): GhostboxConfigResponse => {
+  const { adminToken: _adminToken, ...publicConfig } = config;
+
   return {
-    ...config,
+    ...publicConfig,
     githubToken: maskSensitiveConfigValue(config.githubToken),
     telegramToken: maskSensitiveConfigValue(config.telegramToken),
     hasSensitive: toConfigSensitiveStatus(config)
@@ -935,7 +1001,7 @@ const extractBearerToken = (authorizationHeader: string | undefined): string | n
   return token || null;
 };
 
-const authenticateMailToken = async (token: string | null): Promise<MailAuthContext | null> => {
+const authenticateApiToken = async (token: string | null): Promise<ApiAuthContext | null> => {
   if (!token) {
     return null;
   }
@@ -950,7 +1016,14 @@ const authenticateMailToken = async (token: string | null): Promise<MailAuthCont
     };
   }
 
-  if (token === getMailUserToken()) {
+  if (token === resolveConfigAdminToken(state.config)) {
+    return {
+      authenticatedBy: "user",
+      ghostName: null
+    };
+  }
+
+  if (token === getLegacyApiUserToken()) {
     return {
       authenticatedBy: "user",
       ghostName: null
@@ -972,7 +1045,7 @@ const validateMailSize = (subject: string, body: string): void => {
 
 const resolveAuthenticatedMailSender = (
   requestedFrom: unknown,
-  auth: MailAuthContext
+  auth: ApiAuthContext
 ): Pick<MailMessage, "from" | "authenticatedBy"> => {
   const normalizedFrom =
     requestedFrom === undefined
@@ -1164,7 +1237,20 @@ const handleRoute = async (c: Context, handler: () => Promise<Response>): Promis
   }
 };
 
-app.use("/api/*", cors({ origin: "*" }));
+app.use(
+  "/api/*",
+  cors({
+    origin: async (origin) => {
+      if (!origin) {
+        return null;
+      }
+
+      const state = await loadState();
+      const allowedOrigins = resolveAllowedCorsOrigins(state.config);
+      return allowedOrigins.includes(origin) ? origin : null;
+    }
+  })
+);
 
 // Polling endpoints that don't need per-request logging
 const QUIET_ROUTES = new Set(["/api/ghosts", "/api/config", "/api/auth"]);
@@ -1188,22 +1274,24 @@ app.use("/api/*", async (c, next) => {
   }
 });
 
-app.use("/api/mail/*", async (c, next) => {
+app.get("/api/health", (c) => c.json({ status: "ok" }));
+
+app.use("/api/*", async (c, next) => {
   try {
     const token = extractBearerToken(c.req.header("authorization"));
-    const auth = await authenticateMailToken(token);
+    const auth = await authenticateApiToken(token);
 
     if (!auth) {
       return c.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    c.set("mailAuth", auth);
+    c.set("apiAuth", auth);
     await next();
   } catch (error) {
     const status = getErrorStatus(error);
     const message = getErrorMessage(error);
 
-    log.error({ err: error, method: c.req.method, path: c.req.path, status }, "Mail auth failed");
+    log.error({ err: error, method: c.req.method, path: c.req.path, status }, "API auth failed");
 
     return c.json({ error: message }, { status });
   }
@@ -1323,7 +1411,7 @@ app.delete("/api/ghosts/:name/schedules/:id", (c) =>
 app.post("/api/mail/send", (c) =>
   handleRoute(c, async () => {
     const body = await parseJsonBody<MailSendBody>(c);
-    const auth = c.var.mailAuth;
+    const auth = c.var.apiAuth;
     const { from, authenticatedBy } = resolveAuthenticatedMailSender(body.from, auth);
     const to = normalizeMailTextField(body.to, "to");
     const subject = normalizeMailTextField(body.subject, "subject");
@@ -1381,7 +1469,7 @@ app.get("/api/mail/:ghostName", (c) =>
     const mailboxState = await loadMailboxState();
     const ghostName = c.req.param("ghostName");
 
-    if (c.var.mailAuth.ghostName !== ghostName) {
+    if (c.var.apiAuth.ghostName !== ghostName) {
       throw new ApiError(403, "Forbidden");
     }
 
@@ -1409,7 +1497,7 @@ app.post("/api/mail/:id/read", (c) =>
       throw new ApiError(404, `Mail message "${c.req.param("id")}" not found.`);
     }
 
-    if (!canAccessMailMessage(message, c.var.mailAuth.ghostName)) {
+    if (!canAccessMailMessage(message, c.var.apiAuth.ghostName)) {
       throw new ApiError(403, "Forbidden");
     }
 
@@ -1429,7 +1517,7 @@ app.delete("/api/mail/:id", (c) =>
       throw new ApiError(404, `Mail message "${c.req.param("id")}" not found.`);
     }
 
-    if (!canAccessMailMessage(message, c.var.mailAuth.ghostName)) {
+    if (!canAccessMailMessage(message, c.var.apiAuth.ghostName)) {
       throw new ApiError(403, "Forbidden");
     }
 
@@ -1822,6 +1910,7 @@ const __apiDirname = dirname(__apiFilename);
 
 if (import.meta.main || process.argv[1] === __apiFilename) {
   const webDir = resolve(__apiDirname, "..", "web");
+  await ensureApiAdminToken();
 
   const handler = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
