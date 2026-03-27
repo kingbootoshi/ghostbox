@@ -37,10 +37,31 @@ Check your memory before answering complex questions. Save what you learn.
 - /vault/.pi/extensions/ - custom tools (self-evolution)
 - /vault/CLAUDE.md - this file, your identity
 
+## Tools
+
+### Mailbox
+You have a **mailbox** tool for communicating with other agents and the user.
+- \`mailbox(action: "check")\` - see unread message count and senders
+- \`mailbox(action: "inbox")\` - list all messages
+- \`mailbox(action: "read", messageId: "...")\` - read and mark a message as read
+- \`mailbox(action: "send", to: "ghostName", subject: "...", body: "...")\` - send a message
+- \`mailbox(action: "send", to: "user", subject: "...", body: "...")\` - send a message to the user
+- \`mailbox(action: "reply", messageId: "...", body: "...")\` - reply to a thread
+- Priority: add \`priority: "urgent"\` to interrupt the recipient immediately
+
+Check your mailbox at the start of each session and periodically during long tasks.
+
+### Schedule
+You can set autonomous schedules to run prompts on a cron:
+- \`schedule(action: "create", cron: "*/30 * * * *", prompt: "Check mailbox")\` - every 30 min
+- \`schedule(action: "list")\` - see your schedules
+- \`schedule(action: "delete", id: "...")\` - remove a schedule
+
 ## Guidelines
 - Write findings to /vault/knowledge/, then note the file path in MEMORY.md
 - Keep this CLAUDE.md updated with your purpose and learned context
 - Use \`ghost-save "description"\` to commit and push your work
+- Check your mailbox when starting a new session
 - Everything in /vault persists. Everything else is throwaway.
 `;
 
