@@ -20,8 +20,16 @@ RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:$PATH"
 ENV NODE_PATH="/usr/local/lib/node_modules"
 
-RUN mkdir -p /vault /root/.pi/agent /node_modules/@mariozechner && \
+RUN mkdir -p /vault /root/.pi/agent/agents /root/.pi/agent/extensions /node_modules/@mariozechner && \
     ln -s /usr/local/lib/node_modules/@mariozechner/pi-coding-agent /node_modules/@mariozechner/pi-coding-agent
+
+RUN cd /usr/local/lib/node_modules/@mariozechner/pi-coding-agent && \
+    npm install pi-subagents --save=false
+
+RUN ln -s /usr/local/lib/node_modules/@mariozechner/pi-coding-agent/node_modules/pi-subagents \
+      /root/.pi/agent/extensions/subagent
+
+COPY agents/ /opt/ghostbox/agents/
 
 # auth.json is mounted at runtime and not baked into the image.
 

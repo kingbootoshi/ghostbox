@@ -22,4 +22,16 @@ install_dependencies() {
 install_dependencies /vault/package.json /vault "vault"
 install_dependencies /vault/.pi/extensions/package.json /vault/.pi/extensions "extension"
 
+# Copy base agent templates into mounted pi-agent dir (won't overwrite user customizations)
+if [ -d /opt/ghostbox/agents ]; then
+  mkdir -p /root/.pi/agent/agents
+  for f in /opt/ghostbox/agents/*.md; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f")"
+    if [ ! -f "/root/.pi/agent/agents/$base" ]; then
+      cp "$f" "/root/.pi/agent/agents/$base"
+    fi
+  done
+fi
+
 exec node /ghost-server.js
