@@ -22,6 +22,8 @@ import type {
   GhostSchedule,
   GhostStreamingBehavior,
   HistoryMessage,
+  MailMessage,
+  MailboxState,
   SessionInfo,
   SessionListResponse
 } from "./types";
@@ -105,6 +107,17 @@ type ScheduleToolParams = {
 
 type ScheduleCreateInput = Pick<ScheduleToolParams, "cron" | "prompt" | "once" | "timezone">;
 
+type MailboxToolParams = {
+  action: "check" | "inbox" | "read" | "send" | "reply";
+  to?: string;
+  subject?: string;
+  body?: string;
+  messageId?: string;
+  priority?: "normal" | "urgent";
+};
+
+type MailSendInput = Pick<MailboxToolParams, "to" | "subject" | "body" | "priority">;
+
 const scheduleToolSchema = {
   type: "object",
   additionalProperties: false,
@@ -133,6 +146,41 @@ const scheduleToolSchema = {
     timezone: {
       type: "string",
       description: "IANA timezone like America/Los_Angeles. Defaults to the host timezone."
+    }
+  },
+  required: ["action"]
+};
+
+const mailboxToolSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    action: {
+      type: "string",
+      enum: ["check", "inbox", "read", "send", "reply"],
+      description: "Whether to check unread mail, list the inbox, read a message, send a message, or reply to a message."
+    },
+    to: {
+      type: "string",
+      description: "Recipient ghost name or 'user'. Required when action is send."
+    },
+    subject: {
+      type: "string",
+      description: "Message subject. Required when action is send."
+    },
+    body: {
+      type: "string",
+      description: "Message body. Required when action is send or reply."
+    },
+    messageId: {
+      type: "string",
+      description: "Message id to read or reply to. Required when action is read or reply."
+    },
+    priority: {
+      type: "string",
+      enum: ["normal", "urgent"],
+      description: "Message priority. Optional and defaults to normal.",
+      default: "normal"
     }
   },
   required: ["action"]
@@ -838,6 +886,37 @@ const requestHostSchedules = async (
   return JSON.parse(text) as unknown;
 };
 
+const getMailboxHostUrl = (path: string): string => `http://host.docker.internal:${hostApiPort}${path}`;
+
+const requestHostMailbox = async (method: "GET" | "POST", path: string, body?: unknown): Promise<unknown> => {
+  const response = await fetch(getMailboxHostUrl(path), {
+    method,
+    headers: {
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      ...(ghostApiKey ? { Authorization: `Bearer ${ghostApiKey}` } : {})
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) })
+  });
+
+  if (!response.ok) {
+    let message = `Mailbox request failed with status ${response.status}.`;
+    try {
+      const payload = (await response.json()) as { error?: unknown };
+      if (typeof payload.error === "string" && payload.error.length > 0) {
+        message = payload.error;
+      }
+    } catch {}
+    throw new Error(message);
+  }
+
+  const text = await response.text();
+  if (!text.trim()) {
+    return null;
+  }
+
+  return JSON.parse(text) as unknown;
+};
+
 const parseJsonRequestBody = async <T>(req: IncomingMessage): Promise<T> => {
   const body = await getRequestBody(req);
   if (!body.trim()) {
@@ -884,6 +963,49 @@ const formatScheduleList = (schedules: GhostSchedule[]): string => {
   return schedules.map(formatScheduleSummary).join("\n\n");
 };
 
+const formatMailboxSummary = (message: MailMessage): string =>
+  [
+    `id: ${message.id}`,
+    `from: ${message.from}`,
+    `to: ${message.to}`,
+    `subject: ${message.subject}`,
+    `sent: ${message.sentAt}`,
+    `read: ${message.readAt ?? "unread"}`,
+    `priority: ${message.priority}`
+  ].join("\n");
+
+const formatMailboxList = (messages: MailMessage[]): string => {
+  if (messages.length === 0) {
+    return "No messages found.";
+  }
+
+  return messages.map(formatMailboxSummary).join("\n\n");
+};
+
+const formatMailboxUnreadSummary = (messages: MailMessage[]): string => {
+  const header = `${messages.length} unread message${messages.length === 1 ? "" : "s"}.`;
+  if (messages.length === 0) {
+    return header;
+  }
+
+  const lines = messages.map((message) => `- ${message.from}: ${message.subject}`);
+  return [header, ...lines].join("\n");
+};
+
+const formatMailboxMessage = (message: MailMessage): string =>
+  [
+    `id: ${message.id}`,
+    `from: ${message.from}`,
+    `to: ${message.to}`,
+    `subject: ${message.subject}`,
+    `sent: ${message.sentAt}`,
+    `read: ${message.readAt ?? "unread"}`,
+    `priority: ${message.priority}`,
+    `thread: ${message.threadId ?? message.id}`,
+    "",
+    message.body
+  ].join("\n");
+
 const defaultHeartbeatPrompt =
   "Heartbeat check. Review your memory, check if there's anything you should follow up on or proactively do for the user.";
 
@@ -903,6 +1025,94 @@ const createHostSchedule = async (input: ScheduleCreateInput): Promise<GhostSche
 
 const deleteHostSchedule = async (id: string): Promise<unknown> =>
   requestHostSchedules("DELETE", `/schedules/${encodeURIComponent(id)}`);
+
+const isMailMessage = (value: unknown): value is MailMessage => {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  return (
+    typeof value.id === "string" &&
+    typeof value.from === "string" &&
+    (value.authenticatedBy === null || typeof value.authenticatedBy === "string") &&
+    typeof value.to === "string" &&
+    typeof value.subject === "string" &&
+    typeof value.body === "string" &&
+    typeof value.sentAt === "string" &&
+    (value.readAt === null || typeof value.readAt === "string") &&
+    (value.threadId === null || typeof value.threadId === "string") &&
+    (value.priority === "normal" || value.priority === "urgent")
+  );
+};
+
+const isMailboxState = (value: unknown): value is MailboxState => {
+  return isRecord(value) && Array.isArray(value.messages) && value.messages.every(isMailMessage);
+};
+
+const extractMailboxMessages = (payload: unknown): MailMessage[] => {
+  if (Array.isArray(payload) && payload.every(isMailMessage)) {
+    return payload;
+  }
+
+  if (isMailboxState(payload)) {
+    return payload.messages;
+  }
+
+  throw new Error("Mailbox response was not in the expected format.");
+};
+
+const extractMailboxMessage = (payload: unknown): MailMessage => {
+  if (isMailMessage(payload)) {
+    return payload;
+  }
+
+  throw new Error("Mailbox message response was not in the expected format.");
+};
+
+const listMailboxMessages = async (options?: { unread?: boolean }): Promise<MailMessage[]> => {
+  if (!ghostName) {
+    throw new Error("GHOSTBOX_GHOST_NAME is not configured.");
+  }
+
+  const suffix = options?.unread ? "?unread=true" : "";
+  const data = await requestHostMailbox("GET", `/api/mail/${encodeURIComponent(ghostName)}${suffix}`);
+  return extractMailboxMessages(data);
+};
+
+const getMailboxMessage = async (messageId: string): Promise<MailMessage> => {
+  const messages = await listMailboxMessages();
+  const message = messages.find((entry) => entry.id === messageId);
+
+  if (!message) {
+    throw new Error(`Mailbox message "${messageId}" not found.`);
+  }
+
+  return extractMailboxMessage(message);
+};
+
+const markMailboxMessageRead = async (messageId: string): Promise<unknown> =>
+  requestHostMailbox("POST", `/api/mail/${encodeURIComponent(messageId)}/read`);
+
+const sendMailboxMessage = async (input: {
+  to: string;
+  subject: string;
+  body: string;
+  priority: "normal" | "urgent";
+  threadId?: string;
+}): Promise<unknown> => {
+  if (!ghostName) {
+    throw new Error("GHOSTBOX_GHOST_NAME is not configured.");
+  }
+
+  return requestHostMailbox("POST", "/api/mail/send", {
+    from: ghostName,
+    to: input.to,
+    subject: input.subject,
+    body: input.body,
+    priority: input.priority,
+    ...(input.threadId ? { threadId: input.threadId } : {})
+  });
+};
 
 const requireScheduleCreateInput = (
   input: ScheduleCreateInput
@@ -936,6 +1146,50 @@ const requireScheduleId = (id: string | undefined): string => {
   return id;
 };
 
+const requireMailboxSendInput = (
+  input: MailSendInput
+): {
+  to: string;
+  subject: string;
+  body: string;
+  priority: "normal" | "urgent";
+} => {
+  if (typeof input.to !== "string" || input.to.trim().length === 0) {
+    throw new Error("to is required when action is send.");
+  }
+
+  if (typeof input.subject !== "string" || input.subject.trim().length === 0) {
+    throw new Error("subject is required when action is send.");
+  }
+
+  if (typeof input.body !== "string" || input.body.trim().length === 0) {
+    throw new Error("body is required when action is send.");
+  }
+
+  return {
+    to: input.to,
+    subject: input.subject,
+    body: input.body,
+    priority: input.priority ?? "normal"
+  };
+};
+
+const requireMailboxMessageId = (messageId: string | undefined, action: "read" | "reply"): string => {
+  if (typeof messageId !== "string" || messageId.trim().length === 0) {
+    throw new Error(`messageId is required when action is ${action}.`);
+  }
+
+  return messageId;
+};
+
+const requireMailboxReplyBody = (body: string | undefined): string => {
+  if (typeof body !== "string" || body.trim().length === 0) {
+    throw new Error("body is required when action is reply.");
+  }
+
+  return body;
+};
+
 const listScheduleOperation = async (): Promise<{ data: GhostSchedule[]; text: string }> => {
   const data = await listHostSchedules();
   return { data, text: formatScheduleList(data) };
@@ -965,6 +1219,67 @@ const deleteScheduleOperation = async (
     data,
     id: scheduleId,
     text: `Deleted schedule ${scheduleId}.`
+  };
+};
+
+const checkMailboxOperation = async (): Promise<{ data: MailMessage[]; text: string }> => {
+  const data = await listMailboxMessages({ unread: true });
+  return { data, text: formatMailboxUnreadSummary(data) };
+};
+
+const inboxMailboxOperation = async (): Promise<{ data: MailMessage[]; text: string }> => {
+  const data = await listMailboxMessages();
+  return { data, text: formatMailboxList(data) };
+};
+
+const readMailboxOperation = async (
+  messageId: string | undefined
+): Promise<{
+  data: MailMessage;
+  text: string;
+}> => {
+  const id = requireMailboxMessageId(messageId, "read");
+  await markMailboxMessageRead(id);
+  const data = await getMailboxMessage(id);
+  return { data, text: formatMailboxMessage(data) };
+};
+
+const sendMailboxOperation = async (
+  input: MailSendInput
+): Promise<{
+  data: unknown;
+  text: string;
+}> => {
+  const validated = requireMailboxSendInput(input);
+  const data = await sendMailboxMessage(validated);
+  return {
+    data,
+    text: `Sent message to ${validated.to}: ${validated.subject}`
+  };
+};
+
+const replyMailboxOperation = async (
+  messageId: string | undefined,
+  body: string | undefined,
+  priority?: "normal" | "urgent"
+): Promise<{
+  data: unknown;
+  text: string;
+}> => {
+  const id = requireMailboxMessageId(messageId, "reply");
+  const replyBody = requireMailboxReplyBody(body);
+  const original = await getMailboxMessage(id);
+  const data = await sendMailboxMessage({
+    to: original.from,
+    subject: original.subject,
+    body: replyBody,
+    priority: priority ?? "normal",
+    threadId: original.threadId ?? original.id
+  });
+
+  return {
+    data,
+    text: `Replied to ${original.from}: ${original.subject}`
   };
 };
 
@@ -1321,6 +1636,38 @@ const scheduleTool: ToolDefinition<ScheduleToolParams> = {
   }
 };
 
+const mailboxTool: ToolDefinition<MailboxToolParams> = {
+  name: "mailbox",
+  label: "Mailbox",
+  description:
+    "Send and receive messages to/from other ghosts and the user. Use this to communicate with other agents or check for messages.",
+  parameters: mailboxToolSchema,
+  async execute(_toolCallId, params) {
+    if (params.action === "check") {
+      const result = await checkMailboxOperation();
+      return toToolTextResult(result.text, result.data);
+    }
+
+    if (params.action === "inbox") {
+      const result = await inboxMailboxOperation();
+      return toToolTextResult(result.text, result.data);
+    }
+
+    if (params.action === "read") {
+      const result = await readMailboxOperation(params.messageId);
+      return toToolTextResult(result.text, result.data);
+    }
+
+    if (params.action === "send") {
+      const result = await sendMailboxOperation(params);
+      return toToolTextResult(result.text, result.data);
+    }
+
+    const result = await replyMailboxOperation(params.messageId, params.body, params.priority);
+    return toToolTextResult(result.text, result.data);
+  }
+};
+
 const sessionManagerCandidate = SessionManager.continueRecent("/vault");
 let sessionManager = sessionManagerCandidate.getSessionFile()
   ? sessionManagerCandidate
@@ -1350,7 +1697,7 @@ const createManagedSession = async (nextSessionManager: SessionManager): Promise
     authStorage,
     modelRegistry,
     tools: codingTools,
-    customTools: [scheduleTool],
+    customTools: [scheduleTool, mailboxTool],
     resourceLoader
   });
 
@@ -1967,8 +2314,9 @@ const handleSessions = async (res: ServerResponse): Promise<void> => {
   try {
     const sessions = await SessionManager.list("/vault");
     const names = loadSessionNames();
+    const currentId = basename(sessionManager.getSessionFile() ?? "", ".jsonl") || session.sessionId;
     const response = {
-      current: session.sessionId,
+      current: currentId,
       sessions: sessions.map((entry) => {
         const info = toSessionInfo(entry);
         const storedName = names[info.id];

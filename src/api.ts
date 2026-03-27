@@ -2,7 +2,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { dirname, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
@@ -46,6 +46,9 @@ import type {
   GhostboxConfigSensitiveStatus,
   GhostboxConfigUpdate,
   GhostImage,
+  GhostboxState,
+  MailMessage,
+  MailboxState,
   GhostSchedule,
   GhostStreamingBehavior,
   VaultEntry
@@ -56,9 +59,19 @@ import { commitVault, getVaultPath } from "./vault";
 const DEFAULT_PORT = 8008;
 const port = Number(process.env.GHOSTBOX_PORT) || DEFAULT_PORT;
 const log = createLogger("api");
-const app = new Hono();
 
-type ApiStatusCode = 400 | 404 | 409 | 500;
+type MailAuthContext = {
+  authenticatedBy: string;
+  ghostName: string | null;
+};
+
+const app = new Hono<{
+  Variables: {
+    mailAuth: MailAuthContext;
+  };
+}>();
+
+type ApiStatusCode = 400 | 401 | 403 | 404 | 409 | 429 | 500;
 
 class ApiError extends Error {
   status: ApiStatusCode;
@@ -110,6 +123,15 @@ type SessionSwitchBody = {
   sessionId?: unknown;
 };
 
+type MailSendBody = {
+  from?: unknown;
+  to?: unknown;
+  subject?: unknown;
+  body?: unknown;
+  priority?: unknown;
+  threadId?: unknown;
+};
+
 type ScheduleCreateBody = {
   cron?: unknown;
   prompt?: unknown;
@@ -152,8 +174,20 @@ const CRON_FIELD_RANGES: Array<{ name: CronFieldName; min: number; max: number }
 
 const SYSTEM_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 const MAX_CRON_SEARCH_MINUTES = 366 * 24 * 60;
+const MAIL_RATE_LIMIT_WINDOW_MS = 60_000;
+const MAIL_RATE_LIMIT_MAX_MESSAGES = 10;
+const MAIL_SUBJECT_MAX_LENGTH = 200;
+const MAIL_BODY_MAX_LENGTH = 10_000;
+const MAILBOX_MAX_MESSAGES_PER_RECIPIENT = 500;
+const mailRateLimitState = new Map<string, { count: number; windowStart: number }>();
 
 const getSchedulePath = (): string => resolve(getHomeDirectory(), ".ghostbox", "schedules.json");
+const getMailboxPath = (): string => join(getHomeDirectory(), ".ghostbox", "mailbox.json");
+const getMailUserToken = (): string | null => {
+  const configured =
+    process.env.GHOSTBOX_MAIL_USER_TOKEN?.trim() || process.env.GHOSTBOX_ADMIN_TOKEN?.trim() || "";
+  return configured || null;
+};
 
 const normalizeScheduleTimezone = (value: unknown): string => {
   if (value === undefined) {
@@ -755,6 +789,277 @@ const normalizeStreamingBehavior = (value: unknown): GhostStreamingBehavior | un
   throw new ApiError(400, "Invalid streamingBehavior");
 };
 
+const normalizeMailTextField = (value: unknown, field: "from" | "to" | "subject" | "body"): string => {
+  if (typeof value !== "string") {
+    throw new ApiError(400, `Missing ${field}`);
+  }
+
+  if (field === "body") {
+    if (!value.trim()) {
+      throw new ApiError(400, "Missing body");
+    }
+
+    return value;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new ApiError(400, `Missing ${field}`);
+  }
+
+  return trimmed;
+};
+
+const normalizeMailPriority = (value: unknown): "normal" | "urgent" => {
+  if (value === undefined) {
+    return "normal";
+  }
+
+  if (value === "normal" || value === "urgent") {
+    return value;
+  }
+
+  throw new ApiError(400, "Invalid priority");
+};
+
+const normalizeMailThreadId = (value: unknown): string | null => {
+  if (value === undefined) {
+    return null;
+  }
+
+  if (typeof value !== "string") {
+    throw new ApiError(400, "Invalid threadId");
+  }
+
+  const trimmed = value.trim();
+  return trimmed || null;
+};
+
+const normalizeStoredMailMessage = (value: unknown): MailMessage => {
+  if (typeof value !== "object" || value === null) {
+    throw new Error("Mailbox file contains an invalid message");
+  }
+
+  const message = value as Partial<MailMessage>;
+
+  if (
+    typeof message.id !== "string" ||
+    typeof message.from !== "string" ||
+    typeof message.to !== "string" ||
+    typeof message.subject !== "string" ||
+    typeof message.body !== "string" ||
+    typeof message.sentAt !== "string" ||
+    (message.readAt !== null && typeof message.readAt !== "string") ||
+    (message.threadId !== null && typeof message.threadId !== "string") ||
+    (message.priority !== "normal" && message.priority !== "urgent")
+  ) {
+    throw new Error("Mailbox file contains an invalid message");
+  }
+
+  return {
+    id: message.id,
+    from: message.from,
+    authenticatedBy: typeof message.authenticatedBy === "string" ? message.authenticatedBy : null,
+    to: message.to,
+    subject: message.subject,
+    body: message.body,
+    sentAt: message.sentAt,
+    readAt: message.readAt,
+    threadId: message.threadId,
+    priority: message.priority
+  };
+};
+
+const parseMailboxState = (value: unknown): MailboxState => {
+  if (typeof value !== "object" || value === null || !Array.isArray((value as { messages?: unknown }).messages)) {
+    throw new Error("Mailbox file must contain a messages array");
+  }
+
+  return {
+    messages: (value as { messages: unknown[] }).messages.map((message) => normalizeStoredMailMessage(message))
+  };
+};
+
+const pruneMailboxMessagesForRecipient = (messages: MailMessage[], recipient: string): MailMessage[] => {
+  const recipientMessages = messages.filter((message) => message.to === recipient);
+
+  if (recipientMessages.length <= MAILBOX_MAX_MESSAGES_PER_RECIPIENT) {
+    return messages;
+  }
+
+  const overflowCount = recipientMessages.length - MAILBOX_MAX_MESSAGES_PER_RECIPIENT;
+  const oldestFirst = (left: MailMessage, right: MailMessage) => Date.parse(left.sentAt) - Date.parse(right.sentAt);
+  const removableMessages = [
+    ...recipientMessages.filter((message) => message.readAt !== null).sort(oldestFirst),
+    ...recipientMessages.filter((message) => message.readAt === null).sort(oldestFirst)
+  ];
+  const removedIds = new Set(removableMessages.slice(0, overflowCount).map((message) => message.id));
+
+  return messages.filter((message) => !removedIds.has(message.id));
+};
+
+const applyMailboxCaps = (mailboxState: MailboxState): MailboxState => {
+  let messages = mailboxState.messages.map((message) => ({
+    ...message,
+    authenticatedBy: message.authenticatedBy ?? null
+  }));
+
+  for (const recipient of new Set(messages.map((message) => message.to))) {
+    messages = pruneMailboxMessagesForRecipient(messages, recipient);
+  }
+
+  return { messages };
+};
+
+const findGhostNameByApiKey = (state: GhostboxState, token: string): string | null => {
+  for (const [ghostName, ghost] of Object.entries(state.ghosts)) {
+    if (ghost.apiKeys.some((apiKey) => apiKey.key === token)) {
+      return ghostName;
+    }
+  }
+
+  return null;
+};
+
+const extractBearerToken = (authorizationHeader: string | undefined): string | null => {
+  if (!authorizationHeader) {
+    return null;
+  }
+
+  const match = authorizationHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return null;
+  }
+
+  const token = match[1]?.trim();
+  return token || null;
+};
+
+const authenticateMailToken = async (token: string | null): Promise<MailAuthContext | null> => {
+  if (!token) {
+    return null;
+  }
+
+  const state = await loadState();
+  const ghostName = findGhostNameByApiKey(state, token);
+
+  if (ghostName) {
+    return {
+      authenticatedBy: ghostName,
+      ghostName
+    };
+  }
+
+  if (token === getMailUserToken()) {
+    return {
+      authenticatedBy: "user",
+      ghostName: null
+    };
+  }
+
+  return null;
+};
+
+const validateMailSize = (subject: string, body: string): void => {
+  if (subject.length > MAIL_SUBJECT_MAX_LENGTH) {
+    throw new ApiError(400, `Subject exceeds ${MAIL_SUBJECT_MAX_LENGTH} characters`);
+  }
+
+  if (body.length > MAIL_BODY_MAX_LENGTH) {
+    throw new ApiError(400, `Body exceeds ${MAIL_BODY_MAX_LENGTH} characters`);
+  }
+};
+
+const resolveAuthenticatedMailSender = (
+  requestedFrom: unknown,
+  auth: MailAuthContext
+): Pick<MailMessage, "from" | "authenticatedBy"> => {
+  const normalizedFrom =
+    requestedFrom === undefined
+      ? undefined
+      : (() => {
+          if (typeof requestedFrom !== "string") {
+            throw new ApiError(400, "Invalid from");
+          }
+
+          const trimmed = requestedFrom.trim();
+          if (!trimmed) {
+            throw new ApiError(400, "Missing from");
+          }
+
+          return trimmed;
+        })();
+
+  if (normalizedFrom === "user") {
+    return {
+      from: "user",
+      authenticatedBy: auth.authenticatedBy
+    };
+  }
+
+  if (auth.ghostName) {
+    return {
+      from: auth.ghostName,
+      authenticatedBy: auth.authenticatedBy
+    };
+  }
+
+  if (normalizedFrom !== undefined) {
+    throw new ApiError(403, "User token can only send mail from user");
+  }
+
+  return {
+    from: "user",
+    authenticatedBy: auth.authenticatedBy
+  };
+};
+
+const checkMailSendRateLimit = (sender: string): number | null => {
+  const now = Date.now();
+  const current = mailRateLimitState.get(sender);
+
+  if (!current || now - current.windowStart >= MAIL_RATE_LIMIT_WINDOW_MS) {
+    mailRateLimitState.set(sender, { count: 1, windowStart: now });
+    return null;
+  }
+
+  if (current.count >= MAIL_RATE_LIMIT_MAX_MESSAGES) {
+    return Math.max(1, Math.ceil((current.windowStart + MAIL_RATE_LIMIT_WINDOW_MS - now) / 1000));
+  }
+
+  current.count += 1;
+  return null;
+};
+
+const canAccessMailMessage = (message: MailMessage, ghostName: string | null): boolean => {
+  if (!ghostName) {
+    return false;
+  }
+
+  return message.to === ghostName || message.to === "all";
+};
+
+const loadMailboxState = async (): Promise<MailboxState> => {
+  const mailboxFile = Bun.file(getMailboxPath());
+
+  if (!(await mailboxFile.exists())) {
+    return { messages: [] };
+  }
+
+  const contents = await mailboxFile.text();
+  if (!contents.trim()) {
+    return { messages: [] };
+  }
+
+  return parseMailboxState(JSON.parse(contents) as unknown);
+};
+
+const saveMailboxState = async (mailboxState: MailboxState): Promise<void> => {
+  const nextMailboxState = applyMailboxCaps(mailboxState);
+  await mkdir(dirname(getMailboxPath()), { recursive: true });
+  await Bun.write(getMailboxPath(), `${JSON.stringify(nextMailboxState, null, 2)}\n`);
+};
+
 const getErrorStatus = (error: unknown): ApiStatusCode => {
   if (error instanceof ApiError) {
     return error.status;
@@ -883,6 +1188,27 @@ app.use("/api/*", async (c, next) => {
   }
 });
 
+app.use("/api/mail/*", async (c, next) => {
+  try {
+    const token = extractBearerToken(c.req.header("authorization"));
+    const auth = await authenticateMailToken(token);
+
+    if (!auth) {
+      return c.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    c.set("mailAuth", auth);
+    await next();
+  } catch (error) {
+    const status = getErrorStatus(error);
+    const message = getErrorMessage(error);
+
+    log.error({ err: error, method: c.req.method, path: c.req.path, status }, "Mail auth failed");
+
+    return c.json({ error: message }, { status });
+  }
+});
+
 app.get("/api/ghosts", (c) =>
   handleRoute(c, async () => {
     return c.json(await listGhosts());
@@ -990,6 +1316,127 @@ app.post("/api/ghosts/:name/schedules", (c) =>
 app.delete("/api/ghosts/:name/schedules/:id", (c) =>
   handleRoute(c, async () => {
     await scheduleManager.delete(c.req.param("name"), c.req.param("id"));
+    return c.json({ status: "deleted" });
+  })
+);
+
+app.post("/api/mail/send", (c) =>
+  handleRoute(c, async () => {
+    const body = await parseJsonBody<MailSendBody>(c);
+    const auth = c.var.mailAuth;
+    const { from, authenticatedBy } = resolveAuthenticatedMailSender(body.from, auth);
+    const to = normalizeMailTextField(body.to, "to");
+    const subject = normalizeMailTextField(body.subject, "subject");
+    const mailBody = normalizeMailTextField(body.body, "body");
+    const priority = normalizeMailPriority(body.priority);
+    const threadId = normalizeMailThreadId(body.threadId);
+
+    validateMailSize(subject, mailBody);
+
+    const retryAfter = checkMailSendRateLimit(auth.authenticatedBy);
+    if (retryAfter !== null) {
+      return c.json({ error: "Rate limit exceeded", retryAfter }, { status: 429 });
+    }
+
+    const message: MailMessage = {
+      id: randomUUID(),
+      from,
+      authenticatedBy,
+      to,
+      subject,
+      body: mailBody,
+      priority,
+      threadId,
+      sentAt: new Date().toISOString(),
+      readAt: null
+    };
+
+    const mailboxState = await loadMailboxState();
+    mailboxState.messages.push(message);
+    await saveMailboxState(mailboxState);
+
+    if (priority === "urgent") {
+      try {
+        const ghost = await getGhost(to);
+        if (ghost.status === "running") {
+          await steerGhost(
+            to,
+            `You have an urgent message from ${from}. Use mailbox(action: "check") to read it.`
+          );
+        }
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes("not found")) {
+          throw error;
+        }
+      }
+    }
+
+    return c.json({ status: "sent", id: message.id });
+  })
+);
+
+app.get("/api/mail/:ghostName", (c) =>
+  handleRoute(c, async () => {
+    const unreadOnly = c.req.query("unread") === "true";
+    const mailboxState = await loadMailboxState();
+    const ghostName = c.req.param("ghostName");
+
+    if (c.var.mailAuth.ghostName !== ghostName) {
+      throw new ApiError(403, "Forbidden");
+    }
+
+    const messages = mailboxState.messages
+      .filter((message) => message.to === ghostName || message.to === "all")
+      .filter((message) => !unreadOnly || message.readAt === null)
+      .sort((left, right) => {
+        if ((left.readAt === null) !== (right.readAt === null)) {
+          return left.readAt === null ? -1 : 1;
+        }
+
+        return Date.parse(right.sentAt) - Date.parse(left.sentAt);
+      });
+
+    return c.json({ messages });
+  })
+);
+
+app.post("/api/mail/:id/read", (c) =>
+  handleRoute(c, async () => {
+    const mailboxState = await loadMailboxState();
+    const message = mailboxState.messages.find((entry) => entry.id === c.req.param("id"));
+
+    if (!message) {
+      throw new ApiError(404, `Mail message "${c.req.param("id")}" not found.`);
+    }
+
+    if (!canAccessMailMessage(message, c.var.mailAuth.ghostName)) {
+      throw new ApiError(403, "Forbidden");
+    }
+
+    message.readAt = new Date().toISOString();
+    await saveMailboxState(mailboxState);
+
+    return c.json({ status: "read" });
+  })
+);
+
+app.delete("/api/mail/:id", (c) =>
+  handleRoute(c, async () => {
+    const mailboxState = await loadMailboxState();
+    const message = mailboxState.messages.find((entry) => entry.id === c.req.param("id"));
+
+    if (!message) {
+      throw new ApiError(404, `Mail message "${c.req.param("id")}" not found.`);
+    }
+
+    if (!canAccessMailMessage(message, c.var.mailAuth.ghostName)) {
+      throw new ApiError(403, "Forbidden");
+    }
+
+    const nextMessages = mailboxState.messages.filter((message) => message.id !== c.req.param("id"));
+
+    await saveMailboxState({ messages: nextMessages });
+
     return c.json({ status: "deleted" });
   })
 );

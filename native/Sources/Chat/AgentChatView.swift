@@ -118,7 +118,55 @@ struct AgentChatView: View {
                 .transition(.opacity)
                 .zIndex(4)
             }
+
+            if let toastMessage = viewModel.toast ?? viewModel.error {
+                VStack {
+                    HStack {
+                        Spacer()
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(Color.orange.opacity(0.8))
+                                .frame(width: 6, height: 6)
+
+                            Text(toastMessage)
+                                .font(Theme.Typography.label(weight: .medium))
+                                .foregroundColor(Color.white.opacity(Theme.Text.primary))
+                                .lineLimit(2)
+
+                            Button {
+                                viewModel.dismissToast()
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+                                    .frame(width: 18, height: 18)
+                                    .background(Color.white.opacity(0.08))
+                                    .clipShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14)
+                                .fill(Color.white.opacity(0.06))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14)
+                                .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
+                        )
+                        .shadow(color: Color.black.opacity(0.3), radius: 12, y: 4)
+                        .padding(.trailing, 16)
+                        .padding(.top, 80)
+                    }
+                    Spacer()
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+                .zIndex(5)
+            }
         }
+        .animation(.easeInOut(duration: 0.2), value: viewModel.toast)
+        .animation(.easeInOut(duration: 0.2), value: viewModel.error)
         .background(Color.clear)
         .onAppear {
             isInputFocused = true
@@ -258,6 +306,9 @@ struct AgentChatView: View {
             }
             .onChange(of: viewModel.isStreaming) {
                 guard viewModel.isStreaming else { return }
+                scrollToLatest(using: proxy)
+            }
+            .onChange(of: viewModel.sessions?.current) {
                 scrollToLatest(using: proxy)
             }
         }

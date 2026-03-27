@@ -23,6 +23,32 @@ const putJson = (path: string, body: unknown): Promise<Response> => {
   });
 };
 
+const mailHeaders = (token: string, headers: Record<string, string> = {}): Record<string, string> => ({
+  Authorization: `Bearer ${token}`,
+  ...headers
+});
+
+const postMailJson = (path: string, token: string, body: unknown): Promise<Response> => {
+  return app.request(path, {
+    method: "POST",
+    headers: mailHeaders(token, { "Content-Type": "application/json" }),
+    body: JSON.stringify(body)
+  });
+};
+
+const deleteWithMailAuth = (path: string, token: string): Promise<Response> => {
+  return app.request(path, {
+    method: "DELETE",
+    headers: mailHeaders(token)
+  });
+};
+
+const getWithMailAuth = (path: string, token: string): Promise<Response> => {
+  return app.request(path, {
+    headers: mailHeaders(token)
+  });
+};
+
 describe("api route validation", () => {
   let testHome: TestHome;
 
@@ -271,6 +297,298 @@ describe("api route validation", () => {
     const finalListResponse = await app.request("/api/ghosts/demo/schedules");
     expect(finalListResponse.status).toBe(200);
     expect(await finalListResponse.json()).toEqual([]);
+  });
+
+  test("mail routes require bearer auth", async () => {
+    const response = await app.request("/api/mail/demo");
+
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "Unauthorized" });
+  });
+
+  test("mail send binds the sender to the authenticated ghost and records who authenticated it", async () => {
+    await testHome.writeState(
+      createState({
+        ghosts: {
+          binder: createGhostState({
+            apiKeys: [{ id: "alpha-key", key: "alpha-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+          }),
+          recipient: createGhostState({
+            containerId: "container-2",
+            portBase: 3200,
+            apiKeys: [{ id: "beta-key", key: "beta-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+          })
+        }
+      })
+    );
+
+    const response = await postMailJson("/api/mail/send", "alpha-token", {
+      from: "beta",
+      to: "recipient",
+      subject: "Hello",
+      body: "Message body"
+    });
+
+    expect(response.status).toBe(200);
+
+    const mailboxPath = join(testHome.homeDir, ".ghostbox", "mailbox.json");
+    const mailbox = JSON.parse(await readFile(mailboxPath, "utf8"));
+    expect(mailbox.messages).toHaveLength(1);
+    expect(mailbox.messages[0]).toMatchObject({
+      from: "binder",
+      authenticatedBy: "binder",
+      to: "recipient",
+      subject: "Hello",
+      body: "Message body"
+    });
+  });
+
+  test("mail send allows explicit user mail while preserving the authenticated ghost for audit", async () => {
+    await testHome.writeState(
+      createState({
+        ghosts: {
+          userproxy: createGhostState({
+            apiKeys: [{ id: "alpha-key", key: "alpha-user-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+          })
+        }
+      })
+    );
+
+    const response = await postMailJson("/api/mail/send", "alpha-user-token", {
+      from: "user",
+      to: "userproxy",
+      subject: "User note",
+      body: "Sent as user"
+    });
+
+    expect(response.status).toBe(200);
+
+    const mailboxPath = join(testHome.homeDir, ".ghostbox", "mailbox.json");
+    const mailbox = JSON.parse(await readFile(mailboxPath, "utf8"));
+    expect(mailbox.messages[0]).toMatchObject({
+      from: "user",
+      authenticatedBy: "userproxy",
+      to: "userproxy"
+    });
+  });
+
+  test("mail inbox access is limited to the authenticated ghost", async () => {
+    await testHome.writeState(
+      createState({
+        ghosts: {
+          inboxreader: createGhostState({
+            apiKeys: [
+              { id: "alpha-key", key: "alpha-inbox-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }
+            ]
+          }),
+          inboxowner: createGhostState({
+            containerId: "container-2",
+            portBase: 3200,
+            apiKeys: [{ id: "beta-key", key: "beta-inbox-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+          })
+        }
+      })
+    );
+
+    const mailboxPath = join(testHome.homeDir, ".ghostbox", "mailbox.json");
+    await writeFile(
+      mailboxPath,
+      JSON.stringify(
+        {
+          messages: [
+            {
+              id: "message-1",
+              from: "binder",
+              authenticatedBy: "binder",
+              to: "inboxowner",
+              subject: "Private",
+              body: "For inboxowner only",
+              sentAt: "2026-03-25T00:00:00.000Z",
+              readAt: null,
+              threadId: null,
+              priority: "normal"
+            }
+          ]
+        },
+        null,
+        2
+      )
+    );
+
+    const forbiddenResponse = await getWithMailAuth("/api/mail/inboxowner", "alpha-inbox-token");
+    expect(forbiddenResponse.status).toBe(403);
+    expect(await forbiddenResponse.json()).toEqual({ error: "Forbidden" });
+
+    const allowedResponse = await getWithMailAuth("/api/mail/inboxowner", "beta-inbox-token");
+    expect(allowedResponse.status).toBe(200);
+    const allowedPayload = await allowedResponse.json();
+    expect(allowedPayload.messages).toEqual([
+      expect.objectContaining({
+        id: "message-1",
+        to: "inboxowner"
+      })
+    ]);
+  });
+
+  test("mail read and delete only work for the owning inbox", async () => {
+    await testHome.writeState(
+      createState({
+        ghosts: {
+          blockedreader: createGhostState({
+            apiKeys: [{ id: "alpha-key", key: "alpha-read-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+          }),
+          allowedreader: createGhostState({
+            containerId: "container-2",
+            portBase: 3200,
+            apiKeys: [{ id: "beta-key", key: "beta-read-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+          })
+        }
+      })
+    );
+
+    const mailboxPath = join(testHome.homeDir, ".ghostbox", "mailbox.json");
+    await writeFile(
+      mailboxPath,
+      JSON.stringify(
+        {
+          messages: [
+            {
+              id: "message-2",
+              from: "binder",
+              authenticatedBy: "binder",
+              to: "allowedreader",
+              subject: "Private",
+              body: "For allowedreader only",
+              sentAt: "2026-03-25T00:00:00.000Z",
+              readAt: null,
+              threadId: null,
+              priority: "normal"
+            }
+          ]
+        },
+        null,
+        2
+      )
+    );
+
+    const forbiddenRead = await postMailJson("/api/mail/message-2/read", "alpha-read-token", {});
+    expect(forbiddenRead.status).toBe(403);
+
+    const forbiddenDelete = await deleteWithMailAuth("/api/mail/message-2", "alpha-read-token");
+    expect(forbiddenDelete.status).toBe(403);
+
+    const allowedRead = await postMailJson("/api/mail/message-2/read", "beta-read-token", {});
+    expect(allowedRead.status).toBe(200);
+    expect(await allowedRead.json()).toEqual({ status: "read" });
+  });
+
+  test("mail send enforces subject and body size caps", async () => {
+    await testHome.writeState(
+      createState({
+        ghosts: {
+          sizeghost: createGhostState({
+            apiKeys: [{ id: "alpha-key", key: "alpha-size-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+          })
+        }
+      })
+    );
+
+    const response = await postMailJson("/api/mail/send", "alpha-size-token", {
+      to: "sizeghost",
+      subject: "x".repeat(201),
+      body: "Message body"
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "Subject exceeds 200 characters" });
+  });
+
+  test("mail send rate limits each authenticated sender after ten messages per minute", async () => {
+    await testHome.writeState(
+      createState({
+        ghosts: {
+          rateghost: createGhostState({
+            apiKeys: [{ id: "alpha-key", key: "alpha-rate-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+          })
+        }
+      })
+    );
+
+    for (let index = 0; index < 10; index += 1) {
+      const response = await postMailJson("/api/mail/send", "alpha-rate-token", {
+        to: "rateghost",
+        subject: `Message ${index}`,
+        body: "Message body"
+      });
+
+      expect(response.status).toBe(200);
+    }
+
+    const limitedResponse = await postMailJson("/api/mail/send", "alpha-rate-token", {
+      to: "rateghost",
+      subject: "Message 10",
+      body: "Message body"
+    });
+
+    expect(limitedResponse.status).toBe(429);
+    expect(await limitedResponse.json()).toEqual({
+      error: "Rate limit exceeded",
+      retryAfter: expect.any(Number)
+    });
+  });
+
+  test("mailbox saves trim oversized inboxes by removing the oldest read messages first", async () => {
+    await testHome.writeState(
+      createState({
+        ghosts: {
+          capsender: createGhostState({
+            apiKeys: [{ id: "alpha-key", key: "alpha-cap-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+          }),
+          cappedinbox: createGhostState({
+            containerId: "container-2",
+            portBase: 3200,
+            apiKeys: [{ id: "beta-key", key: "beta-cap-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+          })
+        }
+      })
+    );
+
+    const mailboxPath = join(testHome.homeDir, ".ghostbox", "mailbox.json");
+    await writeFile(
+      mailboxPath,
+      JSON.stringify(
+        {
+          messages: Array.from({ length: 500 }, (_, index) => ({
+            id: `message-${index + 1}`,
+            from: "capsender",
+            authenticatedBy: "capsender",
+            to: "cappedinbox",
+            subject: `Subject ${index + 1}`,
+            body: `Body ${index + 1}`,
+            sentAt: `2026-03-25T00:${String(index % 60).padStart(2, "0")}:00.000Z`,
+            readAt: index === 0 ? "2026-03-25T01:00:00.000Z" : null,
+            threadId: null,
+            priority: "normal"
+          }))
+        },
+        null,
+        2
+      )
+    );
+
+    const response = await postMailJson("/api/mail/send", "alpha-cap-token", {
+      to: "cappedinbox",
+      subject: "Newest",
+      body: "Newest body"
+    });
+
+    expect(response.status).toBe(200);
+
+    const mailbox = JSON.parse(await readFile(mailboxPath, "utf8"));
+    const ids = mailbox.messages.map((message: { id: string }) => message.id);
+    expect(ids).toHaveLength(500);
+    expect(ids).not.toContain("message-1");
+    expect(ids).toContain("message-2");
   });
 
   test("ScheduleManager disables one-shot schedules after they fire", async () => {

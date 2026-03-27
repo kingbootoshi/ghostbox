@@ -93,11 +93,7 @@ struct ChatHeaderView: View {
                 .buttonStyle(.plain)
             }
 
-            if let error = viewModel.error {
-                Text(error)
-                    .font(Theme.Typography.label(weight: .regular))
-                    .foregroundColor(Color.orange.opacity(0.9))
-            } else if viewModel.isCreatingSession {
+            if viewModel.isCreatingSession {
                 Text("Starting new session...")
                     .font(Theme.Typography.label(weight: .regular))
                     .foregroundColor(Theme.Colors.accentLight)
@@ -133,35 +129,30 @@ private struct SessionSwitcherRow: View {
             Menu {
                 if let sessions, !sessions.sessions.isEmpty {
                     ForEach(sessions.sessions) { session in
-                        Menu {
-                            if session.id == sessions.current {
-                                Label("Current Session", systemImage: "checkmark")
-                            } else {
-                                Button("Open") {
-                                    onSelect(session.id)
-                                }
-                            }
+                        let isCurrent = session.id == sessions.current
+                            || session.id.contains(sessions.current)
+                            || sessions.current.contains(session.id)
 
-                            if onRename != nil {
-                                Button("Rename...") {
-                                    renameDraft = session.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                                    renamingSession = session
-                                }
-                            }
-
-                            if let onDelete {
-                                Button("Delete", role: .destructive) {
-                                    onDelete(session.id)
-                                }
-                                .disabled(session.id == sessions.current)
+                        Button {
+                            if !isCurrent {
+                                onSelect(session.id)
                             }
                         } label: {
                             HStack {
                                 Text(session.menuLabel)
-                                if session.id == sessions.current {
+                                if isCurrent {
                                     Image(systemName: "checkmark")
                                 }
                             }
+                        }
+                    }
+
+                    Divider()
+
+                    if let currentSession {
+                        Button("Rename Session...") {
+                            renameDraft = currentSession.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                            renamingSession = currentSession
                         }
                     }
                 } else {
@@ -227,15 +218,27 @@ private struct SessionSwitcherRow: View {
 
     private var currentTitle: String {
         if let currentSession {
-            return currentSession.displayLabel
+            let name = currentSession.displayLabel
+            if name != "Session" {
+                return name
+            }
+            return "\(name) - \(currentSession.relativeDate)"
         }
 
-        return "Session"
+        if let sessions, !sessions.current.isEmpty {
+            return "Session"
+        }
+
+        return "Loading..."
     }
 
     private var currentSubtitle: String? {
         guard let currentSession else { return nil }
-        return currentSession.relativeDate
+        let name = currentSession.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !name.isEmpty {
+            return currentSession.relativeDate
+        }
+        return nil
     }
 }
 

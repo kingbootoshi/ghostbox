@@ -65,12 +65,15 @@ final class AgentChatViewModel: ObservableObject {
     @Published private(set) var isCreatingSession = false
     @Published private(set) var ghost: Ghost?
     @Published private(set) var error: String?
+    @Published private(set) var toast: String?
     @Published private(set) var stats: GhostStats?
 
     private let client: GhostboxClient
     private var streamTask: Task<Void, Never>?
     private var activeStreamID: UUID?
     private var lastAbortTime: Date?
+    private var toastDismissTask: Task<Void, Never>?
+    private var errorDismissTask: Task<Void, Never>?
     private var historyDraft = ""
     private var hasLoadedInitialState = false
     private var isPreparingForOpening = false
@@ -107,11 +110,40 @@ final class AgentChatViewModel: ObservableObject {
 
     var currentSession: SessionInfo? {
         guard let sessions else { return nil }
-        return sessions.sessions.first { $0.id == sessions.current }
+        let current = sessions.current
+        return sessions.sessions.first { $0.id == current }
+            ?? sessions.sessions.first { $0.id.contains(current) || current.contains($0.id) }
     }
 
     var isInputDisabled: Bool {
         isWakingGhost || isLoadingHistory || isCompacting || ghost?.status == .stopped
+    }
+
+    func showToast(_ message: String) {
+        toast = message
+        toastDismissTask?.cancel()
+        toastDismissTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            self?.toast = nil
+        }
+    }
+
+    func dismissToast() {
+        toast = nil
+        error = nil
+        toastDismissTask?.cancel()
+        errorDismissTask?.cancel()
+    }
+
+    func showError(_ message: String) {
+        error = message
+        errorDismissTask?.cancel()
+        errorDismissTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled else { return }
+            self?.error = nil
+        }
     }
 
     func send() {
@@ -336,7 +368,7 @@ final class AgentChatViewModel: ObservableObject {
                 hasLoadedInitialState = await reloadConversationState()
                 await loadStats()
             } catch {
-                self.error = error.localizedDescription
+                self.showError(error.localizedDescription)
                 self.messages.append(
                     ChatMessage(role: .system, content: "Error: \(error.localizedDescription)")
                 )
@@ -573,7 +605,7 @@ final class AgentChatViewModel: ObservableObject {
         } catch is CancellationError {
             return
         } catch {
-            self.error = error.localizedDescription
+            self.showError(error.localizedDescription)
             messages.append(
                 ChatMessage(role: .system, content: "Error: \(error.localizedDescription)")
             )
@@ -644,7 +676,7 @@ final class AgentChatViewModel: ObservableObject {
                 return
             }
         } catch {
-            self.error = error.localizedDescription
+            self.showError(error.localizedDescription)
             return
         }
 
@@ -678,7 +710,7 @@ final class AgentChatViewModel: ObservableObject {
             }
             return true
         } catch {
-            self.error = error.localizedDescription
+            self.showError(error.localizedDescription)
             return false
         }
     }
@@ -734,7 +766,7 @@ final class AgentChatViewModel: ObservableObject {
             return true
         } catch {
             if self.error == nil {
-                self.error = error.localizedDescription
+                self.showError(error.localizedDescription)
             }
             return false
         }
@@ -755,7 +787,7 @@ final class AgentChatViewModel: ObservableObject {
                 hasLoadedInitialState = await reloadConversationState()
                 await loadStats()
             } catch {
-                self.error = error.localizedDescription
+                self.showError(error.localizedDescription)
             }
         }
     }
@@ -794,7 +826,7 @@ final class AgentChatViewModel: ObservableObject {
                 }
             } catch {
                 isCreatingSession = false
-                self.error = error.localizedDescription
+                self.showError(error.localizedDescription)
                 hasLoadedInitialState = await reloadConversationState()
                 await loadStats()
             }
@@ -808,14 +840,14 @@ final class AgentChatViewModel: ObservableObject {
                 try await client.renameSession(name: ghostName, sessionId: sessionId, sessionName: name)
                 _ = await loadSessions()
             } catch {
-                self.error = error.localizedDescription
+                self.showToast(error.localizedDescription)
             }
         }
     }
 
     func deleteSession(sessionId: String) {
         guard sessions?.current != sessionId else {
-            error = "Cannot delete the active session"
+            showToast("Cannot delete the active session")
             return
         }
 
@@ -825,7 +857,7 @@ final class AgentChatViewModel: ObservableObject {
                 try await client.deleteSession(name: ghostName, sessionId: sessionId)
                 _ = await loadSessions()
             } catch {
-                self.error = error.localizedDescription
+                self.showToast(error.localizedDescription)
             }
         }
     }
@@ -839,7 +871,7 @@ final class AgentChatViewModel: ObservableObject {
         do {
             ghost = try await client.getGhost(name: ghostName)
         } catch {
-            self.error = error.localizedDescription
+            self.showError(error.localizedDescription)
         }
     }
 
@@ -866,7 +898,7 @@ final class AgentChatViewModel: ObservableObject {
             await loadGhost()
             await loadStats()
         } catch {
-            self.error = error.localizedDescription
+            self.showError(error.localizedDescription)
         }
     }
 

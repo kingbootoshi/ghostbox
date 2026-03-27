@@ -45,6 +45,23 @@ export interface GhostSchedule {
   nextFire: string | null;
 }
 
+export interface MailMessage {
+  id: string;
+  from: string;
+  authenticatedBy: string | null;
+  to: string;
+  subject: string;
+  body: string;
+  sentAt: string;
+  readAt: string | null;
+  threadId: string | null;
+  priority: "normal" | "urgent";
+}
+
+export interface MailboxState {
+  messages: MailMessage[];
+}
+
 export interface VaultEntry {
   name: string;
   path: string;
