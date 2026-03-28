@@ -2043,6 +2043,10 @@ if (import.meta.main || process.argv[1] === __apiFilename) {
           res.end();
         }
       });
+      // Disable request timeout so SSE streams for long-running agent
+      // tool calls (bash polling, file reads) don't get killed at 5 min.
+      s.requestTimeout = 0;
+      s.headersTimeout = 0;
       s.once("error", () => resolve(false));
       s.listen(p, () => {
         server = s;
