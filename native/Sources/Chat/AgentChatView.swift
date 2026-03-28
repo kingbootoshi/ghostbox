@@ -40,6 +40,7 @@ struct AgentChatView: View {
                             inputText: $viewModel.inputText,
                             ghostName: viewModel.ghostName,
                             backgroundTaskCount: viewModel.activeBackgroundTaskCount,
+                            isStreaming: viewModel.isStreaming,
                             isWakingGhost: viewModel.isWakingGhost,
                             isLoadingHistory: viewModel.isLoadingHistory,
                             isCompacting: viewModel.isCompacting,

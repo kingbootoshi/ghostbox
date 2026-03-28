@@ -9,6 +9,7 @@ struct ChatInputView: View {
     @Binding var inputText: String
     let ghostName: String
     let backgroundTaskCount: Int
+    let isStreaming: Bool
     let isWakingGhost: Bool
     let isLoadingHistory: Bool
     let isCompacting: Bool
@@ -96,8 +97,21 @@ struct ChatInputView: View {
                     .font(Theme.Typography.caption())
                     .foregroundColor(Color.white.opacity(0.08))
 
+                Spacer()
+
+                if isStreaming {
+                    HStack(spacing: 4) {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .tint(Theme.Colors.accentLight)
+                        Text("Running")
+                            .font(Theme.Typography.mono(Theme.FontSize.xs))
+                            .foregroundColor(Theme.Colors.accentLight.opacity(0.7))
+                    }
+                    .padding(.trailing, 8)
+                }
+
                 if let tokenFooter = tokenFooterText {
-                    Spacer()
                     Text(tokenFooter)
                         .font(Theme.Typography.mono(Theme.FontSize.xs))
                         .foregroundColor(Color.white.opacity(tokenFooterOpacity))

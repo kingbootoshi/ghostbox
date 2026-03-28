@@ -1,3 +1,4 @@
+import MarkdownUI
 import SwiftUI
 
 struct AgentMessageBlock: View {
@@ -62,7 +63,36 @@ struct AgentMessageBlock: View {
             }
 
             if !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                if let attributed = message.attributedContent {
+                if message.role == .ghost || message.role == .thinking {
+                    Markdown(message.content)
+                        .markdownTheme(.basic)
+                        .markdownTextStyle(\.text) {
+                            FontSize(Theme.FontSize.md)
+                            ForegroundColor(contentColor)
+                        }
+                        .markdownTextStyle(\.strong) {
+                            FontWeight(.semibold)
+                            ForegroundColor(Color.white.opacity(Theme.Text.primary))
+                        }
+                        .markdownTextStyle(\.code) {
+                            FontFamilyVariant(.monospaced)
+                            FontSize(.em(0.92))
+                            ForegroundColor(Color.white.opacity(0.92))
+                            BackgroundColor(Color.white.opacity(0.05))
+                        }
+                        .markdownBlockStyle(\.codeBlock) { configuration in
+                            configuration.label
+                                .padding(12)
+                                .background(Color.white.opacity(0.04))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                                .markdownTextStyle {
+                                    FontFamilyVariant(.monospaced)
+                                    FontSize(.em(0.88))
+                                    ForegroundColor(Color.white.opacity(0.85))
+                                }
+                        }
+                        .textSelection(.enabled)
+                } else if let attributed = message.attributedContent {
                     Text(attributed)
                         .font(Theme.Typography.body())
                         .foregroundColor(contentColor)
