@@ -23,10 +23,25 @@ struct AgentMessageBlock: View {
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Text(Self.formatter.string(from: message.timestamp))
-                .font(Theme.Typography.caption())
-                .foregroundColor(Color.white.opacity(0.1))
-                .padding(.top, 1)
+            HStack(spacing: 8) {
+                Text(Self.formatter.string(from: message.timestamp))
+                    .font(Theme.Typography.caption())
+                    .foregroundColor(Color.white.opacity(0.1))
+
+                if message.role == .ghost {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(message.content, forType: .string)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(Color.white.opacity(0.15))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Copy raw message")
+                }
+            }
+            .padding(.top, 1)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)

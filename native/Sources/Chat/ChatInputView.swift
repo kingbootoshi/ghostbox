@@ -99,12 +99,12 @@ struct ChatInputView: View {
 
                 Spacer()
 
-                if isStreaming {
+                if backgroundTaskCount > 0 {
                     HStack(spacing: 4) {
                         ProgressView()
                             .controlSize(.mini)
                             .tint(Theme.Colors.accentLight)
-                        Text("Running")
+                        Text("\(backgroundTaskCount) bg")
                             .font(Theme.Typography.mono(Theme.FontSize.xs))
                             .foregroundColor(Theme.Colors.accentLight.opacity(0.7))
                     }

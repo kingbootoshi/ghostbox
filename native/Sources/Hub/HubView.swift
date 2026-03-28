@@ -170,27 +170,46 @@ struct HubView: View {
 
             Spacer(minLength: 0)
 
-            Button(action: toggleSettings) {
-                Image(systemName: showsSettings ? "gearshape.fill" : "gearshape")
-                    .font(.system(size: Theme.FontSize.sm, weight: .semibold))
-                    .foregroundColor(showsSettings ? Theme.Colors.accentLightest : Color.white.opacity(0.72))
-                    .frame(width: 30, height: 30)
-                    .background(showsSettings ? Theme.Colors.accent.opacity(0.22) : Color.white.opacity(0.05))
-                    .overlay(
-                        Circle()
-                            .strokeBorder(
-                                showsSettings
-                                    ? Theme.Colors.accentLight.opacity(0.28)
-                                    : Color.white.opacity(0.06),
-                                lineWidth: 0.6
-                            )
-                    )
-                    .clipShape(Circle())
+            HStack(spacing: 8) {
+                Button(action: toggleSettings) {
+                    Image(systemName: showsSettings ? "gearshape.fill" : "gearshape")
+                        .font(.system(size: Theme.FontSize.sm, weight: .semibold))
+                        .foregroundColor(showsSettings ? Theme.Colors.accentLightest : Color.white.opacity(0.72))
+                        .frame(width: 30, height: 30)
+                        .background(showsSettings ? Theme.Colors.accent.opacity(0.22) : Color.white.opacity(0.05))
+                        .overlay(
+                            Circle()
+                                .strokeBorder(
+                                    showsSettings
+                                        ? Theme.Colors.accentLight.opacity(0.28)
+                                        : Color.white.opacity(0.06),
+                                    lineWidth: 0.6
+                                )
+                        )
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    NSApp.keyWindow?.orderOut(nil)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(Color.white.opacity(0.4))
+                        .frame(width: 30, height: 30)
+                        .background(Color.white.opacity(0.05))
+                        .overlay(
+                            Circle()
+                                .strokeBorder(Color.white.opacity(0.06), lineWidth: 0.6)
+                        )
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
         .padding(.horizontal, 20)
         .padding(.top, 22)
+        .background(WindowDragArea())
     }
 
     private var footer: some View {

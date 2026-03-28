@@ -25,7 +25,7 @@ class GlassPanel: NSPanel {
         hasShadow = false
         titleVisibility = .hidden
         titlebarAppearsTransparent = true
-        isMovableByWindowBackground = true
+        isMovableByWindowBackground = false
         animationBehavior = .none
         collectionBehavior = [.fullScreenAuxiliary]
         minSize = NSSize(width: 380, height: 450)
