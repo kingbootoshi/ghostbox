@@ -9,7 +9,8 @@
   "files": [
     "dist/",
     "docker/",
-    "web/"
+    "web/",
+    "base/"
   ],
   "engines": {
     "node": ">=20"

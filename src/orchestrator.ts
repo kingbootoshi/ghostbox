@@ -1,8 +1,9 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { copyFile, mkdir, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import Docker from "dockerode";
 import { createLogger } from "./logger";
 import type {
@@ -29,6 +30,7 @@ const getSharedPiAgentPath = (): string => join(getHomeDirectory(), ".pi", "agen
 const getBasePath = (): string => join(getHomeDirectory(), ".ghostbox", "base");
 const getBaseExtensionsPath = (): string => join(getBasePath(), "extensions");
 const getBaseAgentsPath = (): string => join(getBasePath(), "AGENTS.md");
+const getBundledBaseExtensionsPath = (): string => fileURLToPath(new URL("../base/extensions", import.meta.url));
 
 export const computeImageVersion = (dockerDir: string): string => {
   // Accept both absolute and relative paths
@@ -247,6 +249,20 @@ const writeFileIfMissing = async (path: string, content: string): Promise<void> 
   }
 };
 
+const syncBundledBaseExtensions = async (destinationPath: string): Promise<void> => {
+  const sourcePath = getBundledBaseExtensionsPath();
+  if (!existsSync(sourcePath)) {
+    return;
+  }
+
+  const entries = await readdir(sourcePath, { withFileTypes: true });
+  await Promise.all(
+    entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".ts"))
+      .map((entry) => copyFile(join(sourcePath, entry.name), join(destinationPath, entry.name)))
+  );
+};
+
 export const ensureBaseExtensions = async (): Promise<void> => {
   const basePath = getBasePath();
   const baseExtensionsPath = getBaseExtensionsPath();
@@ -255,6 +271,7 @@ export const ensureBaseExtensions = async (): Promise<void> => {
   await mkdir(baseExtensionsPath, { recursive: true });
 
   await writeFileIfMissing(getBaseAgentsPath(), baseAgentsContent);
+  await syncBundledBaseExtensions(baseExtensionsPath);
 };
 
 const log = createLogger("orchestrator");

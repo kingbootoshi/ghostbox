@@ -8,6 +8,7 @@ private enum ChatInputLayout {
 struct ChatInputView: View {
     @Binding var inputText: String
     let ghostName: String
+    let backgroundTaskCount: Int
     let isWakingGhost: Bool
     let isLoadingHistory: Bool
     let isCompacting: Bool
@@ -43,6 +44,29 @@ struct ChatInputView: View {
                 .overlay {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .strokeBorder(Theme.Colors.accentLight.opacity(0.35), lineWidth: 0.8)
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.horizontal, 18)
+            }
+
+            if backgroundTaskCount > 0 {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(Theme.Colors.accentLight)
+
+                    Text(backgroundTaskBannerText)
+                        .font(Theme.Typography.caption(weight: .medium))
+
+                    Spacer(minLength: 0)
+                }
+                .foregroundColor(Theme.Colors.accentLightest)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Theme.Colors.accent.opacity(0.16))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(Theme.Colors.accentLight.opacity(0.22), lineWidth: 0.6)
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .padding(.horizontal, 18)
@@ -118,6 +142,14 @@ struct ChatInputView: View {
         }
 
         return "Press return to send, shift+return for new line"
+    }
+
+    private var backgroundTaskBannerText: String {
+        if backgroundTaskCount == 1 {
+            return "1 background task running"
+        }
+
+        return "\(backgroundTaskCount) background tasks running"
     }
 
     private var tokenFooterText: String? {

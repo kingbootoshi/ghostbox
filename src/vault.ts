@@ -57,6 +57,13 @@ You can set autonomous schedules to run prompts on a cron:
 - \`schedule(action: "list")\` - see your schedules
 - \`schedule(action: "delete", id: "...")\` - remove a schedule
 
+### Background Bash
+You can run long bash commands without blocking the conversation:
+- \`background_bash(command: "curl -s ...", label: "Optional label")\` - start a background bash task and get an id immediately
+- \`background_status()\` - list running tasks and recently completed ones
+
+When a background task finishes, its output is sent back into your next turn automatically.
+
 ## Guidelines
 - Write findings to /vault/knowledge/, then note the file path in MEMORY.md
 - Keep this CLAUDE.md updated with your purpose and learned context

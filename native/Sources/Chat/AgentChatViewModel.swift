@@ -26,6 +26,11 @@ struct QueuedChatMessage {
     let isAlreadyDisplayed: Bool
 }
 
+struct ActiveBackgroundTask: Identifiable, Hashable {
+    let id: String
+    let label: String
+}
+
 @MainActor
 final class AgentChatViewModel: ObservableObject {
     let ghostName: String
@@ -33,11 +38,13 @@ final class AgentChatViewModel: ObservableObject {
     @Published var messages: [ChatMessage] = [] {
         didSet {
             messagesVersion &+= 1
+            rebuildActiveBackgroundTasks()
         }
     }
     @Published var preCompactionMessages: [ChatMessage] = [] {
         didSet {
             preCompactionDisplayVersion &+= 1
+            rebuildActiveBackgroundTasks()
         }
     }
     @Published var showingPreCompactionMessages = false
@@ -67,6 +74,7 @@ final class AgentChatViewModel: ObservableObject {
     @Published private(set) var error: String?
     @Published private(set) var toast: String?
     @Published private(set) var stats: GhostStats?
+    @Published private(set) var activeBackgroundTasks: [ActiveBackgroundTask] = []
 
     private let client: GhostboxClient
     private var streamTask: Task<Void, Never>?
@@ -117,6 +125,10 @@ final class AgentChatViewModel: ObservableObject {
 
     var isInputDisabled: Bool {
         isWakingGhost || isLoadingHistory || isCompacting || ghost?.status == .stopped
+    }
+
+    var activeBackgroundTaskCount: Int {
+        activeBackgroundTasks.count
     }
 
     func showToast(_ message: String) {
@@ -983,6 +995,29 @@ final class AgentChatViewModel: ObservableObject {
         return selectableHistoryMessages.firstIndex { $0.id == historySelectionMessageID }
     }
 
+    private func rebuildActiveBackgroundTasks() {
+        var tasksByID: [String: ActiveBackgroundTask] = [:]
+        var orderedTaskIDs: [String] = []
+
+        for message in preCompactionMessages + messages {
+            if message.role == .toolUse,
+               let task = Self.parseBackgroundTaskStart(from: message.content) {
+                if tasksByID[task.id] == nil {
+                    orderedTaskIDs.append(task.id)
+                }
+                tasksByID[task.id] = task
+                continue
+            }
+
+            if let taskID = Self.parseBackgroundTaskCompletionID(from: message.content) {
+                tasksByID.removeValue(forKey: taskID)
+                orderedTaskIDs.removeAll { $0 == taskID }
+            }
+        }
+
+        activeBackgroundTasks = orderedTaskIDs.compactMap { tasksByID[$0] }
+    }
+
     private func mapRole(_ role: String) -> ChatMessage.Role {
         switch role {
         case "user":
@@ -1022,6 +1057,138 @@ final class AgentChatViewModel: ObservableObject {
             .lowercased()
             .hasPrefix("/compact")
     }
+
+    private static func parseBackgroundTaskStart(from content: String) -> ActiveBackgroundTask? {
+        guard content.range(of: "Background task started", options: .caseInsensitive) != nil else {
+            return nil
+        }
+
+        guard let taskID = extractBackgroundTaskID(from: content) else {
+            return nil
+        }
+
+        let label = extractBackgroundTaskLabel(from: content, taskID: taskID) ?? taskID
+        return ActiveBackgroundTask(id: taskID, label: label)
+    }
+
+    private static func parseBackgroundTaskCompletionID(from content: String) -> String? {
+        guard let taskRange = content.range(of: "Background task", options: .caseInsensitive),
+              let completedRange = content.range(of: "completed", options: .caseInsensitive),
+              taskRange.lowerBound < completedRange.lowerBound else {
+            return nil
+        }
+
+        if let taskID = extractLabeledValue(
+            from: content,
+            keys: ["taskId", "task_id", "task id", "id"]
+        ) {
+            return taskID
+        }
+
+        let between = String(content[taskRange.upperBound..<completedRange.lowerBound])
+        return firstUsefulToken(in: between)
+    }
+
+    private static func extractBackgroundTaskID(from content: String) -> String? {
+        if let taskID = extractLabeledValue(
+            from: content,
+            keys: ["taskId", "task_id", "task id", "id"]
+        ) {
+            return taskID
+        }
+
+        guard let markerRange = content.range(of: "Background task started", options: .caseInsensitive) else {
+            return nil
+        }
+
+        let remainder = String(content[markerRange.upperBound...])
+        return firstUsefulToken(in: remainder)
+    }
+
+    private static func extractBackgroundTaskLabel(from content: String, taskID: String) -> String? {
+        if let label = extractLabeledValue(
+            from: content,
+            keys: ["label", "command", "cmd", "title", "name"]
+        ) {
+            return label
+        }
+
+        guard let markerRange = content.range(of: "Background task started", options: .caseInsensitive) else {
+            return nil
+        }
+
+        var remainder = String(content[markerRange.upperBound...])
+        guard let taskIDRange = remainder.range(of: taskID) else {
+            return nil
+        }
+
+        remainder.removeSubrange(..<taskIDRange.upperBound)
+        let label = remainder.trimmingCharacters(in: backgroundTaskTrimCharacters)
+        return label.isEmpty ? nil : label
+    }
+
+    private static func extractLabeledValue(from content: String, keys: [String]) -> String? {
+        for key in keys {
+            guard let keyRange = content.range(of: key, options: .caseInsensitive) else {
+                continue
+            }
+
+            var suffix = content[keyRange.upperBound...]
+            suffix = suffix.drop(while: { $0.isWhitespace || $0 == "\"" || $0 == "'" })
+
+            guard let delimiter = suffix.first, delimiter == ":" || delimiter == "=" else {
+                continue
+            }
+
+            suffix = suffix.dropFirst()
+            suffix = suffix.drop(while: { $0.isWhitespace })
+
+            guard let firstCharacter = suffix.first else {
+                continue
+            }
+
+            if firstCharacter == "\"" || firstCharacter == "'" {
+                let quote = firstCharacter
+                let quotedValue = suffix.dropFirst().prefix { $0 != quote }
+                let value = String(quotedValue).trimmingCharacters(in: backgroundTaskTrimCharacters)
+                if !value.isEmpty {
+                    return value
+                }
+                continue
+            }
+
+            let rawValue = suffix.prefix { !backgroundTaskValueTerminators.contains($0) }
+            let value = String(rawValue).trimmingCharacters(in: backgroundTaskTrimCharacters)
+            if !value.isEmpty {
+                return value
+            }
+        }
+
+        return nil
+    }
+
+    private static func firstUsefulToken(in content: String) -> String? {
+        let tokens = content
+            .components(separatedBy: backgroundTaskTokenSeparators)
+            .map { $0.trimmingCharacters(in: backgroundTaskTrimCharacters) }
+            .filter { !$0.isEmpty }
+
+        for token in tokens {
+            let normalized = token.lowercased()
+            if ["background", "task", "started", "completed", "id", "label"].contains(normalized) {
+                continue
+            }
+            return token
+        }
+
+        return nil
+    }
+
+    private static let backgroundTaskTrimCharacters = CharacterSet.whitespacesAndNewlines
+        .union(CharacterSet(charactersIn: ":,;()[]{}\"'"))
+    private static let backgroundTaskTokenSeparators = CharacterSet.whitespacesAndNewlines
+        .union(CharacterSet(charactersIn: ",;"))
+    private static let backgroundTaskValueTerminators: Set<Character> = [",", "\n", "\r", "}"]
 
     private nonisolated static func makePendingImage(from image: NSImage) -> PendingImage? {
         let resized = resizeForAPI(image: image)
