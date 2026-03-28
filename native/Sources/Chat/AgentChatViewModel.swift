@@ -613,6 +613,17 @@ final class AgentChatViewModel: ObservableObject {
                         }
                     }
 
+                case .thinking:
+                    let chunk = event.text ?? ""
+                    guard !chunk.isEmpty else { continue }
+
+                    if let last = messages.last, last.role == .thinking {
+                        let index = messages.count - 1
+                        messages[index] = last.updatingContent(chunk)
+                    } else {
+                        messages.append(ChatMessage(role: .thinking, content: chunk))
+                    }
+
                 case .tool_use:
                     let toolName = event.tool ?? "Tool"
                     let content = event.input?.stringValue ?? "Running \(toolName)"

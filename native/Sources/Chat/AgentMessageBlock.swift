@@ -100,6 +100,8 @@ struct AgentMessageBlock: View {
             return ghostName
         case .user:
             return "You"
+        case .thinking:
+            return "Thinking"
         case .system:
             return "System"
         case .toolUse:
@@ -115,6 +117,8 @@ struct AgentMessageBlock: View {
             return Theme.Colors.accentLight
         case .user:
             return Color.white.opacity(Theme.Text.tertiary)
+        case .thinking:
+            return Color.white.opacity(0.25)
         case .system:
             return Color.orange.opacity(0.85)
         case .toolUse:
@@ -130,6 +134,8 @@ struct AgentMessageBlock: View {
             return Color.white.opacity(Theme.Text.primary)
         case .user:
             return Color.white.opacity(Theme.Text.secondary)
+        case .thinking:
+            return Color.white.opacity(0.3)
         case .system:
             return Color.orange.opacity(0.9)
         case .toolUse, .toolResult:

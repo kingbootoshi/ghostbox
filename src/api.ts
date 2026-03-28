@@ -38,6 +38,7 @@ import {
   spawnGhost,
   steerGhost,
   switchGhostSession,
+  updateGhost,
   wakeGhost
 } from "./orchestrator";
 import type {
@@ -89,6 +90,11 @@ type SpawnBody = {
   model?: unknown;
   systemPrompt?: unknown;
 };
+
+type UpdateGhostBody = {
+  model?: unknown;
+  provider?: unknown;
+} & Record<string, unknown>;
 
 type MessageBody = {
   prompt?: unknown;
@@ -1306,6 +1312,66 @@ app.get("/api/ghosts", (c) =>
 app.get("/api/ghosts/:name", (c) =>
   handleRoute(c, async () => {
     return c.json(await getGhost(c.req.param("name")));
+  })
+);
+
+app.patch("/api/ghosts/:name", (c) =>
+  handleRoute(c, async () => {
+    const body = await parseJsonBody<UpdateGhostBody>(c);
+
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      throw new ApiError(400, "Invalid request body");
+    }
+
+    const unexpectedField = Object.keys(body).find((key) => !["model", "provider"].includes(key));
+    if (unexpectedField) {
+      throw new ApiError(400, `Invalid field "${unexpectedField}"`);
+    }
+
+    if (!("model" in body) && !("provider" in body)) {
+      throw new ApiError(400, "At least one of model or provider is required.");
+    }
+
+    let requestedModel: string | undefined;
+    let requestedProvider: string | undefined;
+
+    if ("model" in body) {
+      if (typeof body.model !== "string" || body.model.trim().length === 0) {
+        throw new ApiError(400, "Invalid model");
+      }
+
+      requestedModel = body.model.trim();
+    }
+
+    if ("provider" in body) {
+      if (typeof body.provider !== "string" || body.provider.trim().length === 0) {
+        throw new ApiError(400, "Invalid provider");
+      }
+
+      requestedProvider = body.provider.trim().toLowerCase();
+    }
+
+    const parsedModel = requestedModel ? parseProviderAndModel(requestedModel) : null;
+    if (parsedModel?.provider && requestedProvider && parsedModel.provider !== requestedProvider) {
+      throw new ApiError(
+        400,
+        `Provider mismatch: model uses "${parsedModel.provider}" but provider was "${requestedProvider}".`
+      );
+    }
+
+    const update: { model?: string; provider?: string } = {};
+
+    if (parsedModel) {
+      update.model = parsedModel.model;
+    }
+
+    if (parsedModel?.provider) {
+      update.provider = parsedModel.provider;
+    } else if (requestedProvider) {
+      update.provider = requestedProvider;
+    }
+
+    return c.json(await updateGhost(c.req.param("name"), update));
   })
 );
 

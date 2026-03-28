@@ -21,6 +21,7 @@ struct ChatMessage: Identifiable {
     enum Role {
         case user
         case ghost
+        case thinking
         case system
         case toolUse
         case toolResult

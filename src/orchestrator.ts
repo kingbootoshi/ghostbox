@@ -227,15 +227,11 @@ const ensureGhostPiAgent = async (name: string): Promise<void> => {
   await mkdir(ghostPiPath, { recursive: true });
 
   const sharedPath = getSharedPiAgentPath();
+  await mkdir(sharedPath, { recursive: true });
   const settingsSource = join(sharedPath, "settings.json");
   const settingsDest = join(ghostPiPath, "settings.json");
   if (existsSync(settingsSource) && !existsSync(settingsDest)) {
     await copyFile(settingsSource, settingsDest);
-  }
-
-  const authSource = join(getHomeDirectory(), ".ghostbox", "auth.json");
-  if (existsSync(authSource)) {
-    await copyFile(authSource, join(ghostPiPath, "auth.json"));
   }
 
   const baseAgentsSource = getBaseAgentsPath();
@@ -366,6 +362,11 @@ const parseGhostMessage = (line: string): GhostMessage => {
     return { type: "assistant", text: record.text };
   }
 
+  if (type === "thinking") {
+    if (typeof record.text !== "string") throw new Error("Invalid thinking message");
+    return { type: "thinking", text: record.text };
+  }
+
   if (type === "tool_use") {
     if (typeof record.tool !== "string") throw new Error("Invalid tool_use message");
     return { type: "tool_use", tool: record.tool, input: record.input ?? null };
@@ -471,6 +472,16 @@ const startGhostContainer = async (
   const vaultPath = getVaultPath(name);
   const piAgentPath = getGhostPiAgentPath(name);
   const baseExtensionsPath = getBaseExtensionsPath();
+  const sharedAuthPath = join(getSharedPiAgentPath(), "auth.json");
+  const binds = [
+    `${vaultPath}:/vault`,
+    `${piAgentPath}:/root/.pi/agent`,
+    `${baseExtensionsPath}:/root/.pi/agent/extensions:ro`
+  ];
+
+  if (existsSync(sharedAuthPath)) {
+    binds.push(`${sharedAuthPath}:/root/.pi/agent/auth.json:rw`);
+  }
 
   try {
     const container = await docker.createContainer({
@@ -491,11 +502,7 @@ const startGhostContainer = async (
       ],
       ExposedPorts: buildExposedPorts(),
       HostConfig: {
-        Binds: [
-          `${vaultPath}:/vault`,
-          `${piAgentPath}:/root/.pi/agent`,
-          `${baseExtensionsPath}:/root/.pi/agent/extensions:ro`
-        ],
+        Binds: binds,
         PortBindings: buildPortBindings(ghost.portBase),
         Memory: 1024 * 1024 * 1024,
         CpuShares: 512
@@ -641,6 +648,25 @@ export const getGhost = async (name: string): Promise<GhostState> => {
   return getGhostFromState(state, name);
 };
 
+export const updateGhost = async (
+  name: string,
+  update: Partial<Pick<GhostState, "model" | "provider">>
+): Promise<GhostState> => {
+  const state = await loadState();
+  const ghost = getGhostFromState(state, name);
+
+  if (typeof update.model === "string") {
+    ghost.model = update.model;
+  }
+
+  if (typeof update.provider === "string") {
+    ghost.provider = update.provider;
+  }
+
+  await saveState(state);
+  return ghost;
+};
+
 export const getConfig = async (): Promise<GhostboxConfig> => {
   const state = await loadState();
   return state.config;
@@ -783,8 +809,11 @@ const refreshGhostAuth = async (name: string): Promise<void> => {
   await mkdir(ghostPiPath, { recursive: true });
 
   const sharedPath = getSharedPiAgentPath();
-  for (const file of ["auth.json", "settings.json"]) {
-    await copyFile(join(sharedPath, file), join(ghostPiPath, file));
+  const settingsSource = join(sharedPath, "settings.json");
+  const settingsDest = join(ghostPiPath, "settings.json");
+
+  if (existsSync(settingsSource)) {
+    await copyFile(settingsSource, settingsDest);
   }
 };
 

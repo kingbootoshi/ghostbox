@@ -16,6 +16,7 @@ struct GhostMessage: Decodable {
 
     enum MessageType: String, Codable {
         case assistant
+        case thinking
         case tool_use
         case tool_result
         case result

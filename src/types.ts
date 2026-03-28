@@ -132,6 +132,11 @@ export type AssistantMessage = {
   text: string;
 };
 
+export type ThinkingMessage = {
+  type: "thinking";
+  text: string;
+};
+
 export type ToolUseMessage = {
   type: "tool_use";
   tool: string;
@@ -196,7 +201,7 @@ export type GhostStats = {
   } | null;
 };
 
-export type GhostMessage = AssistantMessage | ToolUseMessage | ToolResultMessage | ResultMessage;
+export type GhostMessage = ThinkingMessage | AssistantMessage | ToolUseMessage | ToolResultMessage | ResultMessage;
 
 export type AuthProvider = "anthropic" | "openai-codex";
 

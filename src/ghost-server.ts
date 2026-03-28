@@ -1799,6 +1799,7 @@ const streamPrompt = async (
 
   let currentAssistantText = "";
   let lastAssistantText = "";
+  let currentThinkingText = "";
   let unsubscribe = (): void => {};
 
   const completion = new Promise<void>((resolve, reject) => {
@@ -1807,14 +1808,44 @@ const streamPrompt = async (
 
       try {
         const assistantMessageEvent = event.assistantMessageEvent;
+        const assistantMessageEventType = assistantMessageEvent?.type;
 
-        if (
-          isMessageUpdateEvent(event) &&
-          assistantMessageEvent?.type === "text_delta" &&
-          typeof assistantMessageEvent.delta === "string"
-        ) {
-          currentAssistantText += assistantMessageEvent.delta;
-          return;
+        if (isMessageUpdateEvent(event)) {
+          if (assistantMessageEventType === "thinking_start") {
+            currentThinkingText = typeof assistantMessageEvent?.delta === "string" ? assistantMessageEvent.delta : "";
+            sendJsonLine(res, {
+              type: "thinking",
+              text: currentThinkingText
+            });
+            return;
+          }
+
+          if (assistantMessageEventType === "thinking_delta" && typeof assistantMessageEvent?.delta === "string") {
+            currentThinkingText += assistantMessageEvent.delta;
+            sendJsonLine(res, {
+              type: "thinking",
+              text: currentThinkingText
+            });
+            return;
+          }
+
+          if (assistantMessageEventType === "thinking_end") {
+            if (typeof assistantMessageEvent?.delta === "string") {
+              currentThinkingText += assistantMessageEvent.delta;
+            }
+
+            sendJsonLine(res, {
+              type: "thinking",
+              text: currentThinkingText
+            });
+            currentThinkingText = "";
+            return;
+          }
+
+          if (assistantMessageEventType === "text_delta" && typeof assistantMessageEvent?.delta === "string") {
+            currentAssistantText += assistantMessageEvent.delta;
+            return;
+          }
         }
 
         if (isMessageEndEvent(event) && event.message?.role === "assistant") {
