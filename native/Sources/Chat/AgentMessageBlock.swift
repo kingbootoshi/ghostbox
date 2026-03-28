@@ -29,16 +29,7 @@ struct AgentMessageBlock: View {
                     .foregroundColor(Color.white.opacity(0.1))
 
                 if message.role == .ghost {
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(message.content, forType: .string)
-                    } label: {
-                        Image(systemName: "doc.on.doc")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(Color.white.opacity(0.15))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Copy raw message")
+                    CopyButton(text: message.content)
                 }
             }
             .padding(.top, 1)
@@ -186,5 +177,28 @@ struct AgentMessageBlock: View {
         case .toolUse, .toolResult:
             return Color.white.opacity(Theme.Text.secondary)
         }
+    }
+}
+
+private struct CopyButton: View {
+    let text: String
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            copied = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                copied = false
+            }
+        } label: {
+            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(copied ? Color.green.opacity(0.6) : Color.white.opacity(0.15))
+                .animation(.easeInOut(duration: 0.15), value: copied)
+        }
+        .buttonStyle(.plain)
+        .help("Copy raw message")
     }
 }
