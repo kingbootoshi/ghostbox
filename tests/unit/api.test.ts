@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import app, { ScheduleManager, ensureApiAdminToken } from "../../src/api";
+import app, { ensureApiAdminToken, ScheduleManager } from "../../src/api";
 import { createConfig, createGhostState, createState, createTestHome } from "../support/test-state";
 
 type TestHome = Awaited<ReturnType<typeof createTestHome>>;
@@ -463,7 +463,9 @@ describe("api route validation", () => {
       createState({
         ghosts: {
           userproxy: createGhostState({
-            apiKeys: [{ id: "alpha-key", key: "alpha-user-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+            apiKeys: [
+              { id: "alpha-key", key: "alpha-user-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }
+            ]
           })
         }
       })
@@ -499,7 +501,9 @@ describe("api route validation", () => {
           inboxowner: createGhostState({
             containerId: "container-2",
             portBase: 3200,
-            apiKeys: [{ id: "beta-key", key: "beta-inbox-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+            apiKeys: [
+              { id: "beta-key", key: "beta-inbox-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }
+            ]
           })
         }
       })
@@ -550,12 +554,16 @@ describe("api route validation", () => {
       createState({
         ghosts: {
           blockedreader: createGhostState({
-            apiKeys: [{ id: "alpha-key", key: "alpha-read-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+            apiKeys: [
+              { id: "alpha-key", key: "alpha-read-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }
+            ]
           }),
           allowedreader: createGhostState({
             containerId: "container-2",
             portBase: 3200,
-            apiKeys: [{ id: "beta-key", key: "beta-read-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+            apiKeys: [
+              { id: "beta-key", key: "beta-read-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }
+            ]
           })
         }
       })
@@ -602,7 +610,9 @@ describe("api route validation", () => {
       createState({
         ghosts: {
           sizeghost: createGhostState({
-            apiKeys: [{ id: "alpha-key", key: "alpha-size-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+            apiKeys: [
+              { id: "alpha-key", key: "alpha-size-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }
+            ]
           })
         }
       })
@@ -623,7 +633,9 @@ describe("api route validation", () => {
       createState({
         ghosts: {
           rateghost: createGhostState({
-            apiKeys: [{ id: "alpha-key", key: "alpha-rate-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+            apiKeys: [
+              { id: "alpha-key", key: "alpha-rate-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }
+            ]
           })
         }
       })
@@ -657,12 +669,16 @@ describe("api route validation", () => {
       createState({
         ghosts: {
           capsender: createGhostState({
-            apiKeys: [{ id: "alpha-key", key: "alpha-cap-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+            apiKeys: [
+              { id: "alpha-key", key: "alpha-cap-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }
+            ]
           }),
           cappedinbox: createGhostState({
             containerId: "container-2",
             portBase: 3200,
-            apiKeys: [{ id: "beta-key", key: "beta-cap-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }]
+            apiKeys: [
+              { id: "beta-key", key: "beta-cap-token", label: "default", createdAt: "2026-03-25T00:00:00.000Z" }
+            ]
           })
         }
       })

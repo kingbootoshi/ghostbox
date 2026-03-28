@@ -46,12 +46,12 @@ import type {
   GhostboxConfigResponse,
   GhostboxConfigSensitiveStatus,
   GhostboxConfigUpdate,
-  GhostImage,
   GhostboxState,
-  MailMessage,
-  MailboxState,
+  GhostImage,
   GhostSchedule,
   GhostStreamingBehavior,
+  MailboxState,
+  MailMessage,
   VaultEntry
 } from "./types";
 import { getHomeDirectory, isNodeError } from "./utils";
@@ -191,8 +191,7 @@ const mailRateLimitState = new Map<string, { count: number; windowStart: number 
 const getSchedulePath = (): string => resolve(getHomeDirectory(), ".ghostbox", "schedules.json");
 const getMailboxPath = (): string => join(getHomeDirectory(), ".ghostbox", "mailbox.json");
 const getLegacyApiUserToken = (): string | null => {
-  const configured =
-    process.env.GHOSTBOX_MAIL_USER_TOKEN?.trim() || process.env.GHOSTBOX_ADMIN_TOKEN?.trim() || "";
+  const configured = process.env.GHOSTBOX_MAIL_USER_TOKEN?.trim() || process.env.GHOSTBOX_ADMIN_TOKEN?.trim() || "";
   return configured || null;
 };
 
@@ -1513,10 +1512,7 @@ app.post("/api/mail/send", (c) =>
       try {
         const ghost = await getGhost(to);
         if (ghost.status === "running") {
-          await steerGhost(
-            to,
-            `You have an urgent message from ${from}. Use mailbox(action: "check") to read it.`
-          );
+          await steerGhost(to, `You have an urgent message from ${from}. Use mailbox(action: "check") to read it.`);
         }
       } catch (error) {
         if (!(error instanceof Error) || !error.message.includes("not found")) {

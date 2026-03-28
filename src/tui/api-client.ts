@@ -1,5 +1,5 @@
-import type { GhostMessage, GhostState, GhostStats, HistoryResponse, SessionListResponse } from "../types";
 import { readRemoteConfig } from "../remote-config";
+import type { GhostMessage, GhostState, GhostStats, HistoryResponse, SessionListResponse } from "../types";
 
 const DEFAULT_API_BASE_URL = "http://localhost:8008";
 

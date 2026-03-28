@@ -89,9 +89,7 @@ describe("tui api client remote config", () => {
       const body = new ReadableStream({
         start(controller) {
           controller.enqueue(
-            new TextEncoder().encode(
-              'data: {"type":"assistant","text":"hello"}\n\n' + "event: done\ndata:\n\n"
-            )
+            new TextEncoder().encode('data: {"type":"assistant","text":"hello"}\n\n' + "event: done\ndata:\n\n")
           );
           controller.close();
         }

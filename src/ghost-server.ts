@@ -22,8 +22,8 @@ import type {
   GhostSchedule,
   GhostStreamingBehavior,
   HistoryMessage,
-  MailMessage,
   MailboxState,
+  MailMessage,
   SessionInfo,
   SessionListResponse
 } from "./types";
@@ -158,7 +158,8 @@ const mailboxToolSchema = {
     action: {
       type: "string",
       enum: ["check", "inbox", "read", "send", "reply"],
-      description: "Whether to check unread mail, list the inbox, read a message, send a message, or reply to a message."
+      description:
+        "Whether to check unread mail, list the inbox, read a message, send a message, or reply to a message."
     },
     to: {
       type: "string",
