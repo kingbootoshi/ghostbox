@@ -94,10 +94,7 @@ final class ChatPanelController: NSObject, NSWindowDelegate {
 
         lastKnownFrame = panel.frame
 
-        panel.snapOut { [weak self] in
-            self?.viewModel.cancelStream()
-            completion?()
-        }
+        panel.snapOut(completion: completion)
     }
 
     func showInPlace() {

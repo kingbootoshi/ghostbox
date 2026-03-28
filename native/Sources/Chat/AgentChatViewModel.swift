@@ -254,11 +254,44 @@ final class AgentChatViewModel: ObservableObject {
                         self.messages.append(ChatMessage(role: .system, content: text))
                     }
                 }
-                await loadGhost()
+                let fallbackGhost = self.locallyUpdatedGhost(for: model)
+
+                do {
+                    self.ghost = try await client.updateGhost(
+                        name: ghostName,
+                        provider: model.provider,
+                        model: model.modelId
+                    )
+                } catch GhostboxClientError.requestFailed(let statusCode, _) where statusCode == 404 || statusCode == 405 {
+                    self.ghost = fallbackGhost
+                } catch {
+                    self.ghost = fallbackGhost
+                    self.messages.append(
+                        ChatMessage(
+                            role: .system,
+                            content: "Model switched, but saving it failed: \(error.localizedDescription)"
+                        )
+                    )
+                }
             } catch {
                 self.messages.append(ChatMessage(role: .system, content: "Model switch failed: \(error.localizedDescription)"))
             }
         }
+    }
+
+    private func locallyUpdatedGhost(for model: GhostModel) -> Ghost? {
+        guard let current = ghost else { return nil }
+
+        return Ghost(
+            name: current.name,
+            status: current.status,
+            provider: model.provider,
+            model: model.modelId,
+            portBase: current.portBase,
+            containerId: current.containerId,
+            createdAt: current.createdAt,
+            systemPrompt: current.systemPrompt
+        )
     }
 
     func prepareForOpening(ghost: Ghost? = nil) {
@@ -524,6 +557,11 @@ final class AgentChatViewModel: ObservableObject {
         var currentAssistantIndex: Int?
         let isCompactCommand = Self.isCompactCommand(prompt)
         var compactResponseMessageID: UUID?
+        // Capture visibility at stream start. NSApp.keyWindow is nil when all
+        // panels are hidden (user pressed Cmd+Shift+G to hide), which is exactly
+        // when we want a notification. A non-activating panel only becomes key
+        // when clicked, so nil key window reliably means the UI is hidden.
+        let panelsHiddenAtStart = NSApp.keyWindow == nil
 
         defer {
             if activeStreamID == streamID {
@@ -558,7 +596,6 @@ final class AgentChatViewModel: ObservableObject {
                     guard !chunk.isEmpty else { continue }
 
                     currentAssistantText += chunk
-                    let shouldNotify = !NSApp.isActive || NSApp.keyWindow?.title != ghostName
 
                     if let index = currentAssistantIndex, messages.indices.contains(index) {
                         let existingMessage = messages[index]
@@ -571,9 +608,6 @@ final class AgentChatViewModel: ObservableObject {
                         messages.append(assistantMessage)
                         currentAssistantIndex = messages.count - 1
                         SoundManager.shared.play(.messageReceived)
-                        if shouldNotify {
-                            fireNotification(for: currentAssistantText)
-                        }
                         if isCompactCommand {
                             compactResponseMessageID = assistantMessage.id
                         }
@@ -620,6 +654,14 @@ final class AgentChatViewModel: ObservableObject {
 
         await loadGhost()
         await loadStats()
+
+        // Fire notification after the full response is complete so the preview
+        // shows the final text, not a partial first chunk. Only notify if the
+        // panels were hidden when the stream started - no point interrupting the
+        // user if they're already looking at the chat.
+        if panelsHiddenAtStart, !currentAssistantText.isEmpty, !isCompactCommand {
+            fireNotification(for: currentAssistantText)
+        }
 
         activeStreamID = nil
         streamTask = nil

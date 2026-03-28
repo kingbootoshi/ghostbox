@@ -1,22 +1,30 @@
 import AppKit
 import Carbon
 import CoreText
+import SwiftUI
 import UserNotifications
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    let client = GhostboxClient.fromUserDefaults()
+    private(set) var client: GhostboxClient = GhostboxClient.fromUserDefaults()
 
     private lazy var appState = AppState(client: client)
     private var hubPanelController: HubPanelController?
     private var chatPanelControllers: [String: ChatPanelController] = [:]
     private var statusItem: NSStatusItem?
     private var hotKeyMonitor: HotKeyMonitor?
+    private var connectionWindow: NSWindow?
 
     private let panelAnimationStagger: TimeInterval = 0.03
     private let panelHideDuration: TimeInterval = 0.3
     private var serverProcess: Process?
     private var serverLogHandle: FileHandle?
+
+    private var hasConnection: Bool {
+        let url = UserDefaults.standard.string(forKey: "serverURL") ?? ""
+        let token = UserDefaults.standard.string(forKey: "serverToken") ?? ""
+        return !url.isEmpty && !token.isEmpty
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
@@ -27,6 +35,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupNotifications()
         setupHotkey()
 
+        if hasConnection {
+            launchHub()
+        } else {
+            showConnectionWindow()
+        }
+    }
+
+    func showConnectionWindow() {
+        let connectionView = ConnectionView { [weak self] url, token in
+            guard let self else { return }
+            UserDefaults.standard.set(url, forKey: "serverURL")
+            UserDefaults.standard.set(token, forKey: "serverToken")
+
+            self.client = GhostboxClient(baseURL: URL(string: url), token: token)
+            self.appState = AppState(client: self.client)
+
+            // Order out immediately (no animation) to avoid dealloc crash
+            let window = self.connectionWindow
+            window?.animationBehavior = .none
+            window?.orderOut(nil)
+            self.connectionWindow = nil
+            self.launchHub()
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 520),
+            styleMask: [.borderless, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = true
+        window.isMovableByWindowBackground = true
+        window.animationBehavior = .none
+
+        let blur = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 480, height: 520))
+        blur.material = .hudWindow
+        blur.blendingMode = .behindWindow
+        blur.state = .active
+        blur.wantsLayer = true
+        blur.layer?.cornerRadius = Theme.Layout.cornerRadius
+        blur.layer?.masksToBounds = true
+        blur.layer?.borderWidth = 0
+
+        let hostingView = NSHostingView(rootView: BorderlessGlass { connectionView })
+        hostingView.translatesAutoresizingMaskIntoConstraints = false
+        blur.addSubview(hostingView)
+        NSLayoutConstraint.activate([
+            hostingView.topAnchor.constraint(equalTo: blur.topAnchor),
+            hostingView.bottomAnchor.constraint(equalTo: blur.bottomAnchor),
+            hostingView.leadingAnchor.constraint(equalTo: blur.leadingAnchor),
+            hostingView.trailingAnchor.constraint(equalTo: blur.trailingAnchor),
+        ])
+
+        window.contentView = blur
+        window.center()
+
+        connectionWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    private func launchHub() {
         hubPanelController = HubPanelController(client: client, appState: appState)
         hubPanelController?.createPanelHidden()
 
@@ -136,6 +208,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func toggleHub() {
+        guard hasConnection else {
+            if connectionWindow == nil {
+                showConnectionWindow()
+            } else {
+                NSApp.activate(ignoringOtherApps: true)
+                connectionWindow?.makeKeyAndOrderFront(nil)
+            }
+            return
+        }
+
         let anyVisible = (hubPanelController?.isVisible ?? false) ||
             chatPanelControllers.values.contains { $0.isVisible }
 
@@ -249,6 +331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Toggle Hub", action: #selector(toggleHubMenuAction), keyEquivalent: "g"))
         menu.items.last?.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Disconnect", action: #selector(disconnectMenuAction), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem?.menu = menu
     }
@@ -298,6 +381,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleHubMenuAction() {
         toggleHub()
+    }
+
+    @objc private func disconnectMenuAction() {
+        UserDefaults.standard.removeObject(forKey: "serverURL")
+        UserDefaults.standard.removeObject(forKey: "serverToken")
+        closeChatAll()
+        hubPanelController?.hide()
+        hubPanelController = nil
+        chatPanelControllers.removeAll()
+        showConnectionWindow()
     }
 
     @objc private func handleOpenGhostChat(_ notification: Notification) {

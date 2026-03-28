@@ -41,7 +41,7 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         SWIFT_VERSION: "5.9"
-        INFOPLIST_FILE: ""
+        INFOPLIST_FILE: Sources/Info.plist
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_LSUIElement: YES
         INFOPLIST_KEY_NSMainStoryboardFile: ""

@@ -96,7 +96,11 @@ struct ToolCallGroup: Identifiable {
     let toolUse: ChatMessage
     let toolResult: ChatMessage?
 
-    var id: UUID { toolResult?.id ?? toolUse.id }
+    var id: UUID { toolUse.id }
+
+    var isRunning: Bool {
+        toolResult == nil
+    }
 
     var toolName: String {
         toolUse.resolvedToolName
@@ -123,7 +127,8 @@ struct ToolCallGroup: Identifiable {
         let inputPreview = cleaned(toolUse.toolInputPreview)
 
         guard let toolResult else {
-            return truncated(inputPreview, limit: 80)
+            let runningPreview = inputPreview.isEmpty ? "Running..." : "\(inputPreview) - Running..."
+            return truncated(runningPreview, limit: 80)
         }
 
         if toolKind == "read", let subject = toolUse.toolPrimarySubject {

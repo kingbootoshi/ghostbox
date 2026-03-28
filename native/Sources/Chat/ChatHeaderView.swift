@@ -292,7 +292,10 @@ struct ModelSwitcherMenu: View {
     var body: some View {
         Menu {
             ForEach(GhostModel.all) { model in
-                let isCurrent = model.modelId == currentModel || model.displayName == currentModel
+                let isCurrent =
+                    model.id == normalizedCurrentModelIdentifier
+                    || model.modelId == currentModelId
+                    || model.displayName == trimmedCurrentModel
 
                 Button {
                     onSelect(model)
@@ -334,10 +337,45 @@ struct ModelSwitcherMenu: View {
     }
 
     private var displayModelName: String {
-        if let model = GhostModel.all.first(where: { $0.modelId == currentModel }) {
+        if let model = GhostModel.all.first(where: { $0.id == normalizedCurrentModelIdentifier }) {
             return model.displayName
         }
-        return currentModel
+
+        if let model = GhostModel.all.first(where: { $0.modelId == currentModelId }) {
+            return model.displayName
+        }
+
+        return currentModelId
+    }
+
+    private var trimmedCurrentModel: String {
+        currentModel.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var currentModelId: String {
+        let modelValue = trimmedCurrentModel
+        if modelValue.contains("/") {
+            return String(modelValue.split(separator: "/", maxSplits: 1).last ?? "")
+        }
+
+        return modelValue
+    }
+
+    private var normalizedCurrentModelIdentifier: String {
+        let modelValue = trimmedCurrentModel
+        if modelValue.contains("/") {
+            let parts = modelValue.split(separator: "/", maxSplits: 1).map(String.init)
+            if parts.count == 2 {
+                return "\(parts[0].lowercased())/\(parts[1])"
+            }
+        }
+
+        let providerValue = currentProvider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if providerValue.isEmpty {
+            return currentModelId
+        }
+
+        return "\(providerValue)/\(currentModelId)"
     }
 }
 

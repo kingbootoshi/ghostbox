@@ -24,6 +24,10 @@ struct ToolCallGroupBlock: View {
                         .foregroundColor(Color.white.opacity(Theme.Text.secondary))
                         .lineLimit(1)
 
+                    if group.isRunning {
+                        ToolCallRunningBadge()
+                    }
+
                     Spacer(minLength: 0)
 
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
@@ -69,6 +73,12 @@ struct ToolCallGroupBlock: View {
                             .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
 
                         ToolCallContentView(content: toolResult.content)
+                    } else {
+                        Rectangle()
+                            .fill(Color.white.opacity(0.06))
+                            .frame(height: 1)
+
+                        ToolCallRunningRow()
                     }
                 }
                 .padding(12)
@@ -99,6 +109,42 @@ struct ToolCallContentView: View {
     }
 }
 
+private struct ToolCallRunningBadge: View {
+    var body: some View {
+        HStack(spacing: 6) {
+            ProgressView()
+                .controlSize(.small)
+                .tint(Theme.Colors.accentLight)
+
+            Text("Running...")
+                .font(Theme.Typography.caption(weight: .medium))
+                .foregroundColor(Theme.Colors.accentLight)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Theme.Colors.accent.opacity(0.12))
+        .overlay(
+            Capsule()
+                .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
+        )
+        .clipShape(Capsule())
+    }
+}
+
+private struct ToolCallRunningRow: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+                .tint(Theme.Colors.accentLight)
+
+            Text("Running...")
+                .font(Theme.Typography.label(weight: .medium))
+                .foregroundColor(Theme.Colors.accentLight)
+        }
+    }
+}
+
 struct ToolCallFullscreenOverlay: View {
     let group: ToolCallGroup
     let onClose: () -> Void
@@ -122,6 +168,10 @@ struct ToolCallFullscreenOverlay: View {
                         .font(Theme.Typography.label(weight: .regular))
                         .foregroundColor(Color.white.opacity(Theme.Text.secondary))
                         .lineLimit(1)
+
+                    if group.isRunning {
+                        ToolCallRunningBadge()
+                    }
 
                     Spacer(minLength: 0)
 
@@ -173,6 +223,13 @@ struct ToolCallFullscreenOverlay: View {
                                 .lineSpacing(5)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Rectangle()
+                                .fill(Color.white.opacity(0.06))
+                                .frame(height: 1)
+                                .padding(.vertical, 4)
+
+                            ToolCallRunningRow()
                         }
                     }
                     .padding(20)

@@ -286,10 +286,17 @@ struct AgentChatView: View {
                             GhostTypingBlock(name: viewModel.ghostName)
                                 .id(ChatScrollAnchor.typing)
                         }
+
+                        Color.clear
+                            .frame(height: 1)
+                            .id(ChatScrollAnchor.bottom)
                     }
                     .padding(.top, 20)
                     .padding(.bottom, 16)
                 }
+            }
+            .onAppear {
+                scrollToLatest(using: proxy)
             }
             .onChange(of: viewModel.messages.count) {
                 scrollToLatest(using: proxy)
@@ -524,23 +531,17 @@ struct AgentChatView: View {
     }
 
     private func scrollToLatest(using proxy: ScrollViewProxy) {
-        guard let target = latestScrollTarget else { return }
-        withAnimation(.easeOut(duration: 0.2)) {
-            proxy.scrollTo(target, anchor: .bottom)
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.2)) {
+                proxy.scrollTo(ChatScrollAnchor.bottom, anchor: .bottom)
+            }
         }
-    }
-
-    private var latestScrollTarget: String? {
-        if viewModel.isStreaming {
-            return ChatScrollAnchor.typing
-        }
-
-        return viewModel.messages.last.map { ChatScrollAnchor.message($0.id) }
     }
 }
 
 private enum ChatScrollAnchor {
     static let typing = "chat-typing-anchor"
+    static let bottom = "chat-bottom-anchor"
 
     static func message(_ id: UUID) -> String {
         "chat-message-\(id.uuidString)"

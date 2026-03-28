@@ -1,5 +1,10 @@
 import SwiftUI
 
+private enum ChatInputLayout {
+    static let minHeight: CGFloat = 20
+    static let maxHeight: CGFloat = 60
+}
+
 struct ChatInputView: View {
     @Binding var inputText: String
     let ghostName: String
@@ -17,6 +22,7 @@ struct ChatInputView: View {
     let onHistoryBack: () -> Bool
     let onHistoryForward: () -> Bool
     let onSubmit: () -> Void
+    @State private var inputHeight: CGFloat = ChatInputLayout.minHeight
 
     var body: some View {
         VStack(spacing: 8) {
@@ -42,40 +48,24 @@ struct ChatInputView: View {
                 .padding(.horizontal, 18)
             }
 
-            TextField(inputPlaceholder, text: $inputText)
-                .textFieldStyle(.plain)
-                .font(Theme.Typography.body(Theme.FontSize.lg))
-                .foregroundColor(Color.white.opacity(Theme.Text.primary))
-                .focused(isInputFocused)
-                .disabled(isInputDisabled)
-                .onSubmit { submitInput() }
-                .onKeyPress(.tab) {
-                    guard showsSlashCommandPopup, let firstFilteredSlashCommand else {
-                        return .ignored
-                    }
-
-                    inputText = "/\(firstFilteredSlashCommand.name) "
-                    return .handled
-                }
-                .onKeyPress(.upArrow) {
-                    onHistoryBack() ? .handled : .ignored
-                }
-                .onKeyPress(.downArrow) {
-                    onHistoryForward() ? .handled : .ignored
-                }
-                .onKeyPress { keyPress in
-                    guard keyPress.modifiers.contains(.command),
-                          keyPress.characters.caseInsensitiveCompare("v") == .orderedSame else {
-                        return .ignored
-                    }
-
-                    return onPasteCommand() ? .handled : .ignored
-                }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 14)
-                .background(Color.white.opacity(0.02))
-                .clipShape(RoundedRectangle(cornerRadius: 18))
-                .padding(.horizontal, 18)
+            MultilineInput(
+                text: $inputText,
+                height: $inputHeight,
+                placeholder: inputPlaceholder,
+                font: NSFont.systemFont(ofSize: Theme.FontSize.lg),
+                textColor: NSColor.white.withAlphaComponent(CGFloat(Theme.Text.primary)),
+                isDisabled: isInputDisabled,
+                minHeight: ChatInputLayout.minHeight,
+                maxHeight: ChatInputLayout.maxHeight,
+                onSubmit: { submitInput() },
+                onPasteCommand: onPasteCommand
+            )
+            .frame(height: inputHeight)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 14)
+            .background(Color.white.opacity(0.02))
+            .clipShape(RoundedRectangle(cornerRadius: 18))
+            .padding(.horizontal, 18)
 
             HStack(spacing: 0) {
                 Text(footerHint)
@@ -127,7 +117,7 @@ struct ChatInputView: View {
             return "Starting a new session in the background"
         }
 
-        return "Press return to send"
+        return "Press return to send, shift+return for new line"
     }
 
     private var tokenFooterText: String? {

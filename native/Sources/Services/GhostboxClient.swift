@@ -136,6 +136,11 @@ final class GhostboxClient {
     let baseURL: URL
     let token: String?
     private let session: URLSession
+    // Dedicated session for SSE streams: no inter-packet timeout so long tool
+    // calls (file reads, complex work) don't kill the connection mid-stream.
+    // timeoutIntervalForResource is left at its default (7 days) which is fine
+    // since the stream ends naturally when the agent finishes.
+    private let sseSession: URLSession
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
@@ -149,11 +154,19 @@ final class GhostboxClient {
 
         if let session {
             self.session = session
+            self.sseSession = session
         } else {
             let configuration = URLSessionConfiguration.default
             configuration.timeoutIntervalForRequest = 60
             configuration.timeoutIntervalForResource = 300
             self.session = URLSession(configuration: configuration)
+
+            let sseConfiguration = URLSessionConfiguration.default
+            // 0 means no timeout waiting for the next packet - required for
+            // SSE streams where the agent may be silent for minutes during
+            // tool calls or large file reads before the next event arrives.
+            sseConfiguration.timeoutIntervalForRequest = 0
+            self.sseSession = URLSession(configuration: sseConfiguration)
         }
     }
 
@@ -217,6 +230,18 @@ final class GhostboxClient {
     func removeGhost(name: String) async throws {
         let request = makeRequest(path: ["api", "ghosts", name], method: "DELETE")
         _ = try await perform(request)
+    }
+
+    func updateGhost(name: String, provider: String, model: String) async throws -> Ghost {
+        struct UpdateGhostRequest: Encodable {
+            let provider: String
+            let model: String
+        }
+
+        let body = try encoder.encode(UpdateGhostRequest(provider: provider, model: model))
+        let request = makeRequest(path: ["api", "ghosts", name], method: "PATCH", body: body)
+        let ghost = try await decodeResponse(for: request, as: Ghost.self)
+        return Ghost(name: name, status: ghost.status, provider: ghost.provider, model: ghost.model, portBase: ghost.portBase, containerId: ghost.containerId, createdAt: ghost.createdAt, systemPrompt: ghost.systemPrompt)
     }
 
     func getHistory(ghostName: String) async throws -> HistoryData {
@@ -429,7 +454,7 @@ final class GhostboxClient {
                     )
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
-                    let (bytes, response) = try await session.bytes(for: request)
+                    let (bytes, response) = try await sseSession.bytes(for: request)
                     try validate(response: response)
                     Self.logger.info("SSE connected for ghost \(ghostName, privacy: .public).")
 
@@ -470,9 +495,13 @@ final class GhostboxClient {
 
     func healthCheck() async -> Bool {
         do {
-            _ = try await listGhosts()
-            return true
+            let request = makeRequest(path: ["api", "health"])
+            let (data, _) = try await perform(request)
+            struct HealthResponse: Decodable { let status: String }
+            let response = try decoder.decode(HealthResponse.self, from: data)
+            return response.status == "ok"
         } catch {
+            Self.logger.error("Health check failed: \(error.localizedDescription, privacy: .public)")
             return false
         }
     }
