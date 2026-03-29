@@ -436,9 +436,11 @@ extension AppDelegate: @preconcurrency UNUserNotificationCenterDelegate {
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        let ghostName = notification.request.content.userInfo["ghostName"] as? String
-        let shouldPresent = ghostName.map { NSApp.keyWindow?.title != $0 } ?? true
-        completionHandler(shouldPresent ? [.banner, .sound, .badge] : [])
+        // Always show the banner. The notification only fires when the ghost's
+        // panel isn't visible, so if we get here the user needs to see it.
+        // macOS suppresses banners for foreground apps by default - returning
+        // .banner here overrides that.
+        completionHandler([.banner, .sound, .badge])
     }
 }
 

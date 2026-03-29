@@ -735,12 +735,12 @@ final class AgentChatViewModel: ObservableObject {
         await loadStats()
 
         // Fire notification when the agent finishes and the user isn't looking
-        // at this ghost's chat. Check visibility NOW (at completion), not at
-        // stream start - the user may have walked away during a long run.
+        // at this ghost's chat. Check if the ghost's panel is actually visible
+        // and the app is in the foreground. Panels hidden via Cmd+Shift+G have
+        // isVisible=false even though NSApp.isActive may be true.
         if !currentAssistantText.isEmpty, !isCompactCommand {
-            let isAppActive = NSApp.isActive
-            let isPanelVisible = NSApp.keyWindow?.title == ghostName
-            if !isAppActive || !isPanelVisible {
+            let isUserWatching = Self.isGhostPanelVisible(ghostName)
+            if !isUserWatching {
                 fireNotification(for: currentAssistantText)
             }
         }
@@ -1110,6 +1110,14 @@ final class AgentChatViewModel: ObservableObject {
         }
 
         return Date()
+    }
+
+    private static func isGhostPanelVisible(_ ghostName: String) -> Bool {
+        guard NSApp.isActive else { return false }
+        // Check all visible windows for one matching this ghost's title
+        return NSApp.windows.contains { window in
+            window.isVisible && window.title == ghostName
+        }
     }
 
     private static func isCompactCommand(_ prompt: String) -> Bool {
