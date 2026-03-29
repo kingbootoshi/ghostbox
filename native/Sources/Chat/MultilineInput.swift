@@ -14,6 +14,8 @@ struct MultilineInput: NSViewRepresentable {
     var onSubmit: () -> Void
     var onPasteCommand: () -> Bool
     var onKeyPress: ((NSEvent) -> Bool)?
+    var onArrowUp: (() -> Bool)?
+    var onArrowDown: (() -> Bool)?
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSScrollView()
@@ -62,6 +64,8 @@ struct MultilineInput: NSViewRepresentable {
         context.coordinator.onSubmit = onSubmit
         context.coordinator.onPasteCommand = onPasteCommand
         context.coordinator.onKeyPress = onKeyPress
+        context.coordinator.onArrowUp = onArrowUp
+        context.coordinator.onArrowDown = onArrowDown
         context.coordinator.minHeight = minHeight
         context.coordinator.maxHeight = maxHeight
         textView.onPasteCommand = context.coordinator.handlePasteCommand
@@ -92,6 +96,8 @@ struct MultilineInput: NSViewRepresentable {
         var onSubmit: () -> Void = {}
         var onPasteCommand: () -> Bool = { false }
         var onKeyPress: ((NSEvent) -> Bool)?
+        var onArrowUp: (() -> Bool)?
+        var onArrowDown: (() -> Bool)?
         var isUpdating = false
         var minHeight: CGFloat = 20
         var maxHeight: CGFloat = 60
@@ -119,6 +125,19 @@ struct MultilineInput: NSViewRepresentable {
                 }
                 return true
             }
+
+            if commandSelector == #selector(NSResponder.moveUp(_:)) {
+                if let handler = onArrowUp, handler() {
+                    return true
+                }
+            }
+
+            if commandSelector == #selector(NSResponder.moveDown(_:)) {
+                if let handler = onArrowDown, handler() {
+                    return true
+                }
+            }
+
             return false
         }
 

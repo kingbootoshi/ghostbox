@@ -12,7 +12,6 @@ import { getAuthStatus } from "./oauth";
 import {
   abortGhost,
   clearGhostQueue,
-  compactGhost,
   deleteGhostSession,
   generateApiKey,
   getConfig,
@@ -1879,13 +1878,6 @@ app.post("/api/ghosts/:name/reload", (c) =>
   handleRoute(c, async () => {
     await reloadGhost(c.req.param("name"));
     return c.json({ status: "reloaded" });
-  })
-);
-
-app.post("/api/ghosts/:name/compact", (c) =>
-  handleRoute(c, async () => {
-    await compactGhost(c.req.param("name"));
-    return c.json({ status: "compacted" });
   })
 );
 

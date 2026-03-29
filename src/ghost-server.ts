@@ -693,9 +693,7 @@ const flushMemories = async (reason: string): Promise<void> => {
 
 const settingsPath = "/root/.pi/agent/settings.json";
 const defaultModelContextWindow = 200000;
-const compactionTargetRatio = 0.25;
-const maxCompactionTargetTokens = 250000;
-const minReserveTokens = 16384;
+const defaultReserveTokens = 16384;
 const keepRecentTokens = 20000;
 
 type LogContext = Record<string, unknown>;
@@ -1563,18 +1561,14 @@ const getCompactionSettings = (
   model: PiModel | undefined
 ): {
   modelContextWindow: number;
-  compactionTarget: number;
   reserveTokens: number;
   keepRecentTokens: number;
 } => {
   const modelContextWindow = model?.contextWindow ?? defaultModelContextWindow;
-  const compactionTarget = Math.min(modelContextWindow * compactionTargetRatio, maxCompactionTargetTokens);
-  const reserveTokens = Math.max(modelContextWindow - compactionTarget, minReserveTokens);
 
   return {
     modelContextWindow,
-    compactionTarget,
-    reserveTokens,
+    reserveTokens: defaultReserveTokens,
     keepRecentTokens
   };
 };
@@ -1716,7 +1710,6 @@ log.info("Pi session ready", {
   compaction: {
     settingsPath,
     modelContextWindow: compactionSettings.modelContextWindow,
-    targetTokens: compactionSettings.compactionTarget,
     reserveTokens: compactionSettings.reserveTokens,
     keepRecentTokens: compactionSettings.keepRecentTokens
   }
@@ -1802,6 +1795,21 @@ const streamPrompt = async (
   let lastAssistantText = "";
   let currentThinkingText = "";
   let unsubscribe = (): void => {};
+  let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+
+  const startHeartbeat = (): void => {
+    stopHeartbeat();
+    heartbeatInterval = setInterval(() => {
+      sendJsonLine(res, { type: "heartbeat" } as GhostMessage);
+    }, 30_000);
+  };
+
+  const stopHeartbeat = (): void => {
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+      heartbeatInterval = null;
+    }
+  };
 
   const completion = new Promise<void>((resolve, reject) => {
     unsubscribe = session.subscribe((rawEvent) => {
@@ -1883,10 +1891,12 @@ const streamPrompt = async (
             tool: event.toolName,
             input: event.args ?? null
           });
+          startHeartbeat();
           return;
         }
 
         if (isToolExecutionEndEvent(event)) {
+          stopHeartbeat();
           const preview = typeof event.result === "string" ? event.result.slice(0, 200) : "";
           log.info("SDK tool_result", { preview, isError: event.isError });
           sendJsonLine(res, {
@@ -1897,6 +1907,7 @@ const streamPrompt = async (
         }
 
         if (isAgentEndEvent(event)) {
+          stopHeartbeat();
           const errorText = extractAgentEndError(event);
           if (errorText) {
             log.error("SDK agent_end error", { error: errorText, sessionId: session.sessionId });
@@ -1910,6 +1921,7 @@ const streamPrompt = async (
           resolve();
         }
       } catch (error) {
+        stopHeartbeat();
         unsubscribe();
         reject(error);
       }

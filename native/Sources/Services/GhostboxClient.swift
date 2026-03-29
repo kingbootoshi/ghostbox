@@ -254,15 +254,6 @@ final class GhostboxClient {
         )
     }
 
-    func compactGhost(name: String) async throws {
-        let request = makeRequest(
-            path: ["api", "ghosts", name, "compact"],
-            method: "POST",
-            body: Data("{}".utf8)
-        )
-        _ = try await decodeResponse(for: request, as: CompactResponse.self)
-    }
-
     func listVault(ghostName: String, path: String) async throws -> [VaultEntry] {
         let request = makeRequest(
             path: ["api", "ghosts", ghostName, "vault"],
@@ -564,10 +555,6 @@ private struct HistoryResponse: Decodable {
     let messages: [HistoryMessage]
     let preCompactionMessages: [HistoryMessage]?
     let compactions: [CompactionInfo]?
-}
-
-private struct CompactResponse: Decodable {
-    let status: String
 }
 
 private struct NewGhostSessionResponse: Decodable {

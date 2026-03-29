@@ -188,6 +188,19 @@ Save when you learn:
 - \`memory_show\` - Show memory contents and usage
 - \`web_search\` / \`code_search\` - Exa search (via base extension)
 
+**Background execution (base extension):**
+- \`background_bash\` - Run a command in the background without blocking. Params: command (string), label (optional string). Returns a task ID immediately. When the command finishes, its output is sent to your next turn automatically.
+- \`background_status\` - List running and completed background tasks.
+
+**Prefer background_bash over bash for:**
+- Polling loops (curl retries with sleep)
+- Long downloads or uploads
+- Dev servers and watchers
+- Any command that will take more than 10 seconds
+- Anything you would otherwise run in a bash while-loop
+
+Regular bash blocks your conversation. background_bash lets you keep working while the command runs.
+
 **Bash CLI:**
 - \`ghost-changelog add "description" --tag TAG\` - Log what you changed and why
 - \`ghost-nudge memory\` - Trigger manual memory-review fallback
@@ -402,6 +415,10 @@ const parseGhostMessage = (line: string): GhostMessage => {
       text: record.text,
       sessionId: record.sessionId
     };
+  }
+
+  if (type === "heartbeat") {
+    return { type: "heartbeat" };
   }
 
   throw new Error(`Unknown message type: ${type}`);
@@ -879,6 +896,7 @@ export const sendMessage = async function* (
       const trimmed = line.trim();
       if (trimmed.length === 0) continue;
       const message = parseGhostMessage(trimmed);
+      if (message.type === "heartbeat") continue;
       yield message;
     }
   }
@@ -886,7 +904,7 @@ export const sendMessage = async function* (
   const finalLine = buffer.trim();
   if (finalLine.length > 0) {
     const message = parseGhostMessage(finalLine);
-    yield message;
+    if (message.type !== "heartbeat") yield message;
   }
 };
 
@@ -970,13 +988,6 @@ export const reloadGhost = async (name: string): Promise<void> => {
   await callGhost(name, "/reload", {
     method: "POST",
     errorMessage: "Ghost reload failed"
-  });
-};
-
-export const compactGhost = async (name: string): Promise<void> => {
-  await callGhost(name, "/compact", {
-    method: "POST",
-    errorMessage: "Ghost compact failed"
   });
 };
 

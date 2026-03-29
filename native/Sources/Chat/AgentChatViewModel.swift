@@ -20,7 +20,7 @@ struct PendingImage: Identifiable {
 }
 
 struct QueuedChatMessage {
-    let prompt: String
+    var prompt: String
     let images: [PendingImage]
     let streamingBehavior: String?
     let isAlreadyDisplayed: Bool
@@ -62,6 +62,8 @@ final class AgentChatViewModel: ObservableObject {
     @Published var inputText = ""
     @Published var pendingImages: [PendingImage] = []
     @Published private(set) var queuedMessages: [QueuedChatMessage] = []
+    @Published private(set) var queueBrowseIndex: Int?
+    private var savedInputBeforeQueueBrowse: String = ""
     @Published private(set) var historySelectionMessageID: UUID?
     @Published var lastEscapeTime: Date?
     @Published var isStreaming = false
@@ -159,6 +161,14 @@ final class AgentChatViewModel: ObservableObject {
     }
 
     func send() {
+        if queueBrowseIndex != nil {
+            saveCurrentQueueEdit()
+            queueBrowseIndex = nil
+            inputText = savedInputBeforeQueueBrowse
+            savedInputBeforeQueueBrowse = ""
+            return
+        }
+
         let prompt = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let submittedImages = pendingImages.filter { !$0.isProcessing }
         guard (!prompt.isEmpty || !submittedImages.isEmpty), !isInputDisabled else { return }
@@ -243,6 +253,8 @@ final class AgentChatViewModel: ObservableObject {
     }
 
     func clearQueue() {
+        queueBrowseIndex = nil
+        savedInputBeforeQueueBrowse = ""
         queuedMessages.removeAll()
 
         let name = ghostName
@@ -395,29 +407,59 @@ final class AgentChatViewModel: ObservableObject {
         return exitHistoryModeIfNeeded()
     }
 
-    func compact() {
-        guard !isStreaming, !isLoadingHistory, !isCompacting else { return }
+    // MARK: - Queue Browsing
 
-        isCompacting = true
-        error = nil
+    var isQueueBrowsing: Bool { queueBrowseIndex != nil }
 
-        Task { [weak self] in
-            guard let self else { return }
+    @discardableResult
+    func browseQueueBackward() -> Bool {
+        guard !queuedMessages.isEmpty else { return false }
 
-            defer {
-                self.isCompacting = false
-            }
+        if let current = queueBrowseIndex {
+            guard current > 0 else { return true }
+            saveCurrentQueueEdit()
+            let next = current - 1
+            queueBrowseIndex = next
+            inputText = queuedMessages[next].prompt
+        } else {
+            savedInputBeforeQueueBrowse = inputText
+            let last = queuedMessages.count - 1
+            queueBrowseIndex = last
+            inputText = queuedMessages[last].prompt
+        }
+        return true
+    }
 
-            do {
-                try await client.compactGhost(name: ghostName)
-                hasLoadedInitialState = await reloadConversationState()
-                await loadStats()
-            } catch {
-                self.showError(error.localizedDescription)
-                self.messages.append(
-                    ChatMessage(role: .system, content: "Error: \(error.localizedDescription)")
-                )
-            }
+    @discardableResult
+    func browseQueueForward() -> Bool {
+        guard let current = queueBrowseIndex else { return false }
+
+        saveCurrentQueueEdit()
+        let next = current + 1
+        if next < queuedMessages.count {
+            queueBrowseIndex = next
+            inputText = queuedMessages[next].prompt
+        } else {
+            queueBrowseIndex = nil
+            inputText = savedInputBeforeQueueBrowse
+            savedInputBeforeQueueBrowse = ""
+        }
+        return true
+    }
+
+    func exitQueueBrowseMode() {
+        guard let current = queueBrowseIndex else { return }
+        saveCurrentQueueEdit()
+        queueBrowseIndex = nil
+        inputText = savedInputBeforeQueueBrowse
+        savedInputBeforeQueueBrowse = ""
+    }
+
+    private func saveCurrentQueueEdit() {
+        guard let current = queueBrowseIndex, current < queuedMessages.count else { return }
+        let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            queuedMessages[current].prompt = trimmed
         }
     }
 
@@ -514,6 +556,12 @@ final class AgentChatViewModel: ObservableObject {
     private func processNextQueued() {
         guard !isStreaming, !isLoadingHistory, !isCompacting, !isCreatingSession, !queuedMessages.isEmpty else { return }
 
+        if queueBrowseIndex != nil {
+            queueBrowseIndex = nil
+            inputText = savedInputBeforeQueueBrowse
+            savedInputBeforeQueueBrowse = ""
+        }
+
         let nextMessage = queuedMessages.removeFirst()
 
         if !nextMessage.isAlreadyDisplayed {
@@ -575,11 +623,18 @@ final class AgentChatViewModel: ObservableObject {
         // when clicked, so nil key window reliably means the UI is hidden.
         let panelsHiddenAtStart = NSApp.keyWindow == nil
 
+        if isCompactCommand {
+            isCompacting = true
+        }
+
         defer {
             if activeStreamID == streamID {
                 activeStreamID = nil
                 streamTask = nil
                 isStreaming = false
+            }
+            if isCompactCommand {
+                isCompacting = false
             }
         }
 
@@ -819,10 +874,6 @@ final class AgentChatViewModel: ObservableObject {
 
     var hasMoreOlderMessages: Bool {
         visiblePreCompactionCount < preCompactionMessages.count
-    }
-
-    func handleCompaction() async {
-        await handleCompaction(compactResponseMessageID: nil)
     }
 
     func loadSessions() async -> Bool {

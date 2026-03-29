@@ -23,6 +23,8 @@ struct ChatInputView: View {
     let onPasteCommand: () -> Bool
     let onHistoryBack: () -> Bool
     let onHistoryForward: () -> Bool
+    let onQueueBrowseUp: () -> Bool
+    let onQueueBrowseDown: () -> Bool
     let onSubmit: () -> Void
     @State private var inputHeight: CGFloat = ChatInputLayout.minHeight
 
@@ -83,7 +85,9 @@ struct ChatInputView: View {
                 minHeight: ChatInputLayout.minHeight,
                 maxHeight: ChatInputLayout.maxHeight,
                 onSubmit: { submitInput() },
-                onPasteCommand: onPasteCommand
+                onPasteCommand: onPasteCommand,
+                onArrowUp: onQueueBrowseUp,
+                onArrowDown: onQueueBrowseDown
             )
             .frame(height: inputHeight)
             .padding(.horizontal, 18)

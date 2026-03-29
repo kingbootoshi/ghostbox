@@ -54,6 +54,8 @@ struct AgentChatView: View {
                             onPasteCommand: viewModel.addImageFromPasteboard,
                             onHistoryBack: viewModel.browseSentHistoryBackward,
                             onHistoryForward: viewModel.browseSentHistoryForward,
+                            onQueueBrowseUp: viewModel.browseQueueBackward,
+                            onQueueBrowseDown: viewModel.browseQueueForward,
                             onSubmit: submitInput
                         )
                         .overlay(alignment: .bottomTrailing) {
@@ -353,19 +355,26 @@ struct AgentChatView: View {
     }
 
     private var queueIndicator: some View {
-        Text("\(viewModel.queuedMessages.count) queued")
+        let label: String = if let idx = viewModel.queueBrowseIndex {
+            "\(idx + 1)/\(viewModel.queuedMessages.count) queued"
+        } else {
+            "\(viewModel.queuedMessages.count) queued"
+        }
+
+        return Text(label)
             .font(Theme.Typography.caption(weight: .medium))
             .foregroundColor(Theme.Colors.accentLightest)
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(Theme.Colors.accent.opacity(0.18))
+            .background(Theme.Colors.accent.opacity(viewModel.isQueueBrowsing ? 0.3 : 0.18))
             .overlay {
                 RoundedRectangle(cornerRadius: 999, style: .continuous)
-                    .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
+                    .strokeBorder(Theme.Colors.accentLight.opacity(viewModel.isQueueBrowsing ? 0.35 : 0.18), lineWidth: 0.5)
             }
             .clipShape(RoundedRectangle(cornerRadius: 999, style: .continuous))
             .shadow(color: Theme.Colors.accent.opacity(0.12), radius: 16, x: 0, y: 8)
             .allowsHitTesting(false)
+            .animation(.easeOut(duration: 0.12), value: viewModel.queueBrowseIndex)
     }
 
     private func toggleToolMessage(_ id: UUID) {
@@ -420,6 +429,11 @@ struct AgentChatView: View {
 
     private func handleEscapeKey() -> KeyPress.Result {
         if viewModel.exitHistoryModeIfNeeded() {
+            return .handled
+        }
+
+        if viewModel.isQueueBrowsing {
+            viewModel.exitQueueBrowseMode()
             return .handled
         }
 

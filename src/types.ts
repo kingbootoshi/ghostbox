@@ -201,7 +201,15 @@ export type GhostStats = {
   } | null;
 };
 
-export type GhostMessage = ThinkingMessage | AssistantMessage | ToolUseMessage | ToolResultMessage | ResultMessage;
+export type HeartbeatMessage = { type: "heartbeat" };
+
+export type GhostMessage =
+  | ThinkingMessage
+  | AssistantMessage
+  | ToolUseMessage
+  | ToolResultMessage
+  | ResultMessage
+  | HeartbeatMessage;
 
 export type AuthProvider = "anthropic" | "openai-codex";
 
