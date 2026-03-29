@@ -618,11 +618,6 @@ final class AgentChatViewModel: ObservableObject {
         var currentAssistantIndex: Int?
         let isCompactCommand = Self.isCompactCommand(prompt)
         var compactResponseMessageID: UUID?
-        // Capture visibility at stream start. NSApp.keyWindow is nil when all
-        // panels are hidden (user pressed Cmd+Shift+G to hide), which is exactly
-        // when we want a notification. A non-activating panel only becomes key
-        // when clicked, so nil key window reliably means the UI is hidden.
-        let panelsHiddenAtStart = NSApp.keyWindow == nil
 
         if isCompactCommand {
             isCompacting = true
@@ -706,11 +701,16 @@ final class AgentChatViewModel: ObservableObject {
                     currentAssistantIndex = nil
 
                 case .result:
-                    if let text = event.text, !text.isEmpty, currentAssistantText.isEmpty {
-                        let resultMessage = ChatMessage(role: .ghost, content: text)
-                        messages.append(resultMessage)
-                        if isCompactCommand {
-                            compactResponseMessageID = resultMessage.id
+                    if let text = event.text, !text.isEmpty {
+                        if currentAssistantText.isEmpty {
+                            let resultMessage = ChatMessage(role: .ghost, content: text)
+                            messages.append(resultMessage)
+                            if isCompactCommand {
+                                compactResponseMessageID = resultMessage.id
+                            }
+                        }
+                        if currentAssistantText.isEmpty {
+                            currentAssistantText = text
                         }
                     }
                 }
@@ -734,12 +734,15 @@ final class AgentChatViewModel: ObservableObject {
         await loadGhost()
         await loadStats()
 
-        // Fire notification after the full response is complete so the preview
-        // shows the final text, not a partial first chunk. Only notify if the
-        // panels were hidden when the stream started - no point interrupting the
-        // user if they're already looking at the chat.
-        if panelsHiddenAtStart, !currentAssistantText.isEmpty, !isCompactCommand {
-            fireNotification(for: currentAssistantText)
+        // Fire notification when the agent finishes and the user isn't looking
+        // at this ghost's chat. Check visibility NOW (at completion), not at
+        // stream start - the user may have walked away during a long run.
+        if !currentAssistantText.isEmpty, !isCompactCommand {
+            let isAppActive = NSApp.isActive
+            let isPanelVisible = NSApp.keyWindow?.title == ghostName
+            if !isAppActive || !isPanelVisible {
+                fireNotification(for: currentAssistantText)
+            }
         }
 
         activeStreamID = nil
@@ -771,6 +774,12 @@ final class AgentChatViewModel: ObservableObject {
         )
 
         UNUserNotificationCenter.current().add(request)
+
+        NotificationCenter.default.post(
+            name: .ghostUnread,
+            object: nil,
+            userInfo: ["ghostName": ghostName]
+        )
     }
 
     private func prepareForOpeningTask(ghostHint: Ghost?) async {
@@ -1052,7 +1061,7 @@ final class AgentChatViewModel: ObservableObject {
         var orderedTaskIDs: [String] = []
 
         for message in preCompactionMessages + messages {
-            if message.role == .toolUse,
+            if message.role == .toolResult,
                let task = Self.parseBackgroundTaskStart(from: message.content) {
                 if tasksByID[task.id] == nil {
                     orderedTaskIDs.append(task.id)

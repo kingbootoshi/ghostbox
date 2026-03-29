@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 
@@ -10,9 +11,24 @@ final class AppState: ObservableObject {
     @Published var isStartingServer = false
     @Published var serverStatus: String?
     @Published var error: String?
+    @Published var unreadGhosts: Set<String> = []
 
     init(client: GhostboxClient = GhostboxClient()) {
         self.client = client
+    }
+
+    func markUnread(_ ghostName: String) {
+        unreadGhosts.insert(ghostName)
+        updateDockBadge()
+    }
+
+    func markRead(_ ghostName: String) {
+        unreadGhosts.remove(ghostName)
+        updateDockBadge()
+    }
+
+    private func updateDockBadge() {
+        NSApp.dockTile.badgeLabel = unreadGhosts.isEmpty ? nil : "\(unreadGhosts.count)"
     }
 
     func refreshGhosts() async {

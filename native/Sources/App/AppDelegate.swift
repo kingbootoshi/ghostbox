@@ -349,6 +349,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: .closeGhostChat,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleGhostUnread(_:)),
+            name: .ghostUnread,
+            object: nil
+        )
+    }
+
+    @objc private func handleGhostUnread(_ notification: Notification) {
+        guard let ghostName = notification.userInfo?["ghostName"] as? String else { return }
+        appState.markUnread(ghostName)
     }
 
     private func setupHotkey() {
@@ -395,6 +406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func handleOpenGhostChat(_ notification: Notification) {
         guard let ghostName = notification.userInfo?["ghostName"] as? String else { return }
+        appState.markRead(ghostName)
         openChat(ghostName: ghostName)
     }
 
@@ -411,6 +423,7 @@ extension AppDelegate: @preconcurrency UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         if let ghostName = response.notification.request.content.userInfo["ghostName"] as? String {
+            appState.markRead(ghostName)
             openChat(ghostName: ghostName)
             NSApp.activate(ignoringOtherApps: true)
         }
