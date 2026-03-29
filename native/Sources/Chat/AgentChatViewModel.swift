@@ -126,7 +126,7 @@ final class AgentChatViewModel: ObservableObject {
     }
 
     var isInputDisabled: Bool {
-        isWakingGhost || isLoadingHistory || isCompacting || ghost?.status == .stopped
+        isWakingGhost || isLoadingHistory || ghost?.status == .stopped
     }
 
     var activeBackgroundTaskCount: Int {
@@ -236,6 +236,7 @@ final class AgentChatViewModel: ObservableObject {
         streamTask?.cancel()
         streamTask = nil
         isStreaming = false
+        isCompacting = false
 
         if shouldClearQueue && hasQueuedMessages {
             clearQueue()

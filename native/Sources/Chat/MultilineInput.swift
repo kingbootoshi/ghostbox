@@ -16,6 +16,7 @@ struct MultilineInput: NSViewRepresentable {
     var onKeyPress: ((NSEvent) -> Bool)?
     var onArrowUp: (() -> Bool)?
     var onArrowDown: (() -> Bool)?
+    var onTab: (() -> Bool)?
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSScrollView()
@@ -66,6 +67,7 @@ struct MultilineInput: NSViewRepresentable {
         context.coordinator.onKeyPress = onKeyPress
         context.coordinator.onArrowUp = onArrowUp
         context.coordinator.onArrowDown = onArrowDown
+        context.coordinator.onTab = onTab
         context.coordinator.minHeight = minHeight
         context.coordinator.maxHeight = maxHeight
         textView.onPasteCommand = context.coordinator.handlePasteCommand
@@ -98,6 +100,7 @@ struct MultilineInput: NSViewRepresentable {
         var onKeyPress: ((NSEvent) -> Bool)?
         var onArrowUp: (() -> Bool)?
         var onArrowDown: (() -> Bool)?
+        var onTab: (() -> Bool)?
         var isUpdating = false
         var minHeight: CGFloat = 20
         var maxHeight: CGFloat = 60
@@ -134,6 +137,12 @@ struct MultilineInput: NSViewRepresentable {
 
             if commandSelector == #selector(NSResponder.moveDown(_:)) {
                 if let handler = onArrowDown, handler() {
+                    return true
+                }
+            }
+
+            if commandSelector == #selector(NSResponder.insertTab(_:)) {
+                if let handler = onTab, handler() {
                     return true
                 }
             }

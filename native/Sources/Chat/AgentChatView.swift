@@ -56,6 +56,7 @@ struct AgentChatView: View {
                             onHistoryForward: viewModel.browseSentHistoryForward,
                             onQueueBrowseUp: viewModel.browseQueueBackward,
                             onQueueBrowseDown: viewModel.browseQueueForward,
+                            onTab: autocompleteSlashCommand,
                             onSubmit: submitInput
                         )
                         .overlay(alignment: .bottomTrailing) {
@@ -385,6 +386,15 @@ struct AgentChatView: View {
                 expandedToolMessages.insert(id)
             }
         }
+    }
+
+    private func autocompleteSlashCommand() -> Bool {
+        guard isSlashCommandPopupVisible, let command = filteredSlashCommands.first else {
+            return false
+        }
+        viewModel.inputText = "/\(command.name) "
+        dismissSlashCommandPopup()
+        return true
     }
 
     private func submitInput() {

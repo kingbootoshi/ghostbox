@@ -25,6 +25,7 @@ struct ChatInputView: View {
     let onHistoryForward: () -> Bool
     let onQueueBrowseUp: () -> Bool
     let onQueueBrowseDown: () -> Bool
+    let onTab: () -> Bool
     let onSubmit: () -> Void
     @State private var inputHeight: CGFloat = ChatInputLayout.minHeight
 
@@ -47,6 +48,29 @@ struct ChatInputView: View {
                 .overlay {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .strokeBorder(Theme.Colors.accentLight.opacity(0.35), lineWidth: 0.8)
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.horizontal, 18)
+            }
+
+            if isCompacting {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(Theme.Colors.accentLight)
+
+                    Text("Compacting conversation...")
+                        .font(Theme.Typography.caption(weight: .medium))
+
+                    Spacer(minLength: 0)
+                }
+                .foregroundColor(Theme.Colors.accentLightest)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Theme.Colors.accent.opacity(0.16))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(Theme.Colors.accentLight.opacity(0.22), lineWidth: 0.6)
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .padding(.horizontal, 18)
@@ -87,7 +111,8 @@ struct ChatInputView: View {
                 onSubmit: { submitInput() },
                 onPasteCommand: onPasteCommand,
                 onArrowUp: onQueueBrowseUp,
-                onArrowDown: onQueueBrowseDown
+                onArrowDown: onQueueBrowseDown,
+                onTab: onTab
             )
             .frame(height: inputHeight)
             .padding(.horizontal, 18)
@@ -135,10 +160,6 @@ struct ChatInputView: View {
             return "Loading chat history..."
         }
 
-        if isCompacting {
-            return "Compacting chat..."
-        }
-
         return "Talk to \(ghostName)..."
     }
 
@@ -149,10 +170,6 @@ struct ChatInputView: View {
 
         if isLoadingHistory {
             return "Please wait"
-        }
-
-        if isCompacting {
-            return "Refreshing conversation"
         }
 
         if isCreatingSession {
