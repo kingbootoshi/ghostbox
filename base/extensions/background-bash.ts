@@ -392,4 +392,12 @@ export default function (pi: ExtensionAPI) {
       return result(buildStatusText());
     },
   });
+
+  (globalThis as any).__ghostbox_kill_bg_task = (taskId: string): { killed: boolean; taskId: string } => {
+    const task = runningTasks.get(taskId);
+    if (!task) return { killed: false, taskId };
+    task.process.kill("SIGTERM");
+    runningTasks.delete(taskId);
+    return { killed: true, taskId };
+  };
 }

@@ -173,7 +173,7 @@ final class GhostboxClient {
     static func fromUserDefaults() -> GhostboxClient {
         let defaults = UserDefaults.standard
         let urlString = defaults.string(forKey: "serverURL") ?? ""
-        let token = defaults.string(forKey: "serverToken") ?? ""
+        let token = KeychainHelper.loadToken() ?? ""
         let url = urlString.isEmpty ? nil : URL(string: urlString)
         return GhostboxClient(baseURL: url, token: token.isEmpty ? nil : token)
     }
@@ -284,6 +284,15 @@ final class GhostboxClient {
     func abortGhost(name: String) async throws {
         let request = makeRequest(
             path: ["api", "ghosts", name, "abort"],
+            method: "POST",
+            body: Data("{}".utf8)
+        )
+        _ = try await perform(request)
+    }
+
+    func killBackgroundTask(ghostName: String, taskId: String) async throws {
+        let request = makeRequest(
+            path: ["api", "ghosts", ghostName, "tasks", taskId, "kill"],
             method: "POST",
             body: Data("{}".utf8)
         )

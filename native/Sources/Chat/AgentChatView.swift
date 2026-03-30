@@ -5,6 +5,14 @@ private enum ChatPanelLayout {
     static let vaultBrowserWidth: CGFloat = 720
 }
 
+private struct ScrollOffsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 struct AgentChatView: View {
     @ObservedObject var viewModel: AgentChatViewModel
     @FocusState var isInputFocused: Bool
@@ -18,6 +26,8 @@ struct AgentChatView: View {
     @State var didAttemptSlashCommandFetch = false
     @State var isSlashCommandPopupVisible = false
     @State private var expandedImage: NSImage?
+    @State private var isNearBottom = true
+    @State private var scrollViewHeight: CGFloat = 0
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -57,6 +67,9 @@ struct AgentChatView: View {
                             onQueueBrowseUp: viewModel.browseQueueBackward,
                             onQueueBrowseDown: viewModel.browseQueueForward,
                             onTab: autocompleteSlashCommand,
+                            onKillBackgroundTask: { taskId in
+                                viewModel.killBackgroundTask(taskId: taskId)
+                            },
                             onSubmit: submitInput
                         )
                         .overlay(alignment: .bottomTrailing) {
@@ -215,114 +228,161 @@ struct AgentChatView: View {
 
     private var chatContent: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                if viewModel.isWakingGhost && viewModel.messages.isEmpty {
-                    VStack(spacing: 12) {
-                        ProgressView()
-                            .controlSize(.small)
-                            .tint(Theme.Colors.accentLight)
+            ZStack(alignment: .bottom) {
+                ScrollView {
+                    if viewModel.isWakingGhost && viewModel.messages.isEmpty {
+                        VStack(spacing: 12) {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(Theme.Colors.accentLight)
 
-                        Text("Waking ghost...")
-                            .font(Theme.Typography.body())
-                            .foregroundColor(Color.white.opacity(Theme.Text.secondary))
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 40)
-                } else if viewModel.isLoadingHistory && viewModel.messages.isEmpty {
-                    VStack(spacing: 12) {
-                        ProgressView()
-                            .controlSize(.small)
-                            .tint(Theme.Colors.accentLight)
+                            Text("Waking ghost...")
+                                .font(Theme.Typography.body())
+                                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 40)
+                    } else if viewModel.isLoadingHistory && viewModel.messages.isEmpty {
+                        VStack(spacing: 12) {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(Theme.Colors.accentLight)
 
-                        Text("Loading chat history...")
-                            .font(Theme.Typography.body())
-                            .foregroundColor(Color.white.opacity(Theme.Text.secondary))
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 40)
-                } else if viewModel.isCreatingSession && viewModel.messages.isEmpty {
-                    VStack(spacing: 10) {
-                        Text("Starting new session...")
-                            .font(Theme.Typography.body(weight: .medium))
-                            .foregroundColor(Theme.Colors.accentLight)
+                            Text("Loading chat history...")
+                                .font(Theme.Typography.body())
+                                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 40)
+                    } else if viewModel.isCreatingSession && viewModel.messages.isEmpty {
+                        VStack(spacing: 10) {
+                            Text("Starting new session...")
+                                .font(Theme.Typography.body(weight: .medium))
+                                .foregroundColor(Theme.Colors.accentLight)
 
-                        Text("You can start typing right away.")
-                            .font(Theme.Typography.body())
-                            .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 40)
-                } else if viewModel.messages.isEmpty {
-                    VStack(spacing: 8) {
-                        Text("No messages yet.")
-                            .font(Theme.Typography.body(weight: .medium))
-                            .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                            Text("You can start typing right away.")
+                                .font(Theme.Typography.body())
+                                .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 40)
+                    } else if viewModel.messages.isEmpty {
+                        VStack(spacing: 8) {
+                            Text("No messages yet.")
+                                .font(Theme.Typography.body(weight: .medium))
+                                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
 
-                        Text("Send a message to start the thread.")
-                            .font(Theme.Typography.body())
-                            .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 40)
-                } else {
-                    LazyVStack(spacing: 20) {
-                        if !viewModel.preCompactionMessages.isEmpty {
-                            if viewModel.hasMoreOlderMessages {
-                                showMoreButton
-                            }
+                            Text("Send a message to start the thread.")
+                                .font(Theme.Typography.body())
+                                .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 40)
+                    } else {
+                        LazyVStack(spacing: 20) {
+                            if !viewModel.preCompactionMessages.isEmpty {
+                                if viewModel.hasMoreOlderMessages {
+                                    showMoreButton
+                                }
 
-                            if viewModel.showingPreCompactionMessages {
-                                chatItemsSection(cachedPreCompactionDisplayItems)
+                                if viewModel.showingPreCompactionMessages {
+                                    chatItemsSection(cachedPreCompactionDisplayItems)
 
-                                HStack(spacing: 12) {
-                                    hideOlderButton
-                                    if viewModel.hasMoreOlderMessages {
-                                        showMoreButton
+                                    HStack(spacing: 12) {
+                                        hideOlderButton
+                                        if viewModel.hasMoreOlderMessages {
+                                            showMoreButton
+                                        }
                                     }
                                 }
+
+                                CompactionDivider(summary: viewModel.compactionSummary)
                             }
 
-                            CompactionDivider(summary: viewModel.compactionSummary)
-                        }
+                            chatItemsSection(cachedDisplayItems)
 
-                        chatItemsSection(cachedDisplayItems)
+                            if viewModel.isStreaming {
+                                GhostTypingBlock(name: viewModel.ghostName)
+                                    .id(ChatScrollAnchor.typing)
+                            }
 
-                        if viewModel.isStreaming {
-                            GhostTypingBlock(name: viewModel.ghostName)
-                                .id(ChatScrollAnchor.typing)
-                        }
-
-                        Color.clear
+                            GeometryReader { geo in
+                                Color.clear.preference(
+                                    key: ScrollOffsetKey.self,
+                                    value: geo.frame(in: .named("chatScroll")).minY
+                                )
+                            }
                             .frame(height: 1)
                             .id(ChatScrollAnchor.bottom)
+                        }
+                        .padding(.top, 20)
+                        .padding(.bottom, 16)
                     }
-                    .padding(.top, 20)
-                    .padding(.bottom, 16)
+                }
+                .coordinateSpace(name: "chatScroll")
+                .background {
+                    GeometryReader { geo in
+                        Color.clear
+                            .onAppear {
+                                scrollViewHeight = geo.size.height
+                            }
+                            .onChange(of: geo.size.height) {
+                                scrollViewHeight = geo.size.height
+                            }
+                    }
+                }
+                .onPreferenceChange(ScrollOffsetKey.self) { bottomY in
+                    let nearBottom = bottomY < scrollViewHeight + 150
+                    if nearBottom != isNearBottom {
+                        isNearBottom = nearBottom
+                    }
+                }
+                .onAppear {
+                    scrollToLatest(using: proxy)
+                }
+                .onChange(of: viewModel.messages.count) {
+                    guard isNearBottom else { return }
+                    scrollToLatest(using: proxy)
+                }
+                .onChange(of: viewModel.messagesVersion) {
+                    guard isNearBottom else { return }
+                    scrollToLatest(using: proxy)
+                }
+                .onChange(of: viewModel.historySelectionMessageID) {
+                    guard let selectionID = viewModel.historySelectionMessageID else { return }
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        proxy.scrollTo(ChatScrollAnchor.message(selectionID), anchor: .center)
+                    }
+                }
+                .onChange(of: viewModel.isStreaming) {
+                    guard isNearBottom else { return }
+                    scrollToLatest(using: proxy)
+                }
+                .onChange(of: viewModel.sessions?.current) {
+                    scrollToLatest(using: proxy)
+                }
+
+                if !isNearBottom && !viewModel.messages.isEmpty {
+                    Button {
+                        scrollToLatest(using: proxy)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.down")
+                            Text("Latest")
+                        }
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Theme.Colors.accentLightest)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Theme.Colors.accent)
+                        .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 12)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
                 }
             }
-            .onAppear {
-                scrollToLatest(using: proxy)
-            }
-            .onChange(of: viewModel.messages.count) {
-                scrollToLatest(using: proxy)
-            }
-            .onChange(of: viewModel.messagesVersion) {
-                guard viewModel.isStreaming else { return }
-                scrollToLatest(using: proxy)
-            }
-            .onChange(of: viewModel.historySelectionMessageID) {
-                guard let selectionID = viewModel.historySelectionMessageID else { return }
-                withAnimation(.easeOut(duration: 0.2)) {
-                    proxy.scrollTo(ChatScrollAnchor.message(selectionID), anchor: .center)
-                }
-            }
-            .onChange(of: viewModel.isStreaming) {
-                guard viewModel.isStreaming else { return }
-                scrollToLatest(using: proxy)
-            }
-            .onChange(of: viewModel.sessions?.current) {
-                scrollToLatest(using: proxy)
-            }
+            .animation(.easeOut(duration: 0.15), value: isNearBottom)
         }
     }
 

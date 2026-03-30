@@ -26,6 +26,7 @@ struct ChatInputView: View {
     let onQueueBrowseUp: () -> Bool
     let onQueueBrowseDown: () -> Bool
     let onTab: () -> Bool
+    let onKillBackgroundTask: (String) -> Void
     let onSubmit: () -> Void
     @State private var inputHeight: CGFloat = ChatInputLayout.minHeight
     @State private var showingBackgroundTasks = false
@@ -226,6 +227,13 @@ struct ChatInputView: View {
                             .lineLimit(1)
                     }
                     Spacer(minLength: 0)
+                    Button {
+                        onKillBackgroundTask(task.id)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.white.opacity(0.4))
+                    }
+                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)

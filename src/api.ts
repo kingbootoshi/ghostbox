@@ -21,6 +21,7 @@ import {
   getGhostQueue,
   getGhostSessions,
   getGhostStats,
+  killBackgroundTask,
   killGhost,
   listApiKeys,
   listGhosts,
@@ -1148,6 +1149,10 @@ const getErrorStatus = (error: unknown): ApiStatusCode => {
     return 404;
   }
 
+  if (message.includes("extension not loaded")) {
+    return 404;
+  }
+
   if (
     message.includes("already exists") ||
     message.includes("is not running") ||
@@ -1903,6 +1908,13 @@ app.post("/api/ghosts/:name/abort", (c) =>
   handleRoute(c, async () => {
     await abortGhost(c.req.param("name"));
     return c.json({ status: "aborted" });
+  })
+);
+
+app.post("/api/ghosts/:name/tasks/:taskId/kill", (c) =>
+  handleRoute(c, async () => {
+    const result = await killBackgroundTask(c.req.param("name"), c.req.param("taskId"));
+    return c.json(result);
   })
 );
 

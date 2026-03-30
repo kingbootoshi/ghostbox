@@ -25,7 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var hasConnection: Bool {
         let url = UserDefaults.standard.string(forKey: "serverURL") ?? ""
-        let token = UserDefaults.standard.string(forKey: "serverToken") ?? ""
+        let token = KeychainHelper.loadToken() ?? ""
         return !url.isEmpty && !token.isEmpty
     }
 
@@ -42,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenuBar()
         setupNotifications()
         setupHotkey()
+        migrateLegacyServerTokenIfNeeded()
 
         if hasConnection {
             launchHub()
@@ -54,7 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let connectionView = ConnectionView { [weak self] url, token in
             guard let self else { return }
             UserDefaults.standard.set(url, forKey: "serverURL")
-            UserDefaults.standard.set(token, forKey: "serverToken")
+            try? KeychainHelper.save(token: token)
 
             self.client = GhostboxClient(baseURL: URL(string: url), token: token)
             self.appState = AppState(client: self.client)
@@ -105,6 +106,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         connectionWindow = window
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    private func migrateLegacyServerTokenIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard let legacyToken = defaults.string(forKey: "serverToken"), !legacyToken.isEmpty else {
+            return
+        }
+
+        if KeychainHelper.loadToken() == nil {
+            try? KeychainHelper.save(token: legacyToken)
+        }
+
+        defaults.removeObject(forKey: "serverToken")
     }
 
     private func launchHub() {
@@ -471,7 +485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func disconnectMenuAction() {
         UserDefaults.standard.removeObject(forKey: "serverURL")
-        UserDefaults.standard.removeObject(forKey: "serverToken")
+        KeychainHelper.deleteToken()
         closeChatAll()
         hubPanelController?.hide()
         hubPanelController = nil

@@ -90,7 +90,7 @@ struct HubSettingsView: View {
     let onSave: () -> Void
 
     @AppStorage("serverURL") private var serverURL = ""
-    @AppStorage("serverToken") private var serverToken = ""
+    @State private var serverToken = KeychainHelper.loadToken() ?? ""
 
     var body: some View {
         settingsContent
@@ -161,7 +161,7 @@ struct HubSettingsView: View {
                     .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
 
                 HubFieldLabel("API Token")
-                HubSecureField("Not set", text: $serverToken)
+                HubSecureField("Not set", text: serverTokenBinding)
                 Text("Required for remote servers. Get from ghostbox admin token.")
                     .font(Theme.Typography.caption())
                     .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
@@ -243,5 +243,20 @@ struct HubSettingsView: View {
             .font(Theme.Typography.caption())
             .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
             .padding(.leading, 2)
+    }
+
+    private var serverTokenBinding: Binding<String> {
+        Binding(
+            get: { serverToken },
+            set: { newValue in
+                serverToken = newValue
+
+                if newValue.isEmpty {
+                    KeychainHelper.deleteToken()
+                } else {
+                    try? KeychainHelper.save(token: newValue)
+                }
+            }
+        )
     }
 }

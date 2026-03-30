@@ -998,6 +998,19 @@ export const abortGhost = async (name: string): Promise<void> => {
   });
 };
 
+export const killBackgroundTask = async (
+  name: string,
+  taskId: string
+): Promise<{ status: "killed"; taskId: string }> => {
+  const path = `/tasks/${encodeURIComponent(taskId)}/kill`;
+  const response = await callGhost(name, path, {
+    method: "POST",
+    errorMessage: "Ghost background task kill failed"
+  });
+
+  return (await response.json()) as { status: "killed"; taskId: string };
+};
+
 export const newGhostSession = async (name: string): Promise<{ status: "new_session"; sessionId: string }> => {
   const response = await callGhost(name, "/new", {
     method: "POST",

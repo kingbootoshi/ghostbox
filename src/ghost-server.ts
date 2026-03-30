@@ -2843,6 +2843,38 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  if (req.method === "POST") {
+    const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+    const taskKillMatch = pathname.match(/^\/tasks\/([^/]+)\/kill$/);
+
+    if (taskKillMatch) {
+      const taskId = decodeURIComponent(taskKillMatch[1]);
+      const killBackgroundTask = (globalThis as any).__ghostbox_kill_bg_task as
+        | ((taskId: string) => { killed: boolean; taskId: string })
+        | undefined;
+
+      if (!killBackgroundTask) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Background task extension not loaded" }));
+        log.info("Response sent", { method: req.method, url: req.url, status: 404 });
+        return;
+      }
+
+      const result = killBackgroundTask(taskId);
+      if (!result.killed) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `Background task "${taskId}" not found` }));
+        log.info("Response sent", { method: req.method, url: req.url, status: 404 });
+        return;
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "killed", taskId }));
+      log.info("Response sent", { method: req.method, url: req.url, status: 200 });
+      return;
+    }
+  }
+
   if (req.method === "POST" && req.url === "/new") {
     try {
       log.info("Pi new session start", { sessionId: session.sessionId });

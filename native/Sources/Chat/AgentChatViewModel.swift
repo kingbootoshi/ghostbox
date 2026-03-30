@@ -263,6 +263,20 @@ final class AgentChatViewModel: ObservableObject {
         }
     }
 
+    func killBackgroundTask(taskId: String) {
+        activeBackgroundTasks.removeAll { $0.id == taskId }
+
+        Task { [weak self] in
+            guard let self else { return }
+
+            do {
+                try await client.killBackgroundTask(ghostName: ghostName, taskId: taskId)
+            } catch {
+                rebuildActiveBackgroundTasks()
+            }
+        }
+    }
+
     func switchModel(to model: GhostModel) {
         let command = "/model \(model.provider)/\(model.modelId)"
         messages.append(ChatMessage(role: .system, content: "Switching to \(model.displayName)..."))
