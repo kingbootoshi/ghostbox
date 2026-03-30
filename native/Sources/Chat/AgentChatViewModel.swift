@@ -793,7 +793,7 @@ final class AgentChatViewModel: ObservableObject {
         let content = UNMutableNotificationContent()
         content.title = "Ghostbox - \(ghostName)"
         content.body = preview
-        content.sound = .default
+        content.sound = .none
         content.categoryIdentifier = "GHOST_MESSAGE"
         content.userInfo = ["ghostName": ghostName]
 
