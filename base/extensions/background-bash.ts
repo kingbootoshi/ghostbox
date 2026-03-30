@@ -31,7 +31,6 @@ type TaskCompletion = {
 
 type RunningTask = {
   process: ChildProcess;
-  command: string;
   label: string;
   startTime: string;
   stdout: CapturedStream;
@@ -278,7 +277,7 @@ const formatCompletedTask = (task: CompletedTask): string => {
 
 const buildStatusText = (): string => {
   if (runningTasks.size === 0 && completedTasks.size === 0) {
-    return "No background tasks.";
+    return "No running tasks.";
   }
 
   const lines: string[] = [];
@@ -345,7 +344,6 @@ export default function (pi: ExtensionAPI) {
 
       const task: RunningTask = {
         process: child,
-        command,
         label,
         startTime: new Date().toISOString(),
         stdout: createCapturedStream(),
@@ -398,6 +396,7 @@ export default function (pi: ExtensionAPI) {
     if (!task) return { killed: false, taskId };
     task.process.kill("SIGTERM");
     runningTasks.delete(taskId);
+    maybeStopWatcher();
     return { killed: true, taskId };
   };
 }

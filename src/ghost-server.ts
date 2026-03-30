@@ -2843,8 +2843,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
-  if (req.method === "POST") {
-    const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+  if (req.method === "POST" && req.url?.startsWith("/tasks/")) {
+    const pathname = new URL(req.url, "http://localhost").pathname;
     const taskKillMatch = pathname.match(/^\/tasks\/([^/]+)\/kill$/);
 
     if (taskKillMatch) {

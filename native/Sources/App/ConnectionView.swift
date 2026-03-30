@@ -115,7 +115,7 @@ struct ConnectionView: View {
 
     private func connect() {
         let url = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let token = serverToken.filter { !$0.isWhitespace && !$0.isNewline }
+        let token = Self.sanitizedToken(serverToken)
 
         guard URL(string: url) != nil else {
             error = "Invalid URL"
@@ -136,5 +136,9 @@ struct ConnectionView: View {
                 isConnecting = false
             }
         }
+    }
+
+    private static func sanitizedToken(_ token: String) -> String {
+        token.filter { !$0.isWhitespace && !$0.isNewline }
     }
 }

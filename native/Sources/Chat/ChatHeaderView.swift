@@ -102,7 +102,7 @@ struct ChatHeaderView: View {
                     .font(Theme.Typography.label(weight: .regular))
                     .foregroundColor(Theme.Colors.accentLight)
             } else if viewModel.isLoadingHistory {
-                Text("Loading saved messages...")
+                Text("Loading chat history...")
                     .font(Theme.Typography.label(weight: .regular))
                     .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
             }

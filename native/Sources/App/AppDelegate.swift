@@ -22,11 +22,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var serverLogHandle: FileHandle?
     private var baseMenuBarIcon: NSImage?
     private var unreadObservation: AnyCancellable?
+    private var lastRenderedBadgeCount: Int?
 
     private var hasConnection: Bool {
-        let url = UserDefaults.standard.string(forKey: "serverURL") ?? ""
-        let token = KeychainHelper.loadToken() ?? ""
-        return !url.isEmpty && !token.isEmpty
+        GhostboxClient.fromUserDefaults().token != nil
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -373,6 +372,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateMenuBarBadge(count: Int) {
         guard let button = statusItem?.button else { return }
+        guard lastRenderedBadgeCount != count else { return }
+        lastRenderedBadgeCount = count
 
         guard let baseIcon = baseMenuBarIcon else {
             button.title = count > 0 ? "Ghost (\(count))" : "Ghost"

@@ -9,7 +9,6 @@ struct ChatInputView: View {
     @Binding var inputText: String
     let ghostName: String
     let backgroundTasks: [ActiveBackgroundTask]
-    let isStreaming: Bool
     let isWakingGhost: Bool
     let isLoadingHistory: Bool
     let isCompacting: Bool
@@ -17,12 +16,8 @@ struct ChatInputView: View {
     let isHistoryModeActive: Bool
     let isInputDisabled: Bool
     let isInputFocused: FocusState<Bool>.Binding
-    let showsSlashCommandPopup: Bool
-    let firstFilteredSlashCommand: GhostSlashCommand?
     let stats: GhostStats?
     let onPasteCommand: () -> Bool
-    let onHistoryBack: () -> Bool
-    let onHistoryForward: () -> Bool
     let onQueueBrowseUp: () -> Bool
     let onQueueBrowseDown: () -> Bool
     let onTab: () -> Bool
@@ -87,7 +82,7 @@ struct ChatInputView: View {
                 isDisabled: isInputDisabled,
                 minHeight: ChatInputLayout.minHeight,
                 maxHeight: ChatInputLayout.maxHeight,
-                onSubmit: { submitInput() },
+                onSubmit: onSubmit,
                 onPasteCommand: onPasteCommand,
                 onArrowUp: onQueueBrowseUp,
                 onArrowDown: onQueueBrowseDown,
@@ -242,9 +237,5 @@ struct ChatInputView: View {
         .frame(minWidth: 240, maxWidth: 320)
         .padding(.vertical, 4)
         .background(.ultraThinMaterial)
-    }
-
-    private func submitInput() {
-        onSubmit()
     }
 }

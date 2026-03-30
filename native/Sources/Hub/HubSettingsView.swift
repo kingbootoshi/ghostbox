@@ -91,6 +91,7 @@ struct HubSettingsView: View {
 
     @AppStorage("serverURL") private var serverURL = ""
     @State private var serverToken = KeychainHelper.loadToken() ?? ""
+    @FocusState private var isServerTokenFocused: Bool
 
     var body: some View {
         settingsContent
@@ -161,7 +162,8 @@ struct HubSettingsView: View {
                     .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
 
                 HubFieldLabel("API Token")
-                HubSecureField("Not set", text: serverTokenBinding)
+                HubSecureField("Not set", text: $serverToken)
+                    .focused($isServerTokenFocused)
                 Text("Required for remote servers. Get from ghostbox admin token.")
                     .font(Theme.Typography.caption())
                     .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
@@ -201,7 +203,7 @@ struct HubSettingsView: View {
                 }
             }
 
-            Button(action: onSave) {
+            Button(action: saveSettings) {
                 HStack(spacing: 8) {
                     if isSavingConfig {
                         ProgressView()
@@ -225,6 +227,11 @@ struct HubSettingsView: View {
             .buttonStyle(.plain)
             .disabled(isLoadingConfig || isSavingConfig)
         }
+        .onChange(of: isServerTokenFocused) {
+            if !isServerTokenFocused {
+                persistServerToken()
+            }
+        }
     }
 
     private func settingsFeedbackView(_ feedback: HubSettingsFeedback) -> some View {
@@ -245,18 +252,23 @@ struct HubSettingsView: View {
             .padding(.leading, 2)
     }
 
-    private var serverTokenBinding: Binding<String> {
-        Binding(
-            get: { serverToken },
-            set: { newValue in
-                serverToken = newValue
+    private func saveSettings() {
+        persistServerToken()
+        onSave()
+    }
 
-                if newValue.isEmpty {
-                    KeychainHelper.deleteToken()
-                } else {
-                    try? KeychainHelper.save(token: newValue)
-                }
-            }
-        )
+    private func persistServerToken() {
+        let sanitizedToken = Self.sanitizedToken(serverToken)
+        serverToken = sanitizedToken
+
+        if sanitizedToken.isEmpty {
+            KeychainHelper.deleteToken()
+        } else {
+            try? KeychainHelper.save(token: sanitizedToken)
+        }
+    }
+
+    private static func sanitizedToken(_ token: String) -> String {
+        token.filter { !$0.isWhitespace && !$0.isNewline }
     }
 }

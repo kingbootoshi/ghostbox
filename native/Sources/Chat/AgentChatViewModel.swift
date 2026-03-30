@@ -95,6 +95,7 @@ final class AgentChatViewModel: ObservableObject {
         formatter.formatOptions = [.withInternetDateTime]
         return formatter
     }()
+    private static let backgroundTaskIDRegex = try! NSRegularExpression(pattern: "bg-[0-9a-fA-F-]{36}")
     private static let maximumAPIImageEdge: CGFloat = 1_568
     private static let maximumAPIImagePixels: CGFloat = 1_150_000
     private static let maximumAPIImageBytes = 4_500_000
@@ -125,10 +126,6 @@ final class AgentChatViewModel: ObservableObject {
 
     var isInputDisabled: Bool {
         isWakingGhost || isLoadingHistory || ghost?.status == .stopped
-    }
-
-    var activeBackgroundTaskCount: Int {
-        activeBackgroundTasks.count
     }
 
     func showToast(_ message: String) {
@@ -631,6 +628,7 @@ final class AgentChatViewModel: ObservableObject {
         var lastAssistantFlushTime: Date?
         let isCompactCommand = Self.isCompactCommand(prompt)
         var compactResponseMessageID: UUID?
+        var shouldProcessQueuedAfterStream = false
 
         if isCompactCommand {
             isCompacting = true
@@ -667,6 +665,7 @@ final class AgentChatViewModel: ObservableObject {
         }
 
         defer {
+            let shouldProcessQueued = shouldProcessQueuedAfterStream && activeStreamID == streamID
             if activeStreamID == streamID {
                 activeStreamID = nil
                 streamTask = nil
@@ -674,6 +673,9 @@ final class AgentChatViewModel: ObservableObject {
             }
             if isCompactCommand {
                 isCompacting = false
+            }
+            if shouldProcessQueued {
+                processNextQueued()
             }
         }
 
@@ -762,7 +764,7 @@ final class AgentChatViewModel: ObservableObject {
 
             // Continue processing any remaining queued messages
             if !queuedMessages.isEmpty {
-                processNextQueued()
+                shouldProcessQueuedAfterStream = true
             }
             return
         }
@@ -789,12 +791,8 @@ final class AgentChatViewModel: ObservableObject {
             }
         }
 
-        activeStreamID = nil
-        streamTask = nil
-        isStreaming = false
-
         if !queuedMessages.isEmpty {
-            processNextQueued()
+            shouldProcessQueuedAfterStream = true
         }
     }
 
@@ -1156,22 +1154,23 @@ final class AgentChatViewModel: ObservableObject {
             return nil
         }
 
+        if content.contains("No running tasks") {
+            return []
+        }
+
         guard content.contains("Running tasks:") else {
-            if content.contains("No running tasks") || content.contains("Running tasks: 0") {
-                return []
-            }
             return nil
         }
 
         // Extract all bg-<uuid> task IDs from the status output
         var ids: [String] = []
-        let pattern = "bg-[0-9a-fA-F-]{36}"
-        if let regex = try? NSRegularExpression(pattern: pattern) {
-            let matches = regex.matches(in: content, range: NSRange(content.startIndex..., in: content))
-            for match in matches {
-                if let range = Range(match.range, in: content) {
-                    ids.append(String(content[range]))
-                }
+        let matches = Self.backgroundTaskIDRegex.matches(
+            in: content,
+            range: NSRange(content.startIndex..., in: content)
+        )
+        for match in matches {
+            if let range = Range(match.range, in: content) {
+                ids.append(String(content[range]))
             }
         }
         return ids

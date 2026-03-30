@@ -50,7 +50,6 @@ struct AgentChatView: View {
                             inputText: $viewModel.inputText,
                             ghostName: viewModel.ghostName,
                             backgroundTasks: viewModel.activeBackgroundTasks,
-                            isStreaming: viewModel.isStreaming,
                             isWakingGhost: viewModel.isWakingGhost,
                             isLoadingHistory: viewModel.isLoadingHistory,
                             isCompacting: viewModel.isCompacting,
@@ -58,12 +57,8 @@ struct AgentChatView: View {
                             isHistoryModeActive: viewModel.isHistoryModeActive,
                             isInputDisabled: viewModel.isInputDisabled,
                             isInputFocused: $isInputFocused,
-                            showsSlashCommandPopup: showsSlashCommandPopup,
-                            firstFilteredSlashCommand: filteredSlashCommands.first,
                             stats: viewModel.stats,
                             onPasteCommand: viewModel.addImageFromPasteboard,
-                            onHistoryBack: viewModel.browseSentHistoryBackward,
-                            onHistoryForward: viewModel.browseSentHistoryForward,
                             onQueueBrowseUp: viewModel.browseQueueBackward,
                             onQueueBrowseDown: viewModel.browseQueueForward,
                             onTab: autocompleteSlashCommand,
@@ -338,10 +333,6 @@ struct AgentChatView: View {
                     }
                 }
                 .onAppear {
-                    scrollToLatest(using: proxy)
-                }
-                .onChange(of: viewModel.messages.count) {
-                    guard isNearBottom else { return }
                     scrollToLatest(using: proxy)
                 }
                 .onChange(of: viewModel.messagesVersion) {
