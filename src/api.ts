@@ -1241,6 +1241,21 @@ const handleRoute = async (c: Context, handler: () => Promise<Response>): Promis
   }
 };
 
+const enforceGhostScope = async (c: Context, next: () => Promise<void>): Promise<Response | void> => {
+  const auth = c.var.apiAuth;
+
+  if (auth.ghostName === null) {
+    await next();
+    return;
+  }
+
+  if (auth.ghostName !== c.req.param("name")) {
+    return c.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  await next();
+};
+
 app.use(
   "/api/*",
   cors({
@@ -1300,6 +1315,9 @@ app.use("/api/*", async (c, next) => {
     return c.json({ error: message }, { status });
   }
 });
+
+app.use("/api/ghosts/:name", enforceGhostScope);
+app.use("/api/ghosts/:name/*", enforceGhostScope);
 
 app.get("/api/ghosts", (c) =>
   handleRoute(c, async () => {

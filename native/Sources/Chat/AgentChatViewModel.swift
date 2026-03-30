@@ -38,13 +38,11 @@ final class AgentChatViewModel: ObservableObject {
     @Published var messages: [ChatMessage] = [] {
         didSet {
             messagesVersion &+= 1
-            rebuildActiveBackgroundTasks()
         }
     }
     @Published var preCompactionMessages: [ChatMessage] = [] {
         didSet {
             preCompactionDisplayVersion &+= 1
-            rebuildActiveBackgroundTasks()
         }
     }
     @Published var showingPreCompactionMessages = false
@@ -616,11 +614,42 @@ final class AgentChatViewModel: ObservableObject {
     ) async {
         var currentAssistantText = ""
         var currentAssistantIndex: Int?
+        var lastAssistantFlushTime: Date?
         let isCompactCommand = Self.isCompactCommand(prompt)
         var compactResponseMessageID: UUID?
 
         if isCompactCommand {
             isCompacting = true
+        }
+
+        func flushAssistantMessage(force: Bool = false) {
+            guard !currentAssistantText.isEmpty else { return }
+
+            let now = Date()
+            if !force,
+               let lastAssistantFlushTime,
+               now.timeIntervalSince(lastAssistantFlushTime) <= 0.05 {
+                return
+            }
+
+            if let index = currentAssistantIndex, messages.indices.contains(index) {
+                let existingMessage = messages[index]
+                let updatedMessage = existingMessage.updatingContent(currentAssistantText)
+                updateMessage(at: index, with: updatedMessage)
+                if isCompactCommand {
+                    compactResponseMessageID = updatedMessage.id
+                }
+            } else {
+                let assistantMessage = ChatMessage(role: .ghost, content: currentAssistantText)
+                messages.append(assistantMessage)
+                currentAssistantIndex = messages.count - 1
+                SoundManager.shared.play(.messageReceived)
+                if isCompactCommand {
+                    compactResponseMessageID = assistantMessage.id
+                }
+            }
+
+            lastAssistantFlushTime = now
         }
 
         defer {
@@ -650,6 +679,7 @@ final class AgentChatViewModel: ObservableObject {
 
             for try await event in stream {
                 if Task.isCancelled {
+                    flushAssistantMessage(force: true)
                     return
                 }
 
@@ -659,71 +689,71 @@ final class AgentChatViewModel: ObservableObject {
                     guard !chunk.isEmpty else { continue }
 
                     currentAssistantText += chunk
-
-                    if let index = currentAssistantIndex, messages.indices.contains(index) {
-                        let existingMessage = messages[index]
-                        messages[index] = existingMessage.updatingContent(currentAssistantText)
-                        if isCompactCommand {
-                            compactResponseMessageID = existingMessage.id
-                        }
-                    } else {
-                        let assistantMessage = ChatMessage(role: .ghost, content: currentAssistantText)
-                        messages.append(assistantMessage)
-                        currentAssistantIndex = messages.count - 1
-                        SoundManager.shared.play(.messageReceived)
-                        if isCompactCommand {
-                            compactResponseMessageID = assistantMessage.id
-                        }
-                    }
+                    flushAssistantMessage()
 
                 case .thinking:
                     let chunk = event.text ?? ""
                     guard !chunk.isEmpty else { continue }
 
+                    flushAssistantMessage(force: true)
+
                     if let last = messages.last, last.role == .thinking {
                         let index = messages.count - 1
-                        messages[index] = last.updatingContent(chunk)
+                        updateMessage(at: index, with: last.updatingContent(chunk))
                     } else {
                         messages.append(ChatMessage(role: .thinking, content: chunk))
                     }
 
                 case .tool_use:
+                    flushAssistantMessage(force: true)
+
                     let toolName = event.tool ?? "Tool"
                     let content = event.input?.stringValue ?? "Running \(toolName)"
                     messages.append(ChatMessage(role: .toolUse, content: content, toolName: toolName))
                     currentAssistantText = ""
                     currentAssistantIndex = nil
+                    lastAssistantFlushTime = nil
 
                 case .tool_result:
+                    flushAssistantMessage(force: true)
+
                     let content = event.output?.stringValue ?? "Tool finished."
                     messages.append(ChatMessage(role: .toolResult, content: content, toolName: "Result"))
+                    rebuildActiveBackgroundTasks()
                     currentAssistantText = ""
                     currentAssistantIndex = nil
+                    lastAssistantFlushTime = nil
 
                 case .result:
                     if let text = event.text, !text.isEmpty {
                         if currentAssistantText.isEmpty {
-                            let resultMessage = ChatMessage(role: .ghost, content: text)
-                            messages.append(resultMessage)
-                            if isCompactCommand {
-                                compactResponseMessageID = resultMessage.id
-                            }
-                        }
-                        if currentAssistantText.isEmpty {
                             currentAssistantText = text
                         }
                     }
+
+                    flushAssistantMessage(force: true)
                 }
             }
         } catch is CancellationError {
+            flushAssistantMessage(force: true)
             return
         } catch {
             self.showError(error.localizedDescription)
             messages.append(
                 ChatMessage(role: .system, content: "Error: \(error.localizedDescription)")
             )
+
+            // Reconcile with server - the ghost may have finished despite the stream error
+            await reloadConversationState()
+
+            // Continue processing any remaining queued messages
+            if !queuedMessages.isEmpty {
+                processNextQueued()
+            }
             return
         }
+
+        flushAssistantMessage(force: true)
 
         guard activeStreamID == streamID else { return }
 
@@ -842,6 +872,8 @@ final class AgentChatViewModel: ObservableObject {
             if !history.compactions.isEmpty && messages.isEmpty && !preCompactionMessages.isEmpty {
                 messages = [ChatMessage(role: .system, content: "Session compacted")]
             }
+
+            rebuildActiveBackgroundTasks()
             return true
         } catch {
             self.showError(error.localizedDescription)
@@ -929,6 +961,7 @@ final class AgentChatViewModel: ObservableObject {
         _ = exitHistoryModeIfNeeded()
         messages = []
         preCompactionMessages = []
+        rebuildActiveBackgroundTasks()
         compactionSummary = nil
         visiblePreCompactionCount = 0
         showingPreCompactionMessages = false
@@ -959,6 +992,9 @@ final class AgentChatViewModel: ObservableObject {
                 self.showError(error.localizedDescription)
                 hasLoadedInitialState = await reloadConversationState()
                 await loadStats()
+                if !queuedMessages.isEmpty {
+                    processNextQueued()
+                }
             }
         }
     }
@@ -1060,13 +1096,19 @@ final class AgentChatViewModel: ObservableObject {
         return selectableHistoryMessages.firstIndex { $0.id == historySelectionMessageID }
     }
 
+    private func updateMessage(at index: Int, with message: ChatMessage) {
+        guard messages.indices.contains(index) else { return }
+        messages[index] = message
+    }
+
     private func rebuildActiveBackgroundTasks() {
         var tasksByID: [String: ActiveBackgroundTask] = [:]
         var orderedTaskIDs: [String] = []
 
         for message in preCompactionMessages + messages {
-            if message.role == .toolResult,
-               let task = Self.parseBackgroundTaskStart(from: message.content) {
+            guard message.role == .toolResult else { continue }
+
+            if let task = Self.parseBackgroundTaskStart(from: message.content) {
                 if tasksByID[task.id] == nil {
                     orderedTaskIDs.append(task.id)
                 }
@@ -1081,8 +1123,7 @@ final class AgentChatViewModel: ObservableObject {
 
             // background_status tool results show the real running task list -
             // reconcile our tracked tasks with reality
-            if message.role == .toolResult,
-               let realTaskIDs = Self.parseBackgroundStatusResult(from: message.content) {
+            if let realTaskIDs = Self.parseBackgroundStatusResult(from: message.content) {
                 let realSet = Set(realTaskIDs)
                 orderedTaskIDs.removeAll { !realSet.contains($0) }
                 tasksByID = tasksByID.filter { realSet.contains($0.key) }

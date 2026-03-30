@@ -98,11 +98,6 @@ struct AgentMessageBlock: View {
                                 }
                         }
                         .textSelection(.enabled)
-                } else if let attributed = message.attributedContent {
-                    Text(attributed)
-                        .font(Theme.Typography.body())
-                        .foregroundColor(contentColor)
-                        .lineSpacing(5.6)
                 } else {
                     Text(message.content)
                         .font(Theme.Typography.body())

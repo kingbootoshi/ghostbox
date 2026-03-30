@@ -21,7 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var serverProcess: Process?
     private var serverLogHandle: FileHandle?
     private var baseMenuBarIcon: NSImage?
-    private var unreadObservation: Any?
+    private var unreadObservation: AnyCancellable?
 
     private var hasConnection: Bool {
         let url = UserDefaults.standard.string(forKey: "serverURL") ?? ""
@@ -58,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             self.client = GhostboxClient(baseURL: URL(string: url), token: token)
             self.appState = AppState(client: self.client)
+            self.bindUnreadObservation()
 
             // Order out immediately (no animation) to avoid dealloc crash
             let window = self.connectionWindow
@@ -344,6 +345,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem?.menu = menu
 
+        bindUnreadObservation()
+    }
+
+    private func bindUnreadObservation() {
+        unreadObservation?.cancel()
         unreadObservation = appState.$unreadGhosts
             .receive(on: RunLoop.main)
             .sink { [weak self] unreads in

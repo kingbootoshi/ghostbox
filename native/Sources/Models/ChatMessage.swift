@@ -9,7 +9,6 @@ struct ChatMessage: Identifiable {
     let toolName: String?
     let attachmentCount: Int
     let thumbnails: [NSImage]
-    let attributedContent: AttributedString?
     private let cachedResolvedToolName: String
     private let cachedNormalizedToolKind: String
     private let cachedToolPrimarySubject: String?
@@ -59,7 +58,6 @@ struct ChatMessage: Identifiable {
             structuredContent: structuredContent
         )
 
-        attributedContent = Self.makeAttributedContent(for: role, content: content)
         cachedResolvedToolName = Self.resolveToolName(
             sanitizedToolName: sanitizedToolName,
             normalizedToolKind: normalizedToolKind
@@ -123,18 +121,6 @@ extension ChatMessage {
             toolName: toolName,
             attachmentCount: attachmentCount,
             thumbnails: thumbnails
-        )
-    }
-
-    private static func makeAttributedContent(for role: Role, content: String) -> AttributedString? {
-        guard (role == .ghost || role == .system),
-              !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
-        }
-
-        return try? AttributedString(
-            markdown: content,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         )
     }
 
