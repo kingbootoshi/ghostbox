@@ -39,7 +39,7 @@ struct ChatHeaderView: View {
                 SessionSwitcherRow(
                     sessions: store.sessions,
                     currentSession: store.currentSession,
-                    isDisabled: viewModel.isStreaming || store.isLoadingHistory || viewModel.isWakingGhost || store.isCompacting || store.isCreatingSession,
+                    isDisabled: viewModel.isStreaming || store.isLoadingHistory || viewModel.isWakingGhost || store.isCompacting,
                     onSelect: { sessionId in
                         viewModel.switchSession(sessionId: sessionId)
                     },

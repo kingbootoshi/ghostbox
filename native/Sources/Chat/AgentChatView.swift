@@ -29,6 +29,7 @@ struct AgentChatView: View {
     @State private var expandedImage: NSImage?
     @State private var isNearBottom = true
     @State private var scrollViewHeight: CGFloat = 0
+    @State private var hasScrolledToInitialBottom = false
 
     var body: some View {
         @Bindable var input = viewModel.input
@@ -226,60 +227,52 @@ struct AgentChatView: View {
         }
     }
 
+    private var hasEmptyState: Bool {
+        viewModel.store.messages.isEmpty
+    }
+
     private var chatContent: some View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottom) {
-                ScrollView {
-                    if viewModel.isWakingGhost && viewModel.store.messages.isEmpty {
-                        VStack(spacing: 12) {
+                if hasEmptyState {
+                    VStack(spacing: 12) {
+                        if viewModel.isWakingGhost {
                             ProgressView()
                                 .controlSize(.small)
                                 .tint(Theme.Colors.accentLight)
-
                             Text("Waking ghost...")
                                 .font(Theme.Typography.body())
                                 .foregroundColor(Color.white.opacity(Theme.Text.secondary))
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 40)
-                    } else if viewModel.store.isLoadingHistory && viewModel.store.messages.isEmpty {
-                        VStack(spacing: 12) {
+                        } else if viewModel.store.isLoadingHistory {
                             ProgressView()
                                 .controlSize(.small)
                                 .tint(Theme.Colors.accentLight)
-
                             Text("Loading chat history...")
                                 .font(Theme.Typography.body())
                                 .foregroundColor(Color.white.opacity(Theme.Text.secondary))
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 40)
-                    } else if viewModel.store.isCreatingSession && viewModel.store.messages.isEmpty {
-                        VStack(spacing: 10) {
-                            Text("Starting new session...")
-                                .font(Theme.Typography.body(weight: .medium))
-                                .foregroundColor(Theme.Colors.accentLight)
-
-                            Text("You can start typing right away.")
-                                .font(Theme.Typography.body())
-                                .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 40)
-                    } else if viewModel.store.messages.isEmpty {
-                        VStack(spacing: 8) {
+                        } else if viewModel.store.isCreatingSession {
+                            // Header already shows "Starting new session..." - no duplicate here
+                        } else {
                             Text("No messages yet.")
                                 .font(Theme.Typography.body(weight: .medium))
                                 .foregroundColor(Color.white.opacity(Theme.Text.secondary))
-
                             Text("Send a message to start the thread.")
                                 .font(Theme.Typography.body())
                                 .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
                         }
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 40)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+
+                ScrollView {
+                    if hasEmptyState {
+                        Color.clear.frame(height: 0)
                     } else {
                         LazyVStack(spacing: 20) {
+                            if viewModel.store.hasOlderMessages {
+                                loadOlderButton
+                            }
+
                             if !viewModel.store.preCompactionMessages.isEmpty {
                                 if viewModel.store.hasMoreOlderMessages {
                                     showMoreButton
@@ -319,6 +312,7 @@ struct AgentChatView: View {
                         .padding(.bottom, 16)
                     }
                 }
+                .defaultScrollAnchor(.bottom)
                 .coordinateSpace(name: "chatScroll")
                 .background {
                     GeometryReader { geo in
@@ -338,9 +332,19 @@ struct AgentChatView: View {
                     }
                 }
                 .onAppear {
-                    scrollToLatest(using: proxy)
+                    if !viewModel.store.messages.isEmpty {
+                        proxy.scrollTo(ChatScrollAnchor.bottom, anchor: .bottom)
+                        hasScrolledToInitialBottom = true
+                    }
                 }
                 .onChange(of: viewModel.store.messagesVersion) {
+                    if !hasScrolledToInitialBottom && !viewModel.store.messages.isEmpty {
+                        DispatchQueue.main.async {
+                            proxy.scrollTo(ChatScrollAnchor.bottom, anchor: .bottom)
+                        }
+                        hasScrolledToInitialBottom = true
+                        return
+                    }
                     guard isNearBottom else { return }
                     scrollToLatest(using: proxy)
                 }
@@ -355,6 +359,7 @@ struct AgentChatView: View {
                     scrollToLatest(using: proxy)
                 }
                 .onChange(of: viewModel.store.sessions?.current) {
+                    hasScrolledToInitialBottom = false
                     scrollToLatest(using: proxy)
                 }
 
@@ -539,11 +544,17 @@ struct AgentChatView: View {
 
     @ViewBuilder
     func chatItemsSection(_ items: [ChatDisplayItem]) -> some View {
-        ForEach(items) { item in
+        let lastThinkingID = items.last(where: { item in
+            if case .message(let msg, _) = item, msg.role == .thinking { return true }
+            return false
+        })?.id
+
+        return ForEach(items) { item in
             ChatDisplayRow(
                 item: item,
                 ghostName: viewModel.ghostName,
                 selectedMessageID: viewModel.input.historySelectionMessageID,
+                isActiveThinking: viewModel.isStreaming && item.id == lastThinkingID,
                 isToolGroupExpanded: { groupID in
                     expandedToolMessages.contains(groupID)
                 },
@@ -565,6 +576,24 @@ struct AgentChatView: View {
 
     private func rebuildPreCompactionDisplayItems() {
         cachedPreCompactionDisplayItems = ChatDisplayItem.build(from: viewModel.store.visiblePreCompactionMessages)
+    }
+
+    private var loadOlderButton: some View {
+        let count = viewModel.store.olderMessages.count
+        let batch = min(count, ConversationStore.olderMessagesBatchSize)
+
+        return Button {
+            viewModel.store.loadOlderMessageBatch()
+            rebuildDisplayItems()
+        } label: {
+            Text("Load \(batch) older messages (\(count) total)")
+                .font(Theme.Typography.label())
+                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 8)
+        }
+        .buttonStyle(.plain)
     }
 
     private var showMoreButton: some View {
@@ -621,6 +650,7 @@ private struct ChatDisplayRow: View {
     let item: ChatDisplayItem
     let ghostName: String
     let selectedMessageID: UUID?
+    let isActiveThinking: Bool
     let isToolGroupExpanded: (UUID) -> Bool
     let onToggleToolGroup: (UUID) -> Void
     let onShowFullscreenToolGroup: (UUID) -> Void
@@ -646,6 +676,7 @@ private struct ChatDisplayRow: View {
                 message: message,
                 ghostName: ghostName,
                 isSelected: selectedMessageID == message.id,
+                isActiveThinking: message.role == .thinking && isActiveThinking,
                 onThumbnailTap: onThumbnailTap
             )
         case .toolGroup(let group, _):

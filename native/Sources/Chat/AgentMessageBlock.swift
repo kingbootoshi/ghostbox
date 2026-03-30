@@ -5,7 +5,10 @@ struct AgentMessageBlock: View {
     let message: ChatMessage
     let ghostName: String
     let isSelected: Bool
+    var isActiveThinking: Bool = false
     var onThumbnailTap: ((NSImage) -> Void)?
+
+    @State private var thinkingExpanded: Bool = false
 
     private static let formatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -14,6 +17,75 @@ struct AgentMessageBlock: View {
     }()
 
     var body: some View {
+        if message.role == .thinking {
+            thinkingBlock
+        } else {
+            standardBlock
+        }
+    }
+
+    private var thinkingBlock: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    thinkingExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: thinkingExpanded || isActiveThinking ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(Color.white.opacity(0.2))
+                        .frame(width: 12)
+
+                    Text(senderName)
+                        .font(Theme.Typography.label(weight: .semibold))
+                        .foregroundColor(senderColor)
+
+                    if !isActiveThinking && !thinkingExpanded {
+                        Text(thinkingPreview)
+                            .font(Theme.Typography.caption())
+                            .foregroundColor(Color.white.opacity(0.15))
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 0)
+
+                    Text(Self.formatter.string(from: message.timestamp))
+                        .font(Theme.Typography.caption())
+                        .foregroundColor(Color.white.opacity(0.1))
+                }
+            }
+            .buttonStyle(.plain)
+
+            if thinkingExpanded || isActiveThinking {
+                markdownContent
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 6)
+                    .padding(.leading, 18)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.015))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 20)
+        .onChange(of: isActiveThinking) {
+            if !isActiveThinking {
+                thinkingExpanded = false
+            }
+        }
+    }
+
+    private var thinkingPreview: String {
+        let trimmed = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count <= 60 { return trimmed }
+        let end = trimmed.index(trimmed.startIndex, offsetBy: 60)
+        return String(trimmed[..<end]) + "..."
+    }
+
+    private var standardBlock: some View {
         VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
             Text(senderName)
                 .font(Theme.Typography.label(weight: .semibold))

@@ -6,6 +6,7 @@ import Observation
 @Observable
 final class ConversationStore {
     static let olderMessagesBatchSize = 25
+    static let initialMessageCount = 50
 
     let ghostName: String
 
@@ -21,6 +22,8 @@ final class ConversationStore {
             onConversationChanged()
         }
     }
+    private(set) var olderMessages: [ChatMessage] = []
+    var hasOlderMessages: Bool { !olderMessages.isEmpty }
     var messagesVersion = 0
     var preCompactionDisplayVersion = 0
     var sessions: SessionListResponse?
@@ -99,11 +102,20 @@ final class ConversationStore {
 
         do {
             let history = try await client.getHistory(ghostName: ghostName)
-            messages = history.messages.map(historyMessageToChatMessage)
+            let allMessages = history.messages.map(historyMessageToChatMessage)
             preCompactionMessages = history.preCompactionMessages.map(historyMessageToChatMessage)
             compactionSummary = history.compactions.last?.summary
             visiblePreCompactionCount = 0
             showingPreCompactionMessages = false
+
+            if allMessages.count > Self.initialMessageCount {
+                let splitIndex = allMessages.count - Self.initialMessageCount
+                olderMessages = Array(allMessages[..<splitIndex])
+                messages = Array(allMessages[splitIndex...])
+            } else {
+                olderMessages = []
+                messages = allMessages
+            }
 
             if !history.compactions.isEmpty && messages.isEmpty && !preCompactionMessages.isEmpty {
                 messages = [ChatMessage(role: .system, content: "Session compacted")]
@@ -121,6 +133,7 @@ final class ConversationStore {
 
         clearError()
         messages = []
+        olderMessages = []
         preCompactionMessages = []
         compactionSummary = nil
         visiblePreCompactionCount = 0
@@ -221,6 +234,14 @@ final class ConversationStore {
     func updateMessage(at index: Int, with message: ChatMessage) {
         guard messages.indices.contains(index) else { return }
         messages[index] = message
+    }
+
+    func loadOlderMessageBatch() {
+        guard !olderMessages.isEmpty else { return }
+        let batchSize = min(Self.olderMessagesBatchSize, olderMessages.count)
+        let batch = Array(olderMessages.suffix(batchSize))
+        olderMessages.removeLast(batchSize)
+        messages.insert(contentsOf: batch, at: 0)
     }
 
     func showMoreOlderMessages() {
