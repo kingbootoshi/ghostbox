@@ -761,9 +761,9 @@ final class AgentChatViewModel: ObservableObject {
         SoundManager.shared.play(.notification)
 
         let content = UNMutableNotificationContent()
-        content.title = ghostName
+        content.title = "Ghostbox - \(ghostName)"
         content.body = preview
-        content.sound = .none
+        content.sound = .default
         content.categoryIdentifier = "GHOST_MESSAGE"
         content.userInfo = ["ghostName": ghostName]
 
@@ -773,7 +773,11 @@ final class AgentChatViewModel: ObservableObject {
             trigger: nil
         )
 
-        UNUserNotificationCenter.current().add(request)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                print("[notifications] failed to deliver: \(error.localizedDescription)")
+            }
+        }
 
         NotificationCenter.default.post(
             name: .ghostUnread,
@@ -1074,9 +1078,48 @@ final class AgentChatViewModel: ObservableObject {
                 tasksByID.removeValue(forKey: taskID)
                 orderedTaskIDs.removeAll { $0 == taskID }
             }
+
+            // background_status tool results show the real running task list -
+            // reconcile our tracked tasks with reality
+            if message.role == .toolResult,
+               let realTaskIDs = Self.parseBackgroundStatusResult(from: message.content) {
+                let realSet = Set(realTaskIDs)
+                orderedTaskIDs.removeAll { !realSet.contains($0) }
+                tasksByID = tasksByID.filter { realSet.contains($0.key) }
+            }
         }
 
         activeBackgroundTasks = orderedTaskIDs.compactMap { tasksByID[$0] }
+    }
+
+    private static func parseBackgroundStatusResult(from content: String) -> [String]? {
+        // Matches "background_status" tool results like:
+        // "Running tasks: 1 - bg-abc123 | label: foo"
+        // "Running tasks: 0"
+        // "No running tasks"
+        guard content.contains("background_status") || content.contains("Running tasks:") else {
+            return nil
+        }
+
+        guard content.contains("Running tasks:") else {
+            if content.contains("No running tasks") || content.contains("Running tasks: 0") {
+                return []
+            }
+            return nil
+        }
+
+        // Extract all bg-<uuid> task IDs from the status output
+        var ids: [String] = []
+        let pattern = "bg-[0-9a-fA-F-]{36}"
+        if let regex = try? NSRegularExpression(pattern: pattern) {
+            let matches = regex.matches(in: content, range: NSRange(content.startIndex..., in: content))
+            for match in matches {
+                if let range = Range(match.range, in: content) {
+                    ids.append(String(content[range]))
+                }
+            }
+        }
+        return ids
     }
 
     private func mapRole(_ role: String) -> ChatMessage.Role {

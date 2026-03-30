@@ -1,5 +1,6 @@
 import AppKit
 import Carbon
+import Combine
 import CoreText
 import SwiftUI
 import UserNotifications
@@ -19,6 +20,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let panelHideDuration: TimeInterval = 0.3
     private var serverProcess: Process?
     private var serverLogHandle: FileHandle?
+    private var baseMenuBarIcon: NSImage?
+    private var unreadObservation: Any?
 
     private var hasConnection: Bool {
         let url = UserDefaults.standard.string(forKey: "serverURL") ?? ""
@@ -27,8 +30,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
         UNUserNotificationCenter.current().delegate = self
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            print("[notifications] authorization granted=\(granted) error=\(String(describing: error))")
+            if !granted {
+                print("[notifications] banners will not appear - check System Settings > Notifications > Ghostbox")
+            }
+        }
 
         registerFonts()
         setupMenuBar()
@@ -319,9 +327,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem?.isVisible = true
 
+        baseMenuBarIcon = Self.loadMenuBarIcon()
         if let button = statusItem?.button {
-            if let ghostImage = Self.loadMenuBarIcon() {
-                button.image = ghostImage
+            if let icon = baseMenuBarIcon {
+                button.image = icon
             } else {
                 button.title = "Ghost"
             }
@@ -334,6 +343,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Disconnect", action: #selector(disconnectMenuAction), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem?.menu = menu
+
+        unreadObservation = appState.$unreadGhosts
+            .receive(on: RunLoop.main)
+            .sink { [weak self] unreads in
+                self?.updateMenuBarBadge(count: unreads.count)
+            }
+    }
+
+    private func updateMenuBarBadge(count: Int) {
+        guard let button = statusItem?.button else { return }
+
+        guard let baseIcon = baseMenuBarIcon else {
+            button.title = count > 0 ? "Ghost (\(count))" : "Ghost"
+            return
+        }
+
+        if count == 0 {
+            button.image = baseIcon
+            return
+        }
+
+        // Expand canvas so badge doesn't clip outside the icon bounds
+        let iconSize = baseIcon.size
+        let badgeDiameter: CGFloat = 12
+        let padding: CGFloat = 4
+        let canvasSize = NSSize(width: iconSize.width + padding, height: iconSize.height)
+
+        let badgedIcon = NSImage(size: canvasSize, flipped: false) { _ in
+            // Draw the ghost icon left-aligned
+            baseIcon.draw(in: NSRect(origin: .zero, size: iconSize))
+
+            // Badge in upper-right of the canvas
+            let badgeRect = NSRect(
+                x: canvasSize.width - badgeDiameter,
+                y: canvasSize.height - badgeDiameter,
+                width: badgeDiameter,
+                height: badgeDiameter
+            )
+            NSColor.systemRed.setFill()
+            NSBezierPath(ovalIn: badgeRect).fill()
+
+            if count <= 9 {
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 8, weight: .bold),
+                    .foregroundColor: NSColor.white,
+                ]
+                let text = "\(count)" as NSString
+                let textSize = text.size(withAttributes: attrs)
+                text.draw(at: NSPoint(
+                    x: badgeRect.midX - textSize.width / 2,
+                    y: badgeRect.midY - textSize.height / 2
+                ), withAttributes: attrs)
+            }
+
+            return true
+        }
+
+        // Not template - we need the red badge color to show
+        badgedIcon.isTemplate = false
+        button.image = badgedIcon
     }
 
     private func setupNotifications() {

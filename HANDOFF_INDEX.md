@@ -1,6 +1,6 @@
 # Handoff Index
-Last updated: 2026-03-28T04:35:00Z
+Last updated: 2026-03-29T23:55:00Z
 
 | Opus | Mission | Status | File | Next Step |
 |------|---------|--------|------|-----------|
-| native-app-polish | Native app bugs + features from live testing | 6 Codex agents running (paste, model, scroll, abort, indicator, auth) | handoffs/native-app-polish.md | Await agents, review output, build, test |
+| native-app-polish | Native app UX, notifications, compaction, background tasks | 5 commits pushed, 5 open issues | handoffs/native-app-polish.md | Fix notification banner, background task tracking, popover UX |

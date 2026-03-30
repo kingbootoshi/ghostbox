@@ -19,16 +19,10 @@ final class AppState: ObservableObject {
 
     func markUnread(_ ghostName: String) {
         unreadGhosts.insert(ghostName)
-        updateDockBadge()
     }
 
     func markRead(_ ghostName: String) {
         unreadGhosts.remove(ghostName)
-        updateDockBadge()
-    }
-
-    private func updateDockBadge() {
-        NSApp.dockTile.badgeLabel = unreadGhosts.isEmpty ? nil : "\(unreadGhosts.count)"
     }
 
     func refreshGhosts() async {

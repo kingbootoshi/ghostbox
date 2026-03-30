@@ -8,7 +8,7 @@ private enum ChatInputLayout {
 struct ChatInputView: View {
     @Binding var inputText: String
     let ghostName: String
-    let backgroundTaskCount: Int
+    let backgroundTasks: [ActiveBackgroundTask]
     let isStreaming: Bool
     let isWakingGhost: Bool
     let isLoadingHistory: Bool
@@ -28,6 +28,7 @@ struct ChatInputView: View {
     let onTab: () -> Bool
     let onSubmit: () -> Void
     @State private var inputHeight: CGFloat = ChatInputLayout.minHeight
+    @State private var showingBackgroundTasks = false
 
     var body: some View {
         VStack(spacing: 8) {
@@ -76,29 +77,6 @@ struct ChatInputView: View {
                 .padding(.horizontal, 18)
             }
 
-            if backgroundTaskCount > 0 {
-                HStack(spacing: 10) {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(Theme.Colors.accentLight)
-
-                    Text(backgroundTaskBannerText)
-                        .font(Theme.Typography.caption(weight: .medium))
-
-                    Spacer(minLength: 0)
-                }
-                .foregroundColor(Theme.Colors.accentLightest)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(Theme.Colors.accent.opacity(0.16))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(Theme.Colors.accentLight.opacity(0.22), lineWidth: 0.6)
-                }
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .padding(.horizontal, 18)
-            }
-
             MultilineInput(
                 text: $inputText,
                 height: $inputHeight,
@@ -128,16 +106,24 @@ struct ChatInputView: View {
 
                 Spacer()
 
-                if backgroundTaskCount > 0 {
-                    HStack(spacing: 4) {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .tint(Theme.Colors.accentLight)
-                        Text("\(backgroundTaskCount) bg")
-                            .font(Theme.Typography.mono(Theme.FontSize.xs))
-                            .foregroundColor(Theme.Colors.accentLight.opacity(0.7))
+                if !backgroundTasks.isEmpty {
+                    Button {
+                        showingBackgroundTasks.toggle()
+                    } label: {
+                        HStack(spacing: 4) {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(Theme.Colors.accentLight)
+                            Text("\(backgroundTasks.count) bg")
+                                .font(Theme.Typography.mono(Theme.FontSize.xs))
+                                .foregroundColor(Theme.Colors.accentLight.opacity(0.7))
+                        }
                     }
+                    .buttonStyle(.plain)
                     .padding(.trailing, 8)
+                    .popover(isPresented: $showingBackgroundTasks, arrowEdge: .bottom) {
+                        backgroundTaskPopover
+                    }
                 }
 
                 if let tokenFooter = tokenFooterText {
@@ -179,14 +165,6 @@ struct ChatInputView: View {
         return "Press return to send, shift+return for new line"
     }
 
-    private var backgroundTaskBannerText: String {
-        if backgroundTaskCount == 1 {
-            return "1 background task running"
-        }
-
-        return "\(backgroundTaskCount) background tasks running"
-    }
-
     private var tokenFooterText: String? {
         guard let context = stats?.context else { return nil }
         return "\(Self.formatTokenCount(context.used)) / \(Self.formatTokenCount(context.window))"
@@ -213,6 +191,49 @@ struct ChatInputView: View {
                 : String(format: "%.1fK", value)
         }
         return "\(count)"
+    }
+
+    private var backgroundTaskPopover: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Background Tasks")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.9))
+                Spacer()
+                Text("\(backgroundTasks.count)")
+                    .font(Theme.Typography.mono(11))
+                    .foregroundColor(Theme.Colors.accentLight)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+
+            Divider()
+                .background(Color.white.opacity(0.1))
+
+            ForEach(backgroundTasks) { task in
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(Theme.Colors.accentLight)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(task.label)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(.white.opacity(0.85))
+                            .lineLimit(1)
+                        Text(String(task.id.prefix(20)))
+                            .font(Theme.Typography.mono(9))
+                            .foregroundColor(.white.opacity(0.3))
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+            }
+        }
+        .frame(minWidth: 240, maxWidth: 320)
+        .padding(.vertical, 4)
+        .background(.ultraThinMaterial)
     }
 
     private func submitInput() {
