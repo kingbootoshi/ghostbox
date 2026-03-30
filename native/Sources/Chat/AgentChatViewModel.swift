@@ -1,23 +1,6 @@
 import AppKit
 import Foundation
-import UniformTypeIdentifiers
-import UserNotifications
-
-struct PendingImage: Identifiable {
-    let id: UUID
-    let data: Data
-    let thumbnail: NSImage
-    let mediaType: String
-    let isProcessing: Bool
-
-    init(id: UUID = UUID(), data: Data, thumbnail: NSImage, mediaType: String, isProcessing: Bool = false) {
-        self.id = id
-        self.data = data
-        self.thumbnail = thumbnail
-        self.mediaType = mediaType
-        self.isProcessing = isProcessing
-    }
-}
+import Observation
 
 struct QueuedChatMessage {
     var prompt: String
@@ -32,77 +15,47 @@ struct ActiveBackgroundTask: Identifiable, Hashable {
 }
 
 @MainActor
-final class AgentChatViewModel: ObservableObject {
+@Observable
+final class AgentChatViewModel {
     let ghostName: String
+    let notifications: NotificationController
+    let store: ConversationStore
+    let input: InputController
 
-    @Published var messages: [ChatMessage] = [] {
-        didSet {
-            messagesVersion &+= 1
-        }
-    }
-    @Published var preCompactionMessages: [ChatMessage] = [] {
-        didSet {
-            preCompactionDisplayVersion &+= 1
-        }
-    }
-    @Published var showingPreCompactionMessages = false
-    @Published var visiblePreCompactionCount = 0 {
-        didSet {
-            preCompactionDisplayVersion &+= 1
-        }
-    }
-    @Published private(set) var compactionSummary: String?
-    @Published private(set) var messagesVersion = 0
-    @Published private(set) var preCompactionDisplayVersion = 0
-    @Published var sessions: SessionListResponse?
+    private(set) var queuedMessages: [QueuedChatMessage] = []
+    private(set) var queueBrowseIndex: Int?
+    var isStreaming = false
+    private(set) var isWakingGhost = false
+    private(set) var activeBackgroundTasks: [ActiveBackgroundTask] = []
 
-    static let olderMessagesBatchSize = 25
-    @Published var inputText = ""
-    @Published var pendingImages: [PendingImage] = []
-    @Published private(set) var queuedMessages: [QueuedChatMessage] = []
-    @Published private(set) var queueBrowseIndex: Int?
-    private var savedInputBeforeQueueBrowse: String = ""
-    @Published private(set) var historySelectionMessageID: UUID?
-    @Published var lastEscapeTime: Date?
-    @Published var isStreaming = false
-    @Published private(set) var isWakingGhost = false
-    @Published private(set) var isHistoryModeActive = false
-    @Published private(set) var isLoadingHistory = false
-    @Published private(set) var isCompacting = false
-    @Published private(set) var isCreatingSession = false
-    @Published private(set) var ghost: Ghost?
-    @Published private(set) var error: String?
-    @Published private(set) var toast: String?
-    @Published private(set) var stats: GhostStats?
-    @Published private(set) var activeBackgroundTasks: [ActiveBackgroundTask] = []
+    @ObservationIgnored private let client: GhostboxClient
+    @ObservationIgnored private var streamTask: Task<Void, Never>?
+    @ObservationIgnored private var activeStreamID: UUID?
+    @ObservationIgnored private var lastAbortTime: Date?
+    @ObservationIgnored private var savedInputBeforeQueueBrowse = ""
+    @ObservationIgnored private var hasLoadedInitialState = false
+    @ObservationIgnored private var isPreparingForOpening = false
 
-    private let client: GhostboxClient
-    private var streamTask: Task<Void, Never>?
-    private var activeStreamID: UUID?
-    private var lastAbortTime: Date?
-    private var toastDismissTask: Task<Void, Never>?
-    private var errorDismissTask: Task<Void, Never>?
-    private var historyDraft = ""
-    private var hasLoadedInitialState = false
-    private var isPreparingForOpening = false
-    private static let timestampFormatterWithFractionalSeconds: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-    private static let timestampFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter
-    }()
-    private static let backgroundTaskIDRegex = try! NSRegularExpression(pattern: "bg-[0-9a-fA-F-]{36}")
-    private static let maximumAPIImageEdge: CGFloat = 1_568
-    private static let maximumAPIImagePixels: CGFloat = 1_150_000
-    private static let maximumAPIImageBytes = 4_500_000
     init(ghostName: String, client: GhostboxClient, initialGhost: Ghost? = nil) {
         self.ghostName = ghostName
         self.client = client
-        self.ghost = initialGhost
+
+        let notifications = NotificationController(ghostName: ghostName)
+        let store = ConversationStore(ghostName: ghostName, client: client, initialGhost: initialGhost)
+        let input = InputController(store: store)
+
+        self.notifications = notifications
+        self.store = store
+        self.input = input
+
+        store.clearError = { notifications.clearError() }
+        store.showError = { notifications.showError($0) }
+        store.showToast = { notifications.showToast($0) }
+        store.hasError = { notifications.error != nil }
+        input.isWakingGhost = { [weak self] in self?.isWakingGhost ?? false }
+        store.onConversationChanged = { [weak self] in
+            self?.rebuildActiveBackgroundTasks()
+        }
 
         Task { [weak self] in
             await self?.prepareForOpeningTask(ghostHint: initialGhost)
@@ -117,69 +70,35 @@ final class AgentChatViewModel: ObservableObject {
         client
     }
 
-    var currentSession: SessionInfo? {
-        guard let sessions else { return nil }
-        let current = sessions.current
-        return sessions.sessions.first { $0.id == current }
-            ?? sessions.sessions.first { $0.id.contains(current) || current.contains($0.id) }
-    }
-
-    var isInputDisabled: Bool {
-        isWakingGhost || isLoadingHistory || ghost?.status == .stopped
-    }
-
-    func showToast(_ message: String) {
-        toast = message
-        toastDismissTask?.cancel()
-        toastDismissTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(3))
-            guard !Task.isCancelled else { return }
-            self?.toast = nil
-        }
-    }
-
-    func dismissToast() {
-        toast = nil
-        error = nil
-        toastDismissTask?.cancel()
-        errorDismissTask?.cancel()
-    }
-
-    func showError(_ message: String) {
-        error = message
-        errorDismissTask?.cancel()
-        errorDismissTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(5))
-            guard !Task.isCancelled else { return }
-            self?.error = nil
-        }
+    var isQueueBrowsing: Bool {
+        queueBrowseIndex != nil
     }
 
     func send() {
         if queueBrowseIndex != nil {
             saveCurrentQueueEdit()
             queueBrowseIndex = nil
-            inputText = savedInputBeforeQueueBrowse
+            input.inputText = savedInputBeforeQueueBrowse
             savedInputBeforeQueueBrowse = ""
             return
         }
 
-        let prompt = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let submittedImages = pendingImages.filter { !$0.isProcessing }
-        guard (!prompt.isEmpty || !submittedImages.isEmpty), !isInputDisabled else { return }
+        let prompt = input.inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let submittedImages = input.pendingImages.filter { !$0.isProcessing }
+        guard (!prompt.isEmpty || !submittedImages.isEmpty), !input.isInputDisabled else { return }
 
-        _ = exitHistoryModeIfNeeded(restoreDraft: false)
+        _ = input.exitHistoryModeIfNeeded(restoreDraft: false)
 
-        inputText = ""
-        pendingImages = []
+        input.inputText = ""
+        input.pendingImages = []
 
-        if isCreatingSession {
-            messages.append(
+        if store.isCreatingSession {
+            store.messages.append(
                 ChatMessage(
                     role: .user,
                     content: prompt,
                     attachmentCount: submittedImages.count,
-                    thumbnails: submittedImages.map { $0.thumbnail }
+                    thumbnails: submittedImages.map(\.thumbnail)
                 )
             )
             queuedMessages.append(
@@ -205,12 +124,12 @@ final class AgentChatViewModel: ObservableObject {
             return
         }
 
-        messages.append(
+        store.messages.append(
             ChatMessage(
                 role: .user,
                 content: prompt,
                 attachmentCount: submittedImages.count,
-                thumbnails: submittedImages.map { $0.thumbnail }
+                thumbnails: submittedImages.map(\.thumbnail)
             )
         )
         SoundManager.shared.play(.messageSent)
@@ -231,7 +150,7 @@ final class AgentChatViewModel: ObservableObject {
         streamTask?.cancel()
         streamTask = nil
         isStreaming = false
-        isCompacting = false
+        store.isCompacting = false
 
         if shouldClearQueue && hasQueuedMessages {
             clearQueue()
@@ -276,7 +195,7 @@ final class AgentChatViewModel: ObservableObject {
 
     func switchModel(to model: GhostModel) {
         let command = "/model \(model.provider)/\(model.modelId)"
-        messages.append(ChatMessage(role: .system, content: "Switching to \(model.displayName)..."))
+        store.messages.append(ChatMessage(role: .system, content: "Switching to \(model.displayName)..."))
 
         Task { [weak self] in
             guard let self else { return }
@@ -285,22 +204,23 @@ final class AgentChatViewModel: ObservableObject {
                 let stream = client.sendMessage(ghostName: ghostName, prompt: command, model: nil)
                 for try await event in stream {
                     if event.type == .result || event.type == .assistant, let text = event.text, !text.isEmpty {
-                        self.messages.append(ChatMessage(role: .system, content: text))
+                        store.messages.append(ChatMessage(role: .system, content: text))
                     }
                 }
-                let fallbackGhost = self.locallyUpdatedGhost(for: model)
+
+                let fallbackGhost = locallyUpdatedGhost(for: model)
 
                 do {
-                    self.ghost = try await client.updateGhost(
+                    store.ghost = try await client.updateGhost(
                         name: ghostName,
                         provider: model.provider,
                         model: model.modelId
                     )
                 } catch GhostboxClientError.requestFailed(let statusCode, _) where statusCode == 404 || statusCode == 405 {
-                    self.ghost = fallbackGhost
+                    store.ghost = fallbackGhost
                 } catch {
-                    self.ghost = fallbackGhost
-                    self.messages.append(
+                    store.ghost = fallbackGhost
+                    store.messages.append(
                         ChatMessage(
                             role: .system,
                             content: "Model switched, but saving it failed: \(error.localizedDescription)"
@@ -308,13 +228,125 @@ final class AgentChatViewModel: ObservableObject {
                     )
                 }
             } catch {
-                self.messages.append(ChatMessage(role: .system, content: "Model switch failed: \(error.localizedDescription)"))
+                store.messages.append(ChatMessage(role: .system, content: "Model switch failed: \(error.localizedDescription)"))
             }
         }
     }
 
+    func prepareForOpening(ghost: Ghost? = nil) {
+        Task { [weak self] in
+            await self?.prepareForOpeningTask(ghostHint: ghost)
+        }
+    }
+
+    @discardableResult
+    func handleEscapeForHistory() -> Bool {
+        input.handleEscapeForHistory()
+    }
+
+    @discardableResult
+    func browseSentHistoryBackward() -> Bool {
+        input.browseSentHistoryBackward()
+    }
+
+    @discardableResult
+    func browseSentHistoryForward() -> Bool {
+        input.browseSentHistoryForward()
+    }
+
+    @discardableResult
+    func exitHistoryModeIfNeeded(restoreDraft: Bool = true) -> Bool {
+        input.exitHistoryModeIfNeeded(restoreDraft: restoreDraft)
+    }
+
+    @discardableResult
+    func commitHistorySelection() -> Bool {
+        input.commitHistorySelection { [weak self] in
+            self?.queuedMessages.removeAll()
+        }
+    }
+
+    @discardableResult
+    func addImageFromPasteboard() -> Bool {
+        input.addImageFromPasteboard()
+    }
+
+    func removeImage(id: UUID) {
+        input.removeImage(id: id)
+    }
+
+    @discardableResult
+    func browseQueueBackward() -> Bool {
+        guard !queuedMessages.isEmpty else { return false }
+
+        if let current = queueBrowseIndex {
+            guard current > 0 else { return true }
+            saveCurrentQueueEdit()
+            let next = current - 1
+            queueBrowseIndex = next
+            input.inputText = queuedMessages[next].prompt
+        } else {
+            savedInputBeforeQueueBrowse = input.inputText
+            let last = queuedMessages.count - 1
+            queueBrowseIndex = last
+            input.inputText = queuedMessages[last].prompt
+        }
+        return true
+    }
+
+    @discardableResult
+    func browseQueueForward() -> Bool {
+        guard let current = queueBrowseIndex else { return false }
+
+        saveCurrentQueueEdit()
+        let next = current + 1
+        if next < queuedMessages.count {
+            queueBrowseIndex = next
+            input.inputText = queuedMessages[next].prompt
+        } else {
+            queueBrowseIndex = nil
+            input.inputText = savedInputBeforeQueueBrowse
+            savedInputBeforeQueueBrowse = ""
+        }
+        return true
+    }
+
+    func exitQueueBrowseMode() {
+        guard queueBrowseIndex != nil else { return }
+        saveCurrentQueueEdit()
+        queueBrowseIndex = nil
+        input.inputText = savedInputBeforeQueueBrowse
+        savedInputBeforeQueueBrowse = ""
+    }
+
+    func switchSession(sessionId: String) {
+        guard !isStreaming, !isWakingGhost else { return }
+        _ = input.exitHistoryModeIfNeeded()
+        store.switchSession(sessionId: sessionId) { [weak self] didLoadHistory in
+            self?.hasLoadedInitialState = didLoadHistory
+        }
+    }
+
+    func newSession() {
+        guard !isStreaming, !isWakingGhost else { return }
+        _ = input.exitHistoryModeIfNeeded()
+        queuedMessages.removeAll()
+        store.newSession { [weak self] _ in
+            guard let self, !self.queuedMessages.isEmpty else { return }
+            self.processNextQueued()
+        }
+    }
+
+    func renameSession(sessionId: String, name: String) {
+        store.renameSession(sessionId: sessionId, name: name)
+    }
+
+    func deleteSession(sessionId: String) {
+        store.deleteSession(sessionId: sessionId)
+    }
+
     private func locallyUpdatedGhost(for model: GhostModel) -> Ghost? {
-        guard let current = ghost else { return nil }
+        guard let current = store.ghost else { return nil }
 
         return Ghost(
             name: current.name,
@@ -328,259 +360,36 @@ final class AgentChatViewModel: ObservableObject {
         )
     }
 
-    func prepareForOpening(ghost: Ghost? = nil) {
-        Task { [weak self] in
-            await self?.prepareForOpeningTask(ghostHint: ghost)
-        }
-    }
-
-    @discardableResult
-    func handleEscapeForHistory() -> Bool {
-        if isHistoryModeActive {
-            exitHistoryModeIfNeeded()
-            return true
-        }
-
-        let now = Date()
-        if let lastEscapeTime, now.timeIntervalSince(lastEscapeTime) <= 0.5 {
-            self.lastEscapeTime = nil
-            return enterHistoryMode()
-        }
-
-        lastEscapeTime = now
-        return true
-    }
-
-    @discardableResult
-    func browseSentHistoryBackward() -> Bool {
-        guard isHistoryModeActive, !selectableHistoryMessages.isEmpty else { return false }
-
-        let nextIndex: Int
-        if let currentIndex = selectedHistoryIndex {
-            nextIndex = max(0, currentIndex - 1)
-        } else {
-            nextIndex = selectableHistoryMessages.count - 1
-        }
-
-        historySelectionMessageID = selectableHistoryMessages[nextIndex].id
-        return true
-    }
-
-    @discardableResult
-    func browseSentHistoryForward() -> Bool {
-        guard isHistoryModeActive, !selectableHistoryMessages.isEmpty else { return false }
-
-        guard let currentIndex = selectedHistoryIndex else {
-            historySelectionMessageID = selectableHistoryMessages.first?.id
-            return true
-        }
-
-        let nextIndex = currentIndex + 1
-        if nextIndex < selectableHistoryMessages.count {
-            historySelectionMessageID = selectableHistoryMessages[nextIndex].id
-            return true
-        }
-
-        exitHistoryModeIfNeeded()
-        return true
-    }
-
-    @discardableResult
-    func exitHistoryModeIfNeeded(restoreDraft: Bool = true) -> Bool {
-        guard isHistoryModeActive else { return false }
-
-        isHistoryModeActive = false
-        historySelectionMessageID = nil
-        lastEscapeTime = nil
-
-        if restoreDraft {
-            inputText = historyDraft
-        }
-
-        historyDraft = ""
-        return true
-    }
-
-    @discardableResult
-    func commitHistorySelection() -> Bool {
-        guard isHistoryModeActive,
-              let historySelectionMessageID,
-              let selectedIndex = messages.firstIndex(where: { $0.id == historySelectionMessageID }) else {
-            return false
-        }
-
-        if selectedIndex < messages.count - 1 {
-            messages.removeSubrange((selectedIndex + 1)..<messages.count)
-        }
-
-        queuedMessages.removeAll()
-        return exitHistoryModeIfNeeded()
-    }
-
-    // MARK: - Queue Browsing
-
-    var isQueueBrowsing: Bool { queueBrowseIndex != nil }
-
-    @discardableResult
-    func browseQueueBackward() -> Bool {
-        guard !queuedMessages.isEmpty else { return false }
-
-        if let current = queueBrowseIndex {
-            guard current > 0 else { return true }
-            saveCurrentQueueEdit()
-            let next = current - 1
-            queueBrowseIndex = next
-            inputText = queuedMessages[next].prompt
-        } else {
-            savedInputBeforeQueueBrowse = inputText
-            let last = queuedMessages.count - 1
-            queueBrowseIndex = last
-            inputText = queuedMessages[last].prompt
-        }
-        return true
-    }
-
-    @discardableResult
-    func browseQueueForward() -> Bool {
-        guard let current = queueBrowseIndex else { return false }
-
-        saveCurrentQueueEdit()
-        let next = current + 1
-        if next < queuedMessages.count {
-            queueBrowseIndex = next
-            inputText = queuedMessages[next].prompt
-        } else {
-            queueBrowseIndex = nil
-            inputText = savedInputBeforeQueueBrowse
-            savedInputBeforeQueueBrowse = ""
-        }
-        return true
-    }
-
-    func exitQueueBrowseMode() {
-        guard let current = queueBrowseIndex else { return }
-        saveCurrentQueueEdit()
-        queueBrowseIndex = nil
-        inputText = savedInputBeforeQueueBrowse
-        savedInputBeforeQueueBrowse = ""
-    }
-
     private func saveCurrentQueueEdit() {
         guard let current = queueBrowseIndex, current < queuedMessages.count else { return }
-        let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = input.inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
             queuedMessages[current].prompt = trimmed
         }
     }
 
-    @discardableResult
-    func addImageFromPasteboard() -> Bool {
-        let pasteboard = NSPasteboard.general
-        let items = pasteboard.pasteboardItems ?? []
-
-        guard !items.isEmpty else { return false }
-
-        // Extract raw image data from pasteboard on main thread (fast)
-        // and show placeholders with quick thumbnails instantly
-        var rawEntries: [(id: UUID, imageData: Data)] = []
-        for item in items {
-            guard let imageData = Self.extractImageData(from: item) else { continue }
-            let placeholderID = UUID()
-
-            // Quick thumbnail for instant display - 200px is crisp in the strip
-            let quickThumb: NSImage
-            if let fullImage = NSImage(data: imageData) {
-                quickThumb = fullImage.thumbnailImage(maxDimension: 200) ?? fullImage
-            } else {
-                quickThumb = NSImage(size: NSSize(width: 48, height: 48))
-            }
-
-            pendingImages.append(PendingImage(
-                id: placeholderID,
-                data: Data(),
-                thumbnail: quickThumb,
-                mediaType: "image/png",
-                isProcessing: true
-            ))
-            rawEntries.append((id: placeholderID, imageData: imageData))
-        }
-
-        guard !rawEntries.isEmpty else { return false }
-
-        // Heavy resize/encode work on background thread (Data is Sendable)
-        let entries = rawEntries
-        Task.detached {
-            var results: [(id: UUID, data: Data, thumbData: Data, mediaType: String)] = []
-            for entry in entries {
-                guard let image = NSImage(data: entry.imageData),
-                      let processed = Self.makePendingImage(from: image) else {
-                    results.append((id: entry.id, data: Data(), thumbData: Data(), mediaType: ""))
-                    continue
-                }
-                let thumbData = processed.thumbnail.tiffRepresentation ?? Data()
-                results.append((id: entry.id, data: processed.data, thumbData: thumbData, mediaType: processed.mediaType))
-            }
-
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                for result in results {
-                    guard !result.data.isEmpty,
-                          let thumb = NSImage(data: result.thumbData),
-                          let index = self.pendingImages.firstIndex(where: { $0.id == result.id }) else {
-                        self.pendingImages.removeAll { $0.id == result.id }
-                        continue
-                    }
-                    self.pendingImages[index] = PendingImage(
-                        id: result.id,
-                        data: result.data,
-                        thumbnail: thumb,
-                        mediaType: result.mediaType
-                    )
-                }
-            }
-        }
-
-        return true
-    }
-
-    private static func extractImageData(from item: NSPasteboardItem) -> Data? {
-        if let pngData = item.data(forType: .png) {
-            return pngData
-        }
-        if let tiffData = item.data(forType: .tiff) {
-            return tiffData
-        }
-        if let fileURLString = item.string(forType: .fileURL),
-           let url = URL(string: fileURLString),
-           isSupportedImageFile(url),
-           let data = try? Data(contentsOf: url) {
-            return data
-        }
-        return nil
-    }
-
-    func removeImage(id: UUID) {
-        pendingImages.removeAll { $0.id == id }
-    }
-
     private func processNextQueued() {
-        guard !isStreaming, !isLoadingHistory, !isCompacting, !isCreatingSession, !queuedMessages.isEmpty else { return }
+        guard !isStreaming,
+              !store.isLoadingHistory,
+              !store.isCompacting,
+              !store.isCreatingSession,
+              !queuedMessages.isEmpty else { return }
 
         if queueBrowseIndex != nil {
             queueBrowseIndex = nil
-            inputText = savedInputBeforeQueueBrowse
+            input.inputText = savedInputBeforeQueueBrowse
             savedInputBeforeQueueBrowse = ""
         }
 
         let nextMessage = queuedMessages.removeFirst()
 
         if !nextMessage.isAlreadyDisplayed {
-            messages.append(
+            store.messages.append(
                 ChatMessage(
                     role: .user,
                     content: nextMessage.prompt,
                     attachmentCount: nextMessage.images.count,
-                    thumbnails: nextMessage.images.map { $0.thumbnail }
+                    thumbnails: nextMessage.images.map(\.thumbnail)
                 )
             )
         }
@@ -603,7 +412,7 @@ final class AgentChatViewModel: ObservableObject {
         let streamID = UUID()
         activeStreamID = streamID
         isStreaming = true
-        error = nil
+        notifications.clearError()
 
         streamTask = Task { [weak self] in
             await self?.consumeStream(
@@ -631,7 +440,7 @@ final class AgentChatViewModel: ObservableObject {
         var shouldProcessQueuedAfterStream = false
 
         if isCompactCommand {
-            isCompacting = true
+            store.isCompacting = true
         }
 
         func flushAssistantMessage(force: Bool = false) {
@@ -644,17 +453,17 @@ final class AgentChatViewModel: ObservableObject {
                 return
             }
 
-            if let index = currentAssistantIndex, messages.indices.contains(index) {
-                let existingMessage = messages[index]
+            if let index = currentAssistantIndex, store.messages.indices.contains(index) {
+                let existingMessage = store.messages[index]
                 let updatedMessage = existingMessage.updatingContent(currentAssistantText)
-                updateMessage(at: index, with: updatedMessage)
+                store.updateMessage(at: index, with: updatedMessage)
                 if isCompactCommand {
                     compactResponseMessageID = updatedMessage.id
                 }
             } else {
                 let assistantMessage = ChatMessage(role: .ghost, content: currentAssistantText)
-                messages.append(assistantMessage)
-                currentAssistantIndex = messages.count - 1
+                store.messages.append(assistantMessage)
+                currentAssistantIndex = store.messages.count - 1
                 SoundManager.shared.play(.messageReceived)
                 if isCompactCommand {
                     compactResponseMessageID = assistantMessage.id
@@ -672,7 +481,7 @@ final class AgentChatViewModel: ObservableObject {
                 isStreaming = false
             }
             if isCompactCommand {
-                isCompacting = false
+                store.isCompacting = false
             }
             if shouldProcessQueued {
                 processNextQueued()
@@ -713,11 +522,11 @@ final class AgentChatViewModel: ObservableObject {
 
                     flushAssistantMessage(force: true)
 
-                    if let last = messages.last, last.role == .thinking {
-                        let index = messages.count - 1
-                        updateMessage(at: index, with: last.updatingContent(chunk))
+                    if let last = store.messages.last, last.role == .thinking {
+                        let index = store.messages.count - 1
+                        store.updateMessage(at: index, with: last.updatingContent(chunk))
                     } else {
-                        messages.append(ChatMessage(role: .thinking, content: chunk))
+                        store.messages.append(ChatMessage(role: .thinking, content: chunk))
                     }
 
                 case .tool_use:
@@ -725,7 +534,7 @@ final class AgentChatViewModel: ObservableObject {
 
                     let toolName = event.tool ?? "Tool"
                     let content = event.input?.stringValue ?? "Running \(toolName)"
-                    messages.append(ChatMessage(role: .toolUse, content: content, toolName: toolName))
+                    store.messages.append(ChatMessage(role: .toolUse, content: content, toolName: toolName))
                     currentAssistantText = ""
                     currentAssistantIndex = nil
                     lastAssistantFlushTime = nil
@@ -734,17 +543,15 @@ final class AgentChatViewModel: ObservableObject {
                     flushAssistantMessage(force: true)
 
                     let content = event.output?.stringValue ?? "Tool finished."
-                    messages.append(ChatMessage(role: .toolResult, content: content, toolName: "Result"))
+                    store.messages.append(ChatMessage(role: .toolResult, content: content, toolName: "Result"))
                     rebuildActiveBackgroundTasks()
                     currentAssistantText = ""
                     currentAssistantIndex = nil
                     lastAssistantFlushTime = nil
 
                 case .result:
-                    if let text = event.text, !text.isEmpty {
-                        if currentAssistantText.isEmpty {
-                            currentAssistantText = text
-                        }
+                    if let text = event.text, !text.isEmpty, currentAssistantText.isEmpty {
+                        currentAssistantText = text
                     }
 
                     flushAssistantMessage(force: true)
@@ -754,15 +561,13 @@ final class AgentChatViewModel: ObservableObject {
             flushAssistantMessage(force: true)
             return
         } catch {
-            self.showError(error.localizedDescription)
-            messages.append(
+            notifications.showError(error.localizedDescription)
+            store.messages.append(
                 ChatMessage(role: .system, content: "Error: \(error.localizedDescription)")
             )
 
-            // Reconcile with server - the ghost may have finished despite the stream error
-            await reloadConversationState()
+            _ = await store.reloadConversationState()
 
-            // Continue processing any remaining queued messages
             if !queuedMessages.isEmpty {
                 shouldProcessQueuedAfterStream = true
             }
@@ -778,54 +583,15 @@ final class AgentChatViewModel: ObservableObject {
         }
 
         await loadGhost()
-        await loadStats()
+        await store.loadStats()
 
-        // Fire notification when the agent finishes and the user isn't looking
-        // at this ghost's chat. Check if the ghost's panel is actually visible
-        // and the app is in the foreground. Panels hidden via Cmd+Shift+G have
-        // isVisible=false even though NSApp.isActive may be true.
-        if !currentAssistantText.isEmpty, !isCompactCommand {
-            let isUserWatching = Self.isGhostPanelVisible(ghostName)
-            if !isUserWatching {
-                fireNotification(for: currentAssistantText)
-            }
+        if !currentAssistantText.isEmpty, !isCompactCommand, !notifications.isGhostPanelVisible {
+            notifications.fireNotification(for: currentAssistantText)
         }
 
         if !queuedMessages.isEmpty {
             shouldProcessQueuedAfterStream = true
         }
-    }
-
-    private func fireNotification(for messageText: String) {
-        let preview = String(messageText.prefix(100))
-        guard !preview.isEmpty else { return }
-
-        SoundManager.shared.play(.notification)
-
-        let content = UNMutableNotificationContent()
-        content.title = "Ghostbox - \(ghostName)"
-        content.body = preview
-        content.sound = .none
-        content.categoryIdentifier = "GHOST_MESSAGE"
-        content.userInfo = ["ghostName": ghostName]
-
-        let request = UNNotificationRequest(
-            identifier: "ghost-message-\(ghostName)-\(UUID().uuidString)",
-            content: content,
-            trigger: nil
-        )
-
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error {
-                print("[notifications] failed to deliver: \(error.localizedDescription)")
-            }
-        }
-
-        NotificationCenter.default.post(
-            name: .ghostUnread,
-            object: nil,
-            userInfo: ["ghostName": ghostName]
-        )
     }
 
     private func prepareForOpeningTask(ghostHint: Ghost?) async {
@@ -835,7 +601,7 @@ final class AgentChatViewModel: ObservableObject {
         defer { isPreparingForOpening = false }
 
         if let ghostHint {
-            ghost = ghostHint
+            store.ghost = ghostHint
         }
 
         if ghostHint?.status == .stopped {
@@ -845,226 +611,42 @@ final class AgentChatViewModel: ObservableObject {
 
         do {
             let latestGhost = try await client.getGhost(name: ghostName)
-            ghost = latestGhost
+            store.ghost = latestGhost
 
             if latestGhost.status == .stopped {
                 await wakeGhostAndLoadHistory()
                 return
             }
         } catch {
-            self.showError(error.localizedDescription)
+            notifications.showError(error.localizedDescription)
             return
         }
 
         if !hasLoadedInitialState {
-            hasLoadedInitialState = await reloadConversationState()
+            hasLoadedInitialState = await store.reloadConversationState()
         }
 
         await loadGhost()
-        await loadStats()
+        await store.loadStats()
     }
 
-    @discardableResult
-    private func loadHistory() async -> Bool {
-        isLoadingHistory = true
-        error = nil
-
-        defer {
-            isLoadingHistory = false
-        }
-
-        do {
-            let history = try await client.getHistory(ghostName: ghostName)
-            messages = history.messages.map { historyMessageToChatMessage($0) }
-            preCompactionMessages = history.preCompactionMessages.map { historyMessageToChatMessage($0) }
-            compactionSummary = history.compactions.last?.summary
-            visiblePreCompactionCount = 0
-            showingPreCompactionMessages = false
-
-            if !history.compactions.isEmpty && messages.isEmpty && !preCompactionMessages.isEmpty {
-                messages = [ChatMessage(role: .system, content: "Session compacted")]
-            }
-
-            rebuildActiveBackgroundTasks()
-            return true
-        } catch {
-            self.showError(error.localizedDescription)
-            return false
-        }
-    }
-
-    private func historyMessageToChatMessage(_ message: HistoryMessage) -> ChatMessage {
-        let thumbnails: [NSImage] = (message.images ?? []).compactMap { imageData in
-            guard let data = Data(base64Encoded: imageData.data),
-                  let image = NSImage(data: data) else { return nil }
-            return image
-        }
-
-        return ChatMessage(
-            role: mapRole(message.role),
-            content: message.text,
-            timestamp: parseTimestamp(message.timestamp),
-            toolName: message.toolName,
-            attachmentCount: message.attachmentCount ?? thumbnails.count,
-            thumbnails: thumbnails
-        )
-    }
-
-    func showMoreOlderMessages() {
-        let newCount = min(
-            visiblePreCompactionCount + Self.olderMessagesBatchSize,
-            preCompactionMessages.count
-        )
-        visiblePreCompactionCount = newCount
-        showingPreCompactionMessages = newCount > 0
-    }
-
-    func hideOlderMessages() {
-        visiblePreCompactionCount = 0
-        showingPreCompactionMessages = false
-    }
-
-    var visiblePreCompactionMessages: [ChatMessage] {
-        guard visiblePreCompactionCount > 0 else { return [] }
-        let startIndex = max(0, preCompactionMessages.count - visiblePreCompactionCount)
-        return Array(preCompactionMessages[startIndex...])
-    }
-
-    var hasMoreOlderMessages: Bool {
-        visiblePreCompactionCount < preCompactionMessages.count
-    }
-
-    func loadSessions() async -> Bool {
-        do {
-            sessions = try await client.fetchSessions(name: ghostName)
-            return true
-        } catch {
-            if self.error == nil {
-                self.showError(error.localizedDescription)
-            }
-            return false
-        }
-    }
-
-    func switchSession(sessionId: String) {
-        guard !isStreaming, !isLoadingHistory, !isCompacting, !isCreatingSession else { return }
-        guard sessions?.current != sessionId else { return }
-
-        error = nil
-        _ = exitHistoryModeIfNeeded()
-
-        Task { [weak self] in
-            guard let self else { return }
-
-            do {
-                try await client.switchSession(name: ghostName, sessionId: sessionId)
-                hasLoadedInitialState = await reloadConversationState()
-                await loadStats()
-            } catch {
-                self.showError(error.localizedDescription)
-            }
-        }
-    }
-
-    func newSession() {
-        guard !isStreaming, !isLoadingHistory, !isCompacting, !isCreatingSession else { return }
-
-        error = nil
-        _ = exitHistoryModeIfNeeded()
-        messages = []
-        preCompactionMessages = []
-        rebuildActiveBackgroundTasks()
-        compactionSummary = nil
-        visiblePreCompactionCount = 0
-        showingPreCompactionMessages = false
-        queuedMessages.removeAll()
-        isCreatingSession = true
-        SoundManager.shared.play(.sessionNew)
-
-        Task { [weak self] in
-            guard let self else { return }
-
-            do {
-                let sessionId = try await client.newGhostSession(name: ghostName)
-                if let sessions {
-                    let existingSession = sessions.sessions.first { $0.id == sessionId }
-                    self.sessions = SessionListResponse(
-                        current: sessionId,
-                        sessions: existingSession.map { [ $0 ] + sessions.sessions.filter { $0.id != sessionId } } ?? sessions.sessions
-                    )
-                }
-                _ = await loadSessions()
-                await loadStats()
-                isCreatingSession = false
-                if !queuedMessages.isEmpty {
-                    processNextQueued()
-                }
-            } catch {
-                isCreatingSession = false
-                self.showError(error.localizedDescription)
-                hasLoadedInitialState = await reloadConversationState()
-                await loadStats()
-                if !queuedMessages.isEmpty {
-                    processNextQueued()
-                }
-            }
-        }
-    }
-
-    func renameSession(sessionId: String, name: String) {
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await client.renameSession(name: ghostName, sessionId: sessionId, sessionName: name)
-                _ = await loadSessions()
-            } catch {
-                self.showToast(error.localizedDescription)
-            }
-        }
-    }
-
-    func deleteSession(sessionId: String) {
-        guard sessions?.current != sessionId else {
-            showToast("Cannot delete the active session")
-            return
-        }
-
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await client.deleteSession(name: ghostName, sessionId: sessionId)
-                _ = await loadSessions()
-            } catch {
-                self.showToast(error.localizedDescription)
-            }
-        }
-    }
-
-    private func handleCompaction(compactResponseMessageID: UUID?) async {
-        showingPreCompactionMessages = false
-        hasLoadedInitialState = await reloadConversationState()
+    private func handleCompaction(compactResponseMessageID _: UUID?) async {
+        store.showingPreCompactionMessages = false
+        hasLoadedInitialState = await store.reloadConversationState()
     }
 
     private func loadGhost() async {
         do {
-            ghost = try await client.getGhost(name: ghostName)
+            store.ghost = try await client.getGhost(name: ghostName)
         } catch {
-            self.showError(error.localizedDescription)
-        }
-    }
-
-    private func loadStats() async {
-        do {
-            stats = try await client.fetchStats(ghostName: ghostName)
-        } catch {
-            // Stats are best-effort, don't surface errors
+            notifications.showError(error.localizedDescription)
         }
     }
 
     private func wakeGhostAndLoadHistory() async {
         isWakingGhost = true
         SoundManager.shared.play(.ghostWake)
-        error = nil
+        notifications.clearError()
 
         defer {
             isWakingGhost = false
@@ -1072,52 +654,19 @@ final class AgentChatViewModel: ObservableObject {
 
         do {
             try await client.wakeGhost(name: ghostName)
-            hasLoadedInitialState = await reloadConversationState()
+            hasLoadedInitialState = await store.reloadConversationState()
             await loadGhost()
-            await loadStats()
+            await store.loadStats()
         } catch {
-            self.showError(error.localizedDescription)
+            notifications.showError(error.localizedDescription)
         }
-    }
-
-    @discardableResult
-    private func reloadConversationState() async -> Bool {
-        async let historyLoaded = loadHistory()
-        async let sessionsLoaded = loadSessions()
-
-        let didLoadHistory = await historyLoaded
-        _ = await sessionsLoaded
-        return didLoadHistory
-    }
-
-    private func enterHistoryMode() -> Bool {
-        guard !selectableHistoryMessages.isEmpty else { return false }
-
-        historyDraft = inputText
-        historySelectionMessageID = nil
-        isHistoryModeActive = true
-        return true
-    }
-
-    private var selectableHistoryMessages: [ChatMessage] {
-        messages.filter { !$0.isToolMessage }
-    }
-
-    private var selectedHistoryIndex: Int? {
-        guard let historySelectionMessageID else { return nil }
-        return selectableHistoryMessages.firstIndex { $0.id == historySelectionMessageID }
-    }
-
-    private func updateMessage(at index: Int, with message: ChatMessage) {
-        guard messages.indices.contains(index) else { return }
-        messages[index] = message
     }
 
     private func rebuildActiveBackgroundTasks() {
         var tasksByID: [String: ActiveBackgroundTask] = [:]
         var orderedTaskIDs: [String] = []
 
-        for message in preCompactionMessages + messages {
+        for message in store.preCompactionMessages + store.messages {
             guard message.role == .toolResult else { continue }
 
             if let task = Self.parseBackgroundTaskStart(from: message.content) {
@@ -1133,8 +682,6 @@ final class AgentChatViewModel: ObservableObject {
                 orderedTaskIDs.removeAll { $0 == taskID }
             }
 
-            // background_status tool results show the real running task list -
-            // reconcile our tracked tasks with reality
             if let realTaskIDs = Self.parseBackgroundStatusResult(from: message.content) {
                 let realSet = Set(realTaskIDs)
                 orderedTaskIDs.removeAll { !realSet.contains($0) }
@@ -1146,10 +693,6 @@ final class AgentChatViewModel: ObservableObject {
     }
 
     private static func parseBackgroundStatusResult(from content: String) -> [String]? {
-        // Matches "background_status" tool results like:
-        // "Running tasks: 1 - bg-abc123 | label: foo"
-        // "Running tasks: 0"
-        // "No running tasks"
         guard content.contains("background_status") || content.contains("Running tasks:") else {
             return nil
         }
@@ -1162,9 +705,8 @@ final class AgentChatViewModel: ObservableObject {
             return nil
         }
 
-        // Extract all bg-<uuid> task IDs from the status output
         var ids: [String] = []
-        let matches = Self.backgroundTaskIDRegex.matches(
+        let matches = backgroundTaskIDRegex.matches(
             in: content,
             range: NSRange(content.startIndex..., in: content)
         )
@@ -1174,47 +716,6 @@ final class AgentChatViewModel: ObservableObject {
             }
         }
         return ids
-    }
-
-    private func mapRole(_ role: String) -> ChatMessage.Role {
-        switch role {
-        case "user":
-            return .user
-        case "assistant":
-            return .ghost
-        case "tool_use":
-            return .toolUse
-        case "tool_result":
-            return .toolResult
-        case "system":
-            return .system
-        default:
-            return .system
-        }
-    }
-
-    private func parseTimestamp(_ value: String?) -> Date {
-        guard let value, !value.isEmpty else {
-            return Date()
-        }
-
-        if let date = Self.timestampFormatterWithFractionalSeconds.date(from: value) {
-            return date
-        }
-
-        if let date = Self.timestampFormatter.date(from: value) {
-            return date
-        }
-
-        return Date()
-    }
-
-    private static func isGhostPanelVisible(_ ghostName: String) -> Bool {
-        guard NSApp.isActive else { return false }
-        // Check all visible windows for one matching this ghost's title
-        return NSApp.windows.contains { window in
-            window.isVisible && window.title == ghostName
-        }
     }
 
     private static func isCompactCommand(_ prompt: String) -> Bool {
@@ -1350,147 +851,10 @@ final class AgentChatViewModel: ObservableObject {
         return nil
     }
 
+    private static let backgroundTaskIDRegex = try! NSRegularExpression(pattern: "bg-[0-9a-fA-F-]{36}")
     private static let backgroundTaskTrimCharacters = CharacterSet.whitespacesAndNewlines
         .union(CharacterSet(charactersIn: ":,;()[]{}\"'"))
     private static let backgroundTaskTokenSeparators = CharacterSet.whitespacesAndNewlines
         .union(CharacterSet(charactersIn: ",;"))
     private static let backgroundTaskValueTerminators: Set<Character> = [",", "\n", "\r", "}"]
-
-    private nonisolated static func makePendingImage(from image: NSImage) -> PendingImage? {
-        let resized = resizeForAPI(image: image)
-
-        guard var imageData = resized.pngData() else {
-            return nil
-        }
-
-        imageData = compressForAPI(data: imageData)
-
-        return PendingImage(
-            data: imageData,
-            thumbnail: image.thumbnailImage(maxDimension: 200) ?? image,
-            mediaType: imageData.isJPEGData ? "image/jpeg" : "image/png"
-        )
-    }
-
-    private nonisolated static func resizeForAPI(image: NSImage) -> NSImage {
-        guard let pixelSize = image.pixelSize() else {
-            return image
-        }
-
-        let longestEdge = max(pixelSize.width, pixelSize.height)
-        let totalPixels = pixelSize.width * pixelSize.height
-
-        guard longestEdge > maximumAPIImageEdge || totalPixels > maximumAPIImagePixels else {
-            return image
-        }
-
-        let scale = min(
-            maximumAPIImageEdge / longestEdge,
-            sqrt(maximumAPIImagePixels / totalPixels)
-        )
-        let targetSize = NSSize(
-            width: max(1, floor(pixelSize.width * scale)),
-            height: max(1, floor(pixelSize.height * scale))
-        )
-        let resized = NSImage(size: targetSize)
-        let sourceSize = image.size.width > 0 && image.size.height > 0 ? image.size : pixelSize
-
-        resized.lockFocus()
-        defer { resized.unlockFocus() }
-
-        image.draw(
-            in: NSRect(origin: .zero, size: targetSize),
-            from: NSRect(origin: .zero, size: sourceSize),
-            operation: .copy,
-            fraction: 1
-        )
-
-        return resized
-    }
-
-    private nonisolated static func compressForAPI(data: Data) -> Data {
-        guard data.count > maximumAPIImageBytes,
-              let bitmap = NSBitmapImageRep(data: data),
-              let jpegData = bitmap.representation(
-                  using: .jpeg,
-                  properties: [.compressionFactor: 0.85]
-              ) else {
-            return data
-        }
-
-        return jpegData
-    }
-
-    private static func isSupportedImageFile(_ url: URL) -> Bool {
-        guard url.isFileURL else {
-            return false
-        }
-
-        if let resourceValues = try? url.resourceValues(forKeys: [.contentTypeKey]),
-           let contentType = resourceValues.contentType {
-            return contentType.conforms(to: .image)
-        }
-
-        return false
-    }
-}
-
-private extension NSImage {
-    func pixelSize() -> NSSize? {
-        let bitmapRepresentations = representations
-            .compactMap { $0 as? NSBitmapImageRep }
-            .filter { $0.pixelsWide > 0 && $0.pixelsHigh > 0 }
-
-        if let bitmap = bitmapRepresentations.max(by: {
-            ($0.pixelsWide * $0.pixelsHigh) < ($1.pixelsWide * $1.pixelsHigh)
-        }) {
-            return NSSize(width: bitmap.pixelsWide, height: bitmap.pixelsHigh)
-        }
-
-        guard let tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffRepresentation),
-              bitmap.pixelsWide > 0,
-              bitmap.pixelsHigh > 0 else {
-            return nil
-        }
-
-        return NSSize(width: bitmap.pixelsWide, height: bitmap.pixelsHigh)
-    }
-
-    func pngData() -> Data? {
-        guard let tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffRepresentation) else {
-            return nil
-        }
-
-        return bitmap.representation(using: .png, properties: [:])
-    }
-
-    func thumbnailImage(maxDimension: CGFloat) -> NSImage? {
-        guard size.width > 0, size.height > 0 else {
-            return nil
-        }
-
-        let scale = min(maxDimension / size.width, maxDimension / size.height, 1)
-        let targetSize = NSSize(width: size.width * scale, height: size.height * scale)
-        let thumbnail = NSImage(size: targetSize)
-
-        thumbnail.lockFocus()
-        defer { thumbnail.unlockFocus() }
-
-        draw(
-            in: NSRect(origin: .zero, size: targetSize),
-            from: NSRect(origin: .zero, size: size),
-            operation: .copy,
-            fraction: 1
-        )
-
-        return thumbnail
-    }
-}
-
-private extension Data {
-    var isJPEGData: Bool {
-        starts(with: [0xFF, 0xD8, 0xFF])
-    }
 }

@@ -112,7 +112,7 @@ extension AgentChatView {
     }
 
     var slashAutocompleteQuery: String? {
-        SlashCommandPopup.slashAutocompleteQuery(for: viewModel.inputText)
+        SlashCommandPopup.slashAutocompleteQuery(for: viewModel.input.inputText)
     }
 
     var filteredSlashCommands: [GhostSlashCommand] {
@@ -138,7 +138,7 @@ extension AgentChatView {
     }
 
     func selectSlashCommand(_ command: GhostSlashCommand) {
-        viewModel.inputText = "/\(command.name) "
+        viewModel.input.inputText = "/\(command.name) "
         dismissSlashCommandPopup()
         isInputFocused = true
     }

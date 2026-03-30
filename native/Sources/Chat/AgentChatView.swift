@@ -1,3 +1,4 @@
+import Observation
 import SwiftUI
 
 private enum ChatPanelLayout {
@@ -14,7 +15,7 @@ private struct ScrollOffsetKey: PreferenceKey {
 }
 
 struct AgentChatView: View {
-    @ObservedObject var viewModel: AgentChatViewModel
+    let viewModel: AgentChatViewModel
     @FocusState var isInputFocused: Bool
     @State private var expandedToolMessages: Set<UUID> = []
     @State private var fullscreenToolGroupID: UUID?
@@ -30,6 +31,10 @@ struct AgentChatView: View {
     @State private var scrollViewHeight: CGFloat = 0
 
     var body: some View {
+        @Bindable var input = viewModel.input
+        let store = viewModel.store
+        let notifications = viewModel.notifications
+
         ZStack(alignment: .bottom) {
             VStack(spacing: 0) {
                 ChatHeaderView(
@@ -47,17 +52,17 @@ struct AgentChatView: View {
                         attachmentStrip
 
                         ChatInputView(
-                            inputText: $viewModel.inputText,
+                            inputText: $input.inputText,
                             ghostName: viewModel.ghostName,
                             backgroundTasks: viewModel.activeBackgroundTasks,
                             isWakingGhost: viewModel.isWakingGhost,
-                            isLoadingHistory: viewModel.isLoadingHistory,
-                            isCompacting: viewModel.isCompacting,
-                            isCreatingSession: viewModel.isCreatingSession,
-                            isHistoryModeActive: viewModel.isHistoryModeActive,
-                            isInputDisabled: viewModel.isInputDisabled,
+                            isLoadingHistory: store.isLoadingHistory,
+                            isCompacting: store.isCompacting,
+                            isCreatingSession: store.isCreatingSession,
+                            isHistoryModeActive: input.isHistoryModeActive,
+                            isInputDisabled: input.isInputDisabled,
                             isInputFocused: $isInputFocused,
-                            stats: viewModel.stats,
+                            stats: store.stats,
                             onPasteCommand: viewModel.addImageFromPasteboard,
                             onQueueBrowseUp: viewModel.browseQueueBackward,
                             onQueueBrowseDown: viewModel.browseQueueForward,
@@ -132,7 +137,7 @@ struct AgentChatView: View {
                 .zIndex(4)
             }
 
-            if let toastMessage = viewModel.toast ?? viewModel.error {
+            if let toastMessage = notifications.toastMessage {
                 VStack {
                     HStack {
                         Spacer()
@@ -147,7 +152,7 @@ struct AgentChatView: View {
                                 .lineLimit(2)
 
                             Button {
-                                viewModel.dismissToast()
+                                notifications.dismissToast()
                             } label: {
                                 Image(systemName: "xmark")
                                     .font(.system(size: 9, weight: .semibold))
@@ -161,11 +166,11 @@ struct AgentChatView: View {
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
                         .background(
-                            RoundedRectangle(cornerRadius: 14)
+                            RoundedRectangle(cornerRadius: Theme.Layout.controlCornerRadius)
                                 .fill(Color.white.opacity(0.06))
                         )
                         .overlay(
-                            RoundedRectangle(cornerRadius: 14)
+                            RoundedRectangle(cornerRadius: Theme.Layout.controlCornerRadius)
                                 .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
                         )
                         .shadow(color: Color.black.opacity(0.3), radius: 12, y: 4)
@@ -178,8 +183,8 @@ struct AgentChatView: View {
                 .zIndex(5)
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: viewModel.toast)
-        .animation(.easeInOut(duration: 0.2), value: viewModel.error)
+        .animation(.easeInOut(duration: 0.2), value: notifications.toastMessage)
+        .animation(.easeInOut(duration: 0.2), value: notifications.error)
         .background(Color.clear)
         .onAppear {
             isInputFocused = true
@@ -199,13 +204,13 @@ struct AgentChatView: View {
                 ]
             )
         }
-        .onChange(of: viewModel.inputText) {
+        .onChange(of: input.inputText) {
             handleInputTextChanged()
         }
-        .onChange(of: viewModel.messagesVersion) {
+        .onChange(of: store.messagesVersion) {
             rebuildDisplayItems()
         }
-        .onChange(of: viewModel.preCompactionDisplayVersion) {
+        .onChange(of: store.preCompactionDisplayVersion) {
             rebuildPreCompactionDisplayItems()
         }
         .onKeyPress(.escape, action: handleEscapeKey)
@@ -225,7 +230,7 @@ struct AgentChatView: View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottom) {
                 ScrollView {
-                    if viewModel.isWakingGhost && viewModel.messages.isEmpty {
+                    if viewModel.isWakingGhost && viewModel.store.messages.isEmpty {
                         VStack(spacing: 12) {
                             ProgressView()
                                 .controlSize(.small)
@@ -237,7 +242,7 @@ struct AgentChatView: View {
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.top, 40)
-                    } else if viewModel.isLoadingHistory && viewModel.messages.isEmpty {
+                    } else if viewModel.store.isLoadingHistory && viewModel.store.messages.isEmpty {
                         VStack(spacing: 12) {
                             ProgressView()
                                 .controlSize(.small)
@@ -249,7 +254,7 @@ struct AgentChatView: View {
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.top, 40)
-                    } else if viewModel.isCreatingSession && viewModel.messages.isEmpty {
+                    } else if viewModel.store.isCreatingSession && viewModel.store.messages.isEmpty {
                         VStack(spacing: 10) {
                             Text("Starting new session...")
                                 .font(Theme.Typography.body(weight: .medium))
@@ -261,7 +266,7 @@ struct AgentChatView: View {
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.top, 40)
-                    } else if viewModel.messages.isEmpty {
+                    } else if viewModel.store.messages.isEmpty {
                         VStack(spacing: 8) {
                             Text("No messages yet.")
                                 .font(Theme.Typography.body(weight: .medium))
@@ -275,23 +280,23 @@ struct AgentChatView: View {
                         .padding(.top, 40)
                     } else {
                         LazyVStack(spacing: 20) {
-                            if !viewModel.preCompactionMessages.isEmpty {
-                                if viewModel.hasMoreOlderMessages {
+                            if !viewModel.store.preCompactionMessages.isEmpty {
+                                if viewModel.store.hasMoreOlderMessages {
                                     showMoreButton
                                 }
 
-                                if viewModel.showingPreCompactionMessages {
+                                if viewModel.store.showingPreCompactionMessages {
                                     chatItemsSection(cachedPreCompactionDisplayItems)
 
                                     HStack(spacing: 12) {
                                         hideOlderButton
-                                        if viewModel.hasMoreOlderMessages {
+                                        if viewModel.store.hasMoreOlderMessages {
                                             showMoreButton
                                         }
                                     }
                                 }
 
-                                CompactionDivider(summary: viewModel.compactionSummary)
+                                CompactionDivider(summary: viewModel.store.compactionSummary)
                             }
 
                             chatItemsSection(cachedDisplayItems)
@@ -335,12 +340,12 @@ struct AgentChatView: View {
                 .onAppear {
                     scrollToLatest(using: proxy)
                 }
-                .onChange(of: viewModel.messagesVersion) {
+                .onChange(of: viewModel.store.messagesVersion) {
                     guard isNearBottom else { return }
                     scrollToLatest(using: proxy)
                 }
-                .onChange(of: viewModel.historySelectionMessageID) {
-                    guard let selectionID = viewModel.historySelectionMessageID else { return }
+                .onChange(of: viewModel.input.historySelectionMessageID) {
+                    guard let selectionID = viewModel.input.historySelectionMessageID else { return }
                     withAnimation(.easeOut(duration: 0.2)) {
                         proxy.scrollTo(ChatScrollAnchor.message(selectionID), anchor: .center)
                     }
@@ -349,11 +354,11 @@ struct AgentChatView: View {
                     guard isNearBottom else { return }
                     scrollToLatest(using: proxy)
                 }
-                .onChange(of: viewModel.sessions?.current) {
+                .onChange(of: viewModel.store.sessions?.current) {
                     scrollToLatest(using: proxy)
                 }
 
-                if !isNearBottom && !viewModel.messages.isEmpty {
+                if !isNearBottom && !viewModel.store.messages.isEmpty {
                     Button {
                         scrollToLatest(using: proxy)
                     } label: {
@@ -362,11 +367,11 @@ struct AgentChatView: View {
                             Text("Latest")
                         }
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(Theme.Colors.accentLightest)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Theme.Colors.accent)
-                        .clipShape(Capsule())
+                        .capsuleControlStyle(
+                            backgroundColor: Theme.Colors.accent,
+                            borderColor: nil,
+                            verticalPadding: 5
+                        )
                     }
                     .buttonStyle(.plain)
                     .padding(.bottom, 12)
@@ -379,9 +384,9 @@ struct AgentChatView: View {
 
     @ViewBuilder
     private var attachmentStrip: some View {
-        if !viewModel.pendingImages.isEmpty {
+        if !viewModel.input.pendingImages.isEmpty {
             PendingImageStripView(
-                images: viewModel.pendingImages,
+                images: viewModel.input.pendingImages,
                 onRemove: viewModel.removeImage,
                 onTap: { image in
                     withAnimation(.easeOut(duration: 0.15)) {
@@ -394,16 +399,7 @@ struct AgentChatView: View {
     }
 
     private var statusColor: Color {
-        switch viewModel.ghost?.status {
-        case .running:
-            return Color.green.opacity(0.9)
-        case .stopped:
-            return Color.red.opacity(0.9)
-        case .error:
-            return Color.orange.opacity(0.95)
-        case .none:
-            return Color.white.opacity(Theme.Text.quaternary)
-        }
+        Theme.Colors.statusColor(for: viewModel.store.ghost?.status.rawValue ?? "")
     }
 
     private var queueIndicator: some View {
@@ -415,15 +411,11 @@ struct AgentChatView: View {
 
         return Text(label)
             .font(Theme.Typography.caption(weight: .medium))
-            .foregroundColor(Theme.Colors.accentLightest)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(Theme.Colors.accent.opacity(viewModel.isQueueBrowsing ? 0.3 : 0.18))
-            .overlay {
-                RoundedRectangle(cornerRadius: 999, style: .continuous)
-                    .strokeBorder(Theme.Colors.accentLight.opacity(viewModel.isQueueBrowsing ? 0.35 : 0.18), lineWidth: 0.5)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 999, style: .continuous))
+            .capsuleControlStyle(
+                backgroundColor: Theme.Colors.accent.opacity(viewModel.isQueueBrowsing ? 0.3 : 0.18),
+                borderColor: Theme.Colors.accentLight.opacity(viewModel.isQueueBrowsing ? 0.35 : 0.18),
+                verticalPadding: 6
+            )
             .shadow(color: Theme.Colors.accent.opacity(0.12), radius: 16, x: 0, y: 8)
             .allowsHitTesting(false)
             .animation(.easeOut(duration: 0.12), value: viewModel.queueBrowseIndex)
@@ -443,7 +435,7 @@ struct AgentChatView: View {
         guard isSlashCommandPopupVisible, let command = filteredSlashCommands.first else {
             return false
         }
-        viewModel.inputText = "/\(command.name) "
+        viewModel.input.inputText = "/\(command.name) "
         dismissSlashCommandPopup()
         return true
     }
@@ -551,7 +543,7 @@ struct AgentChatView: View {
             ChatDisplayRow(
                 item: item,
                 ghostName: viewModel.ghostName,
-                selectedMessageID: viewModel.historySelectionMessageID,
+                selectedMessageID: viewModel.input.historySelectionMessageID,
                 isToolGroupExpanded: { groupID in
                     expandedToolMessages.contains(groupID)
                 },
@@ -568,20 +560,20 @@ struct AgentChatView: View {
     }
 
     private func rebuildDisplayItems() {
-        cachedDisplayItems = ChatDisplayItem.build(from: viewModel.messages)
+        cachedDisplayItems = ChatDisplayItem.build(from: viewModel.store.messages)
     }
 
     private func rebuildPreCompactionDisplayItems() {
-        cachedPreCompactionDisplayItems = ChatDisplayItem.build(from: viewModel.visiblePreCompactionMessages)
+        cachedPreCompactionDisplayItems = ChatDisplayItem.build(from: viewModel.store.visiblePreCompactionMessages)
     }
 
     private var showMoreButton: some View {
-        let remaining = viewModel.preCompactionMessages.count - viewModel.visiblePreCompactionCount
-        let batch = min(remaining, AgentChatViewModel.olderMessagesBatchSize)
+        let remaining = viewModel.store.preCompactionMessages.count - viewModel.store.visiblePreCompactionCount
+        let batch = min(remaining, ConversationStore.olderMessagesBatchSize)
 
         return Button {
             withAnimation(.easeOut(duration: 0.18)) {
-                viewModel.showMoreOlderMessages()
+                viewModel.store.showMoreOlderMessages()
             }
         } label: {
             Text("Show \(batch) older messages (\(remaining) total)")
@@ -596,7 +588,7 @@ struct AgentChatView: View {
     private var hideOlderButton: some View {
         Button {
             withAnimation(.easeOut(duration: 0.18)) {
-                viewModel.hideOlderMessages()
+                viewModel.store.hideOlderMessages()
             }
         } label: {
             Text("Hide older messages")

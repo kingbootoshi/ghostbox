@@ -39,7 +39,7 @@ struct ToolCallGroupBlock: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 11)
             .background(Color.white.opacity(0.03))
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Layout.controlCornerRadius, style: .continuous))
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 12) {
@@ -56,7 +56,7 @@ struct ToolCallGroupBlock: View {
                                 .foregroundColor(Color.white.opacity(Theme.Text.secondary))
                                 .frame(width: 24, height: 24)
                                 .background(Color.white.opacity(0.04))
-                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                .clipShape(RoundedRectangle(cornerRadius: Theme.Layout.smallCornerRadius, style: .continuous))
                         }
                         .buttonStyle(.plain)
                     }
@@ -83,7 +83,7 @@ struct ToolCallGroupBlock: View {
                 }
                 .padding(12)
                 .background(Color.white.opacity(0.05))
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: Theme.Layout.cardCornerRadius, style: .continuous))
                 .transition(.opacity)
             }
         }
@@ -120,14 +120,13 @@ private struct ToolCallRunningBadge: View {
                 .font(Theme.Typography.caption(weight: .medium))
                 .foregroundColor(Theme.Colors.accentLight)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Theme.Colors.accent.opacity(0.12))
-        .overlay(
-            Capsule()
-                .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
+        .capsuleControlStyle(
+            foregroundColor: Theme.Colors.accentLight,
+            backgroundColor: Theme.Colors.accent.opacity(0.12),
+            borderColor: Theme.Colors.accentLight.opacity(0.18),
+            horizontalPadding: 8,
+            verticalPadding: 4
         )
-        .clipShape(Capsule())
     }
 }
 
@@ -151,7 +150,7 @@ struct ToolCallFullscreenOverlay: View {
 
     var body: some View {
         ZStack {
-            Color(red: 0.02, green: 0.02, blue: 0.04).opacity(0.88)
+            Theme.Colors.overlayBackdrop.opacity(0.88)
                 .onTapGesture(perform: onClose)
 
             VStack(alignment: .leading, spacing: 0) {
@@ -175,15 +174,14 @@ struct ToolCallFullscreenOverlay: View {
 
                     Spacer(minLength: 0)
 
-                    Button(action: onClose) {
-                        Image(systemName: "xmark")
-                            .font(.system(size: Theme.FontSize.sm, weight: .semibold))
-                            .foregroundColor(Color.white.opacity(Theme.Text.secondary))
-                            .frame(width: 28, height: 28)
-                            .background(Color.white.opacity(0.08))
-                            .clipShape(Circle())
-                    }
-                    .buttonStyle(.plain)
+                    CircularIconButton(
+                        systemImage: "xmark",
+                        action: onClose,
+                        size: 28,
+                        iconSize: Theme.FontSize.sm,
+                        foregroundColor: Color.white.opacity(Theme.Text.secondary),
+                        backgroundColor: Color.white.opacity(0.08)
+                    )
                 }
                 .padding(.horizontal, 20)
                 .padding(.vertical, 16)
@@ -236,11 +234,11 @@ struct ToolCallFullscreenOverlay: View {
                 }
             }
             .background(
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .fill(Color(red: 0.06, green: 0.06, blue: 0.08).opacity(0.96))
+                RoundedRectangle(cornerRadius: Theme.Layout.panelCornerRadius, style: .continuous)
+                    .fill(Theme.Colors.overlaySurface.opacity(0.96))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                RoundedRectangle(cornerRadius: Theme.Layout.panelCornerRadius, style: .continuous)
                     .strokeBorder(Theme.Colors.accentLight.opacity(0.12), lineWidth: 0.5)
             )
             .padding(14)

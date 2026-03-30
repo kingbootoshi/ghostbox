@@ -82,7 +82,7 @@ struct GhostRow: View {
         .buttonStyle(.plain)
         .padding(16)
         .background(Color.white.opacity(0.02))
-        .clipShape(RoundedRectangle(cornerRadius: 22))
+        .clipShape(RoundedRectangle(cornerRadius: Theme.Layout.rowCornerRadius))
         .alert("Kill \(ghost.name)?", isPresented: $showKillConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Kill", role: .destructive, action: onKill)
@@ -98,13 +98,6 @@ struct GhostRow: View {
     }
 
     private var statusColor: Color {
-        switch ghost.status {
-        case .running:
-            return Color.green.opacity(0.9)
-        case .stopped:
-            return Color.red.opacity(0.9)
-        case .error:
-            return Color.orange.opacity(0.95)
-        }
+        Theme.Colors.statusColor(for: ghost.status.rawValue)
     }
 }

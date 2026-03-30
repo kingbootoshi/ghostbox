@@ -1,8 +1,6 @@
-import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import http from "node:http";
-import { basename } from "node:path";
 
 import {
   type AgentSession,
@@ -14,18 +12,16 @@ import {
   SessionManager,
   type ToolDefinition
 } from "@mariozechner/pi-coding-agent";
+import { createGhostHandlers } from "./ghost-handlers";
+import { createGhostMemory, NUDGE_EVENTS, NudgeRegistry, registerDefaultNudgeHandlers } from "./ghost-memory";
 import type {
-  CompactionInfo,
   GhostImage,
   GhostMessage,
-  GhostQueueState,
   GhostSchedule,
   GhostStreamingBehavior,
   HistoryMessage,
   MailboxState,
-  MailMessage,
-  SessionInfo,
-  SessionListResponse
+  MailMessage
 } from "./types";
 
 const defaultSystemPrompt =
@@ -72,26 +68,6 @@ const buildSystemPrompt = (): string => {
   return blocks.join("\n");
 };
 
-// ---------------------------------------------------------------------------
-// Memory flush + observer fallback
-// ---------------------------------------------------------------------------
-
-type AuthEntry = {
-  type: string;
-  access: string;
-  refresh: string;
-  expires: number;
-  accountId?: string;
-};
-
-type ObserverOperation = {
-  action: "add" | "replace" | "remove";
-  target: "memory" | "user";
-  content?: string;
-  old_text?: string;
-};
-
-const observerModelEnv = process.env.GHOSTBOX_OBSERVER_MODEL || "";
 const hostApiPort = process.env.GHOSTBOX_API_PORT || "8008";
 const ghostName = process.env.GHOSTBOX_GHOST_NAME || "";
 const ghostApiKey = process.env.GHOST_API_KEY || "";
@@ -187,510 +163,6 @@ const mailboxToolSchema = {
   required: ["action"]
 };
 
-// ---------------------------------------------------------------------------
-// Nudge Registry - centralized event bus for proactive agent behavior
-// ---------------------------------------------------------------------------
-// Nudges are internal events that trigger actions without user instruction.
-// Pre-compaction memory flush is the default critical-path handler. Future:
-// scheduled hooks, sub-agent callbacks, agent self-activation.
-
-const NUDGE_EVENTS = [
-  "message-complete", // After each user message is processed
-  "pre-compact", // Before context compaction
-  "pre-new-session", // Before new session
-  "idle", // Agent has been idle for N seconds
-  "timer", // Periodic timer fire
-  "self", // Agent-triggered (via tool or API)
-  "session-start" // Session just started
-] as const;
-type NudgeEvent = (typeof NUDGE_EVENTS)[number];
-
-type NudgeHandler = {
-  id: string;
-  event: NudgeEvent | NudgeEvent[];
-  handler: (event: NudgeEvent, context: NudgeContext) => Promise<void> | void;
-  // For message-count-gated handlers
-  messageInterval?: number;
-  // For time-gated handlers (ms)
-  timeInterval?: number;
-  // Background (non-blocking) vs foreground (blocks the event)
-  background?: boolean;
-};
-
-type NudgeContext = {
-  reason: string;
-  messageCount: number;
-  sessionAge: number; // ms since session start
-  payload?: Record<string, unknown>; // For sub-agent callbacks, scheduled hooks
-};
-
-class NudgeRegistry {
-  private handlers: NudgeHandler[] = [];
-  private messageCount = 0;
-  private handlerMessageCounters: Map<string, number> = new Map();
-  private handlerLastFired: Map<string, number> = new Map();
-  private sessionStartTime = Date.now();
-
-  register(handler: NudgeHandler): void {
-    this.handlers.push(handler);
-    this.handlerMessageCounters.set(handler.id, 0);
-    this.handlerLastFired.set(handler.id, Date.now());
-    log.info("Nudge: registered handler", { id: handler.id, event: handler.event });
-  }
-
-  resetCounters(): void {
-    this.messageCount = 0;
-    this.sessionStartTime = Date.now();
-    for (const handler of this.handlers) {
-      this.handlerMessageCounters.set(handler.id, 0);
-      this.handlerLastFired.set(handler.id, Date.now());
-    }
-  }
-
-  status(): {
-    handlers: Array<{
-      id: string;
-      event: NudgeEvent | NudgeEvent[];
-      messageInterval?: number;
-      timeInterval?: number;
-      background?: boolean;
-    }>;
-    messageCount: number;
-    sessionAge: number;
-    handlerCounters: Record<string, number>;
-    handlerLastFired: Record<string, string>;
-  } {
-    const counters: Record<string, number> = {};
-    const lastFired: Record<string, string> = {};
-    for (const handler of this.handlers) {
-      counters[handler.id] = this.handlerMessageCounters.get(handler.id) ?? 0;
-      const ts = this.handlerLastFired.get(handler.id) ?? 0;
-      lastFired[handler.id] = ts ? new Date(ts).toISOString() : "never";
-    }
-    return {
-      handlers: this.handlers.map((h) => ({
-        id: h.id,
-        event: h.event,
-        messageInterval: h.messageInterval,
-        timeInterval: h.timeInterval,
-        background: h.background
-      })),
-      messageCount: this.messageCount,
-      sessionAge: Date.now() - this.sessionStartTime,
-      handlerCounters: counters,
-      handlerLastFired: lastFired
-    };
-  }
-
-  async emit(event: NudgeEvent, reason: string): Promise<void> {
-    if (event === "message-complete") {
-      this.messageCount++;
-    }
-
-    const context: NudgeContext = {
-      reason,
-      messageCount: this.messageCount,
-      sessionAge: Date.now() - this.sessionStartTime
-    };
-
-    for (const handler of this.handlers) {
-      const events = Array.isArray(handler.event) ? handler.event : [handler.event];
-      if (!events.includes(event)) continue;
-
-      // Check message-interval gate
-      if (handler.messageInterval && event === "message-complete") {
-        const count = (this.handlerMessageCounters.get(handler.id) ?? 0) + 1;
-        this.handlerMessageCounters.set(handler.id, count);
-        if (count < handler.messageInterval) continue;
-        this.handlerMessageCounters.set(handler.id, 0);
-      }
-
-      // Check time-interval gate
-      if (handler.timeInterval) {
-        const lastFired = this.handlerLastFired.get(handler.id) ?? 0;
-        if (Date.now() - lastFired < handler.timeInterval) continue;
-      }
-
-      this.handlerLastFired.set(handler.id, Date.now());
-
-      // Critical events always await - background flag only applies to non-critical events
-      const criticalEvents: NudgeEvent[] = ["pre-compact", "pre-new-session"];
-      const shouldAwait = !handler.background || criticalEvents.includes(event);
-
-      if (shouldAwait) {
-        try {
-          await handler.handler(event, context);
-        } catch (error) {
-          log.error("Nudge: handler failed", {
-            id: handler.id,
-            event,
-            ...serializeError(error)
-          });
-        }
-      } else {
-        Promise.resolve(handler.handler(event, context)).catch((error: unknown) => {
-          log.error("Nudge: background handler failed", {
-            id: handler.id,
-            event,
-            ...serializeError(error)
-          });
-        });
-      }
-    }
-  }
-}
-
-const nudges = new NudgeRegistry();
-
-const readAuthEntry = (provider: string): AuthEntry | null => {
-  try {
-    const raw = readFileSync("/root/.pi/agent/auth.json", "utf8");
-    const auth = JSON.parse(raw) as Record<string, AuthEntry>;
-    const entry = auth[provider];
-    if (!entry?.access) return null;
-    return entry;
-  } catch {
-    return null;
-  }
-};
-
-const refreshAnthropicToken = async (entry: AuthEntry): Promise<string | null> => {
-  if (Date.now() < entry.expires) {
-    return entry.access;
-  }
-  try {
-    const response = await fetch("https://platform.claude.com/v1/oauth/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grant_type: "refresh_token",
-        client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-        refresh_token: entry.refresh
-      })
-    });
-    if (!response.ok) return null;
-    const data = (await response.json()) as { access_token?: string; expires_in?: number };
-    if (!data.access_token) return null;
-    // Update auth.json with new token
-    try {
-      const raw = readFileSync("/root/.pi/agent/auth.json", "utf8");
-      const auth = JSON.parse(raw) as Record<string, AuthEntry>;
-      auth.anthropic.access = data.access_token;
-      auth.anthropic.expires = Date.now() + (data.expires_in ?? 3600) * 1000;
-      writeFileSync("/root/.pi/agent/auth.json", JSON.stringify(auth, null, 2));
-    } catch {
-      // Best effort
-    }
-    return data.access_token;
-  } catch {
-    return null;
-  }
-};
-
-const callObserverAnthropic = async (
-  token: string,
-  model: string,
-  system: string,
-  user: string
-): Promise<string | null> => {
-  try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "oauth-2025-04-20"
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 2048,
-        system,
-        messages: [{ role: "user", content: user }]
-      }),
-      signal: AbortSignal.timeout(60000)
-    });
-    if (!response.ok) {
-      log.error("Observer Anthropic API failed", { status: response.status });
-      return null;
-    }
-    const data = (await response.json()) as { content?: Array<{ text?: string }> };
-    return data.content?.[0]?.text ?? null;
-  } catch (error) {
-    log.error("Observer Anthropic API error", serializeError(error));
-    return null;
-  }
-};
-
-const callObserverOpenAI = async (
-  token: string,
-  model: string,
-  system: string,
-  user: string
-): Promise<string | null> => {
-  try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 2048,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user }
-        ]
-      }),
-      signal: AbortSignal.timeout(60000)
-    });
-    if (!response.ok) {
-      log.error("Observer OpenAI API failed", { status: response.status });
-      return null;
-    }
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    return data.choices?.[0]?.message?.content ?? null;
-  } catch (error) {
-    log.error("Observer OpenAI API error", serializeError(error));
-    return null;
-  }
-};
-
-const observerSystemPrompt = `You are a memory extraction agent. Your job: review conversation and extract facts that should persist across sessions.
-
-Two stores:
-- "memory": Agent's notes (environment, conventions, tool quirks, file references, lessons learned, project state)
-- "user": User profile (preferences, role, communication style, corrections, expertise level)
-
-EXTRACTION PROCESS:
-1. Read the current memory contents provided below
-2. Read the conversation
-3. For each of these categories, check if the conversation reveals anything new:
-   a. USER CORRECTIONS - Did the user correct something? (HIGHEST priority - prevents repeat mistakes)
-   b. USER PREFERENCES - Did the user state how they want things done?
-   c. ENVIRONMENT FACTS - Tech stack, tools, OS, paths, configs mentioned?
-   d. PROJECT STATE - Decisions made, features shipped, bugs found, architecture choices?
-   e. FILE REFERENCES - Important files created/modified that future sessions should know about?
-   f. LESSONS LEARNED - Something that didn't work, or a non-obvious solution that did?
-4. For each fact found: is it already in memory? If yes, does it need updating? If no, add it.
-5. Is anything in current memory now WRONG based on the conversation? Remove or replace it.
-
-SKIP: Task progress, temporary state, things easily re-discovered, raw data dumps, session-specific ephemera.
-
-Output a JSON array of operations:
-[{"action":"add","target":"memory","content":"fact to save"}]
-[{"action":"replace","target":"memory","old_text":"unique substring","content":"updated text"}]
-[{"action":"remove","target":"user","old_text":"unique substring to delete"}]
-
-If nothing worth saving: []
-Output ONLY the JSON array, no markdown, no explanation.`;
-
-const formatConversationForObserver = (messages: PiAgentMessage[]): string => {
-  const lines: string[] = [];
-  const maxChars = 30000;
-  let totalChars = 0;
-
-  // Work backwards to get the most recent messages
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    const role = msg.role ?? "unknown";
-    const text = getContentText(msg.content);
-    if (!text) continue;
-
-    const line = `[${role}]: ${text}`;
-    if (totalChars + line.length > maxChars) break;
-
-    lines.unshift(line);
-    totalChars += line.length;
-  }
-
-  return lines.join("\n\n");
-};
-
-const executeObserverOp = (op: ObserverOperation): void => {
-  try {
-    const args: string[] = [];
-    if (op.action === "add" && op.content && op.target) {
-      args.push("add", op.target, op.content);
-    } else if (op.action === "replace" && op.old_text && op.content && op.target) {
-      args.push("replace", op.target, op.old_text, op.content);
-    } else if (op.action === "remove" && op.old_text && op.target) {
-      args.push("remove", op.target, op.old_text);
-    } else {
-      return;
-    }
-    execFileSync("/usr/local/bin/memory", args, { timeout: 5000 });
-  } catch (error) {
-    log.error("Observer memory op failed", {
-      action: op.action,
-      target: op.target,
-      ...serializeError(error)
-    });
-  }
-};
-
-const runMemoryObserver = async (reason: string): Promise<void> => {
-  if (!observerModelEnv) return;
-
-  const separatorIdx = observerModelEnv.indexOf("/");
-  if (separatorIdx <= 0) {
-    log.error("Observer: invalid model format, expected provider/model", {
-      model: observerModelEnv
-    });
-    return;
-  }
-
-  const provider = observerModelEnv.slice(0, separatorIdx);
-  const modelId = observerModelEnv.slice(separatorIdx + 1);
-
-  log.info("Observer: starting", { reason, provider, model: modelId });
-
-  // Get auth
-  const authKey = provider === "openai" ? "openai-codex" : provider;
-  const authEntry = readAuthEntry(authKey);
-  if (!authEntry) {
-    log.info("Observer: no auth for provider, skipping", { provider: authKey });
-    return;
-  }
-
-  // Build context
-  const conversationText = formatConversationForObserver(session.messages);
-  if (!conversationText) {
-    log.info("Observer: no conversation to review, skipping");
-    return;
-  }
-
-  const currentMemory = readMemoryFile("/vault/MEMORY.md");
-  const currentUser = readMemoryFile("/vault/USER.md");
-
-  const userMessage = [
-    "Current MEMORY.md:",
-    currentMemory || "(empty)",
-    "",
-    "Current USER.md:",
-    currentUser || "(empty)",
-    "",
-    "Conversation to review:",
-    conversationText
-  ].join("\n");
-
-  // Call API
-  let responseText: string | null = null;
-
-  if (provider === "anthropic") {
-    const token = await refreshAnthropicToken(authEntry);
-    if (!token) {
-      log.error("Observer: failed to get Anthropic token");
-      return;
-    }
-    responseText = await callObserverAnthropic(token, modelId, observerSystemPrompt, userMessage);
-  } else if (provider === "openai") {
-    responseText = await callObserverOpenAI(authEntry.access, modelId, observerSystemPrompt, userMessage);
-  } else {
-    log.error("Observer: unsupported provider", { provider });
-    return;
-  }
-
-  if (!responseText) {
-    log.info("Observer: no response from model");
-    return;
-  }
-
-  // Parse and execute operations
-  try {
-    // Extract JSON array from response (handle markdown code blocks)
-    const cleaned = responseText
-      .replace(/^```json?\n?/m, "")
-      .replace(/\n?```$/m, "")
-      .trim();
-    const operations = JSON.parse(cleaned) as ObserverOperation[];
-
-    if (!Array.isArray(operations)) {
-      log.error("Observer: response is not an array");
-      return;
-    }
-
-    if (operations.length === 0) {
-      log.info("Observer: nothing to save");
-      return;
-    }
-
-    let successCount = 0;
-    for (const op of operations) {
-      if (op.action && op.target) {
-        executeObserverOp(op);
-        successCount++;
-      }
-    }
-
-    log.info("Observer: complete", { reason, operations: successCount });
-  } catch (error) {
-    log.error("Observer: failed to parse response", {
-      preview: responseText.slice(0, 300),
-      ...serializeError(error)
-    });
-  }
-};
-
-// ---------------------------------------------------------------------------
-// Hermes-style pre-compaction memory flush
-// ---------------------------------------------------------------------------
-// Gives the agent ONE turn before context is lost. The agent uses its normal
-// tools (including memory via bash) to save anything important.
-// After the flush turn, the flush prompt is removed from history.
-
-const flushMemories = async (reason: string): Promise<void> => {
-  if (session.messages.length < 3) {
-    log.info("Memory flush skipped - too few messages", { reason });
-    return;
-  }
-
-  const flushPrompt =
-    '[System: The session is being compressed. Save anything worth remembering using memory_write (target "memory" for facts, target "user" for user preferences). Prioritize user preferences, corrections, and recurring patterns over task-specific details. Do NOT respond conversationally - just save and stop.]';
-
-  log.info("Memory flush start", {
-    reason,
-    sessionId: session.sessionId,
-    messageCount: session.messages.length
-  });
-
-  try {
-    // Give the agent a turn with the flush instruction.
-    // session.prompt() uses the normal Pi SDK flow - the agent calls
-    // memory_write tool directly (registered by base extension).
-    await session.prompt(flushPrompt);
-
-    log.info("Memory flush complete", {
-      reason,
-      sessionId: session.sessionId
-    });
-  } catch (error) {
-    log.error("Memory flush failed", {
-      reason,
-      sessionId: session.sessionId,
-      ...serializeError(error)
-    });
-  }
-
-  // Strip the flush prompt and response from session history so they
-  // don't persist into the compacted context.
-  // The flush prompt is the last user message containing our sentinel text.
-  // The response (if any) follows it.
-  const msgs = session.messages;
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const text = getContentText(msgs[i].content);
-    if (text?.includes("[System: The session is being compressed")) {
-      // Remove from this point to end (flush prompt + any response)
-      msgs.splice(i);
-      log.info("Memory flush artifacts stripped", { removedFrom: i });
-      break;
-    }
-  }
-};
-
 const settingsPath = "/root/.pi/agent/settings.json";
 const defaultModelContextWindow = 200000;
 const defaultReserveTokens = 16384;
@@ -745,21 +217,17 @@ type SlashCommand = {
 };
 
 const isMessageUpdateEvent = (event: PiAgentEvent): boolean => event.type === "message_update";
-
 const isMessageEndEvent = (event: PiAgentEvent): boolean => event.type === "message_end";
-
 const isToolExecutionStartEvent = (event: PiAgentEvent): boolean => event.type === "tool_execution_start";
-
 const isToolExecutionEndEvent = (event: PiAgentEvent): boolean => event.type === "tool_execution_end";
-
 const isAgentEndEvent = (event: PiAgentEvent): boolean => event.type === "agent_end";
 
 const extractAgentEndError = (event: PiAgentEvent): string | undefined => {
   if (!Array.isArray(event.messages)) return undefined;
   for (const msg of event.messages) {
-    const m = msg as PiAgentMessage & { stopReason?: string; errorMessage?: string };
-    if (m.role === "assistant" && m.errorMessage) {
-      return m.errorMessage;
+    const message = msg as PiAgentMessage & { errorMessage?: string };
+    if (message.role === "assistant" && message.errorMessage) {
+      return message.errorMessage;
     }
   }
   return undefined;
@@ -815,27 +283,6 @@ const sendJsonLine = (res: ServerResponse, payload: GhostMessage): void => {
   res.write(`${JSON.stringify(payload)}\n`);
 };
 
-const startNdjsonResponse = (res: ServerResponse): void => {
-  res.writeHead(200, { "Content-Type": "application/x-ndjson" });
-};
-
-const sendAssistantResult = (res: ServerResponse, text: string, options?: { end?: boolean }): void => {
-  sendJsonLine(res, {
-    type: "assistant",
-    text
-  });
-
-  sendJsonLine(res, {
-    type: "result",
-    text: "",
-    sessionId: session.sessionId
-  });
-
-  if (options?.end !== false) {
-    res.end();
-  }
-};
-
 const getRequestBody = (req: IncomingMessage): Promise<string> =>
   new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -843,6 +290,29 @@ const getRequestBody = (req: IncomingMessage): Promise<string> =>
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
+
+const parseJsonRequestBody = async <T>(req: IncomingMessage): Promise<T> => {
+  const body = await getRequestBody(req);
+  if (!body.trim()) {
+    return {} as T;
+  }
+
+  return JSON.parse(body) as T;
+};
+
+const parseJsonRequestBodyOrRespond = async <T>(req: IncomingMessage, res: ServerResponse): Promise<T | undefined> => {
+  try {
+    return await parseJsonRequestBody<T>(req);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid JSON body" }));
+      return undefined;
+    }
+
+    throw error;
+  }
+};
 
 const getScheduleHostUrl = (path: string): string => {
   if (!ghostName) {
@@ -914,29 +384,6 @@ const requestHostMailbox = async (method: "GET" | "POST", path: string, body?: u
   }
 
   return JSON.parse(text) as unknown;
-};
-
-const parseJsonRequestBody = async <T>(req: IncomingMessage): Promise<T> => {
-  const body = await getRequestBody(req);
-  if (!body.trim()) {
-    return {} as T;
-  }
-
-  return JSON.parse(body) as T;
-};
-
-const parseJsonRequestBodyOrRespond = async <T>(req: IncomingMessage, res: ServerResponse): Promise<T | undefined> => {
-  try {
-    return await parseJsonRequestBody<T>(req);
-  } catch (error) {
-    if (error instanceof SyntaxError) {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Invalid JSON body" }));
-      return undefined;
-    }
-
-    throw error;
-  }
 };
 
 const formatScheduleSummary = (schedule: GhostSchedule): string => {
@@ -1024,6 +471,10 @@ const createHostSchedule = async (input: ScheduleCreateInput): Promise<GhostSche
 
 const deleteHostSchedule = async (id: string): Promise<unknown> =>
   requestHostSchedules("DELETE", `/schedules/${encodeURIComponent(id)}`);
+
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+  return typeof value === "object" && value !== null;
+};
 
 const isMailMessage = (value: unknown): value is MailMessage => {
   if (!isRecord(value)) {
@@ -1342,10 +793,6 @@ const getAssistantText = (content: unknown): string => {
     .join("");
 };
 
-const isRecord = (value: unknown): value is Record<string, unknown> => {
-  return typeof value === "object" && value !== null;
-};
-
 const summarizeValue = (value: unknown): string => {
   if (typeof value === "string") {
     return value;
@@ -1409,13 +856,13 @@ const extractImageBlocks = (content: unknown): GhostImage[] => {
   return content
     .filter((block) => typeof block === "object" && block !== null && (block as TextBlock).type === "image")
     .map((block) => {
-      const b = block as { mimeType?: string; data?: string; source?: { mediaType?: string; data?: string } };
+      const candidate = block as { mimeType?: string; data?: string; source?: { mediaType?: string; data?: string } };
       return {
-        mediaType: b.mimeType || b.source?.mediaType || "image/png",
-        data: b.data || b.source?.data || ""
+        mediaType: candidate.mimeType || candidate.source?.mediaType || "image/png",
+        data: candidate.data || candidate.source?.data || ""
       };
     })
-    .filter((img) => img.data.length > 0);
+    .filter((image) => image.data.length > 0);
 };
 
 const createHistoryMessage = (
@@ -1510,26 +957,6 @@ const getHistoryMessages = (messages: PiAgentMessage[]): HistoryMessage[] => {
 
     return [];
   });
-};
-
-const parseSlashCommandPrompt = (prompt: string): { command: string; args: string } | null => {
-  const trimmed = prompt.trim();
-  if (!trimmed.startsWith("/")) {
-    return null;
-  }
-
-  const firstSpaceIndex = trimmed.indexOf(" ");
-  const rawCommand = firstSpaceIndex === -1 ? trimmed.slice(1) : trimmed.slice(1, firstSpaceIndex);
-  const command = rawCommand.trim().toLowerCase();
-
-  if (!command) {
-    return null;
-  }
-
-  return {
-    command,
-    args: firstSpaceIndex === -1 ? "" : trimmed.slice(firstSpaceIndex + 1).trim()
-  };
 };
 
 const parseModelRef = (value: string): { provider: string; modelId: string } => {
@@ -1676,6 +1103,8 @@ const resourceLoader = new DefaultResourceLoader({
 });
 await resourceLoader.reload();
 
+let currentModelValue = startupModelValue ?? "default";
+
 const getConfiguredModel = () => {
   if (!currentModelValue || currentModelValue === "default") {
     return startupModel;
@@ -1699,7 +1128,6 @@ const createManagedSession = async (nextSessionManager: SessionManager): Promise
   return nextSession;
 };
 
-let currentModelValue = startupModelValue ?? "default";
 let session = await createManagedSession(sessionManager);
 
 log.info("Pi session ready", {
@@ -1773,6 +1201,27 @@ const parseRequestImages = (imagesValue: unknown): { images?: GhostImage[]; erro
   }
 
   return { images };
+};
+
+const startNdjsonResponse = (res: ServerResponse): void => {
+  res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+};
+
+const sendAssistantResult = (res: ServerResponse, text: string, options?: { end?: boolean }): void => {
+  sendJsonLine(res, {
+    type: "assistant",
+    text
+  });
+
+  sendJsonLine(res, {
+    type: "result",
+    text: "",
+    sessionId: session.sessionId
+  });
+
+  if (options?.end !== false) {
+    res.end();
+  }
 };
 
 const streamPrompt = async (
@@ -1858,12 +1307,12 @@ const streamPrompt = async (
         }
 
         if (isMessageEndEvent(event) && event.message?.role === "assistant") {
-          const msg = event.message as PiAgentMessage & { stopReason?: string; errorMessage?: string };
+          const message = event.message as PiAgentMessage & { stopReason?: string; errorMessage?: string };
           const fullText = currentAssistantText || getAssistantText(event.message.content);
 
-          if (msg.stopReason === "error" || msg.stopReason === "aborted") {
-            const errorText = msg.errorMessage || "Agent encountered an error.";
-            log.error("SDK assistant error", { stopReason: msg.stopReason, error: errorText });
+          if (message.stopReason === "error" || message.stopReason === "aborted") {
+            const errorText = message.errorMessage || "Agent encountered an error.";
+            log.error("SDK assistant error", { stopReason: message.stopReason, error: errorText });
             sendJsonLine(res, { type: "assistant", text: errorText });
             currentAssistantText = "";
             return;
@@ -1958,7 +1407,6 @@ const streamPrompt = async (
 
     await completion;
 
-    // Emit nudge event - registered handlers decide what to do
     nudges.emit("message-complete", "post-prompt").catch((error) => {
       log.error("Nudge emit failed", serializeError(error));
     });
@@ -1982,6 +1430,21 @@ const registerSlashCommand = (command: SlashCommand): void => {
   const key = command.name.startsWith("/") ? command.name.slice(1) : command.name;
   slashCommands.set(key, command);
 };
+
+const nudges = new NudgeRegistry(log, serializeError);
+const { flushMemories, runMemoryObserver } = createGhostMemory({
+  log,
+  serializeError,
+  getContentText,
+  getSession: () => session
+});
+
+registerDefaultNudgeHandlers(nudges, {
+  log,
+  serializeError,
+  flushMemories,
+  runMemoryObserver
+});
 
 registerSlashCommand({
   name: "/compact",
@@ -2153,8 +1616,8 @@ registerSlashCommand({
       await session.reload();
       await session.newSession();
       nudges.resetCounters();
-      nudges.emit("session-start", "slash-new").catch((e) => {
-        log.error("Session-start nudge failed", serializeError(e));
+      nudges.emit("session-start", "slash-new").catch((error) => {
+        log.error("Session-start nudge failed", serializeError(error));
       });
       log.info("Pi slash new complete", { sessionId: session.sessionId });
       sendAssistantResult(res, "New session started.");
@@ -2165,527 +1628,37 @@ registerSlashCommand({
   }
 });
 
-const streamSlashCommand = async (res: ServerResponse, command: SlashCommand, args: string): Promise<void> => {
-  startNdjsonResponse(res);
-
-  try {
-    await command.handler(res, args);
-  } catch (error) {
-    log.error("Slash command processing failed", {
-      command: command.name,
-      ...serializeError(error)
-    });
-    sendAssistantResult(res, "Ghost server failed while processing command.");
-  }
-};
-
-const handleSteer = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-  const body = await parseJsonRequestBodyOrRespond<unknown>(req, res);
-  if (body === undefined) {
-    return;
-  }
-
-  const requestBody = typeof body === "object" && body !== null ? (body as { prompt?: unknown; images?: unknown }) : {};
-
-  if (typeof requestBody.prompt !== "string") {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Missing prompt" }));
-    return;
-  }
-
-  const { images, error } = parseRequestImages(requestBody.images);
-
-  if (error) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error }));
-    return;
-  }
-
-  try {
-    await session.steer(requestBody.prompt, toPiPromptImages(images));
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        status: "queued",
-        pendingCount: session.pendingMessageCount
-      })
-    );
-  } catch (error) {
-    log.error("Pi steer failed", serializeError(error));
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: error instanceof Error ? error.message : "Steer failed" }));
-  }
-};
-
-const handleQueue = (res: ServerResponse): void => {
-  try {
-    const queueState = {
-      steering: session.getSteeringMessages(),
-      followUp: session.getFollowUpMessages(),
-      pendingCount: session.pendingMessageCount
-    } satisfies GhostQueueState;
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(queueState));
-  } catch (error) {
-    log.error("Pi queue failed", serializeError(error));
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: error instanceof Error ? error.message : "Queue failed" }));
-  }
-};
-
-const handleClearQueue = (res: ServerResponse): void => {
-  try {
-    const cleared = session.clearQueue();
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ cleared }));
-  } catch (error) {
-    log.error("Pi clear queue failed", serializeError(error));
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: error instanceof Error ? error.message : "Clear queue failed" }));
-  }
-};
-
-const handleMessage = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-  const body = await parseJsonRequestBodyOrRespond<unknown>(req, res);
-  if (body === undefined) {
-    return;
-  }
-
-  const requestBody =
-    typeof body === "object" && body !== null
-      ? (body as {
-          prompt?: unknown;
-          model?: unknown;
-          images?: unknown;
-          streamingBehavior?: unknown;
-        })
-      : {};
-
-  const prompt = requestBody.prompt;
-  const model = typeof requestBody.model === "string" ? requestBody.model : undefined;
-  const streamingBehaviorValue = requestBody.streamingBehavior;
-
-  if (typeof prompt !== "string") {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Missing prompt" }));
-    return;
-  }
-
-  if (streamingBehaviorValue !== undefined && !isStreamingBehavior(streamingBehaviorValue)) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Invalid streamingBehavior" }));
-    return;
-  }
-
-  const { images, error } = parseRequestImages(requestBody.images);
-
-  if (error) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error }));
-    return;
-  }
-
-  const slashCommand = parseSlashCommandPrompt(prompt);
-  if (slashCommand) {
-    const handler = slashCommands.get(slashCommand.command);
-    if (handler) {
-      await runQueued(() => streamSlashCommand(res, handler, slashCommand.args));
-      return;
-    }
-  }
-
-  if (streamingBehaviorValue) {
-    await streamPrompt(res, prompt, model, images, streamingBehaviorValue);
-    return;
-  }
-
-  await runQueued(() => streamPrompt(res, prompt, model, images));
-};
-
-const handleReload = async (res: ServerResponse): Promise<void> => {
-  try {
-    log.info("Pi reload start", { sessionId: session.sessionId });
-    await runQueued(() => session.reload());
-    log.info("Pi reload complete", { sessionId: session.sessionId });
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "reloaded" }));
-  } catch (error) {
-    log.error("Pi reload failed", serializeError(error));
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        error: error instanceof Error ? error.message : "Reload failed"
-      })
-    );
-  }
-};
-
-const toSessionTimestamp = (
-  value: string | Date | undefined,
-  fallbackPath: string,
-  kind: "created" | "modified"
-): string => {
-  if (value instanceof Date) {
-    return value.toISOString();
-  }
-
-  if (typeof value === "string") {
-    const parsed = new Date(value);
-    if (!Number.isNaN(parsed.getTime())) {
-      return parsed.toISOString();
-    }
-  }
-
-  const stats = statSync(fallbackPath);
-  return (kind === "created" ? stats.birthtime : stats.mtime).toISOString();
-};
-
-const toSessionInfo = (entry: {
-  name?: string | null;
-  path: string;
-  created?: string | Date;
-  modified?: string | Date;
-}): SessionInfo => ({
-  id: basename(entry.path, ".jsonl"),
-  name: entry.name ?? null,
-  path: entry.path,
-  createdAt: toSessionTimestamp(entry.created, entry.path, "created"),
-  lastActiveAt: toSessionTimestamp(entry.modified, entry.path, "modified")
+const handlers = createGhostHandlers({
+  log,
+  serializeError,
+  getRequestBody,
+  parseJsonRequestBody,
+  parseJsonRequestBodyOrRespond,
+  parseRequestImages,
+  isStreamingBehavior,
+  toPiPromptImages,
+  startNdjsonResponse,
+  sendAssistantResult,
+  streamPrompt,
+  runQueued,
+  slashCommands,
+  getHistoryMessages,
+  getSession: () => session,
+  setSession: (nextSession) => {
+    session = nextSession;
+  },
+  getSessionManager: () => sessionManager,
+  setSessionManager: (nextSessionManager) => {
+    sessionManager = nextSessionManager;
+  },
+  createManagedSession,
+  getCurrentModelValue: () => currentModelValue,
+  nudges,
+  nudgeEvents: NUDGE_EVENTS,
+  listScheduleOperation,
+  createScheduleOperation,
+  deleteScheduleOperation
 });
-
-const handleSessions = async (res: ServerResponse): Promise<void> => {
-  try {
-    const sessions = await SessionManager.list("/vault");
-    const names = loadSessionNames();
-    const currentId = basename(sessionManager.getSessionFile() ?? "", ".jsonl") || session.sessionId;
-    const response = {
-      current: currentId,
-      sessions: sessions.map((entry) => {
-        const info = toSessionInfo(entry);
-        const storedName = names[info.id];
-        if (storedName) info.name = storedName;
-        return info;
-      })
-    } satisfies SessionListResponse;
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(response));
-  } catch (error) {
-    log.error("Pi sessions failed", serializeError(error));
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        error: error instanceof Error ? error.message : "Sessions failed"
-      })
-    );
-  }
-};
-
-const handleSwitchSession = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-  const body = await parseJsonRequestBodyOrRespond<unknown>(req, res);
-  if (body === undefined) {
-    return;
-  }
-
-  const sessionId =
-    typeof body === "object" && body !== null && typeof (body as { sessionId?: unknown }).sessionId === "string"
-      ? (body as { sessionId: string }).sessionId.trim()
-      : "";
-
-  if (!sessionId) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Missing sessionId" }));
-    return;
-  }
-
-  try {
-    const sessions = await SessionManager.list("/vault");
-    const nextSessionInfo = sessions.find((entry) => basename(entry.path, ".jsonl") === sessionId);
-
-    if (!nextSessionInfo) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: `Session "${sessionId}" not found` }));
-      return;
-    }
-
-    await runQueued(async () => {
-      const nextSessionManager = SessionManager.open(nextSessionInfo.path);
-      const nextSession = await createManagedSession(nextSessionManager);
-      sessionManager = nextSessionManager;
-      session = nextSession;
-      nudges.resetCounters();
-    });
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "switched", sessionId: session.sessionId }));
-  } catch (error) {
-    log.error("Pi switch session failed", serializeError(error));
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        error: error instanceof Error ? error.message : "Switch session failed"
-      })
-    );
-  }
-};
-
-const SESSION_NAMES_PATH = "/root/.pi/agent/session-names.json";
-
-const loadSessionNames = (): Record<string, string> => {
-  try {
-    if (existsSync(SESSION_NAMES_PATH)) {
-      return JSON.parse(readFileSync(SESSION_NAMES_PATH, "utf-8")) as Record<string, string>;
-    }
-  } catch {}
-  return {};
-};
-
-const saveSessionNames = (names: Record<string, string>): void => {
-  writeFileSync(SESSION_NAMES_PATH, JSON.stringify(names, null, 2));
-};
-
-const handleRenameSession = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-  const body = await parseJsonRequestBodyOrRespond<unknown>(req, res);
-  if (body === undefined) {
-    return;
-  }
-
-  const sessionId =
-    typeof body === "object" && body !== null && typeof (body as Record<string, unknown>).sessionId === "string"
-      ? (body as Record<string, string>).sessionId.trim()
-      : "";
-  const name =
-    typeof body === "object" && body !== null && typeof (body as Record<string, unknown>).name === "string"
-      ? (body as Record<string, string>).name.trim()
-      : "";
-
-  if (!sessionId) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Missing sessionId" }));
-    return;
-  }
-
-  const names = loadSessionNames();
-  if (name) {
-    names[sessionId] = name;
-  } else {
-    delete names[sessionId];
-  }
-  saveSessionNames(names);
-
-  res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ status: "renamed", sessionId, name: name || null }));
-};
-
-const handleDeleteSession = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-  const sessionId = req.url?.replace("/sessions/", "").trim() ?? "";
-
-  if (!sessionId) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Missing sessionId" }));
-    return;
-  }
-
-  if (session.sessionId === sessionId || basename(sessionManager.getSessionFile() ?? "", ".jsonl") === sessionId) {
-    res.writeHead(409, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Cannot delete the active session" }));
-    return;
-  }
-
-  try {
-    const sessions = await SessionManager.list("/vault");
-    const target = sessions.find((entry) => basename(entry.path, ".jsonl") === sessionId);
-
-    if (!target) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: `Session "${sessionId}" not found` }));
-      return;
-    }
-
-    unlinkSync(target.path);
-
-    const names = loadSessionNames();
-    delete names[sessionId];
-    saveSessionNames(names);
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "deleted", sessionId }));
-  } catch (error) {
-    log.error("Pi delete session failed", serializeError(error));
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: error instanceof Error ? error.message : "Delete session failed" }));
-  }
-};
-
-const handleHistory = (res: ServerResponse): void => {
-  try {
-    const entries = (
-      sessionManager as SessionManager & {
-        getEntries: () => Array<{
-          type: string;
-          message?: PiAgentMessage;
-          timestamp?: string;
-          summary?: string;
-          tokensBefore?: number;
-        }>;
-      }
-    ).getEntries();
-
-    let lastCompactionIndex = -1;
-    const compactions: CompactionInfo[] = [];
-
-    for (let i = 0; i < entries.length; i++) {
-      const entry = entries[i];
-      if (entry.type === "compaction") {
-        lastCompactionIndex = i;
-        compactions.push({
-          timestamp: entry.timestamp ?? "",
-          summary: entry.summary ?? "",
-          tokensBefore: entry.tokensBefore ?? 0
-        });
-      }
-    }
-
-    const preCompactionPiMessages: PiAgentMessage[] = [];
-    const postCompactionPiMessages: PiAgentMessage[] = [];
-
-    for (let i = 0; i < entries.length; i++) {
-      const entry = entries[i];
-      if (entry.type !== "message") {
-        continue;
-      }
-
-      const message = entry.message;
-      if (!message) {
-        continue;
-      }
-
-      if (lastCompactionIndex >= 0 && i < lastCompactionIndex) {
-        preCompactionPiMessages.push(message);
-      } else {
-        postCompactionPiMessages.push(message);
-      }
-    }
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        messages: getHistoryMessages(postCompactionPiMessages),
-        preCompactionMessages: getHistoryMessages(preCompactionPiMessages),
-        compactions
-      })
-    );
-  } catch (error) {
-    log.error("Pi history failed", serializeError(error));
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        error: error instanceof Error ? error.message : "History failed"
-      })
-    );
-  }
-};
-
-const handleCompact = async (res: ServerResponse): Promise<void> => {
-  try {
-    log.info("Pi compact start", { sessionId: session.sessionId });
-    await runQueued(async () => {
-      await nudges.emit("pre-compact", "api");
-      await session.compact();
-      await session.reload();
-    });
-    log.info("Pi compact complete", { sessionId: session.sessionId });
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "compacted" }));
-  } catch (error) {
-    log.error("Pi compact failed", serializeError(error));
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        error: error instanceof Error ? error.message : "Compaction failed"
-      })
-    );
-  }
-};
-
-const handleStats = (res: ServerResponse): void => {
-  try {
-    const stats = session.getSessionStats();
-    const contextUsage = session.getContextUsage();
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        sessionId: session.sessionId,
-        model: currentModelValue,
-        tokens: stats.tokens,
-        cost: stats.cost,
-        messageCount: stats.totalMessages,
-        context: contextUsage
-          ? {
-              used: contextUsage.tokens,
-              window: contextUsage.contextWindow,
-              percent: contextUsage.percent
-            }
-          : null
-      })
-    );
-  } catch (error) {
-    log.error("Pi stats failed", serializeError(error));
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        error: error instanceof Error ? error.message : "Stats failed"
-      })
-    );
-  }
-};
-
-const handleSchedules = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-  try {
-    if (req.method === "GET") {
-      const result = await listScheduleOperation();
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(result.data));
-      return;
-    }
-
-    if (req.method === "POST") {
-      const body = await parseJsonRequestBody<unknown>(req);
-      const input = typeof body === "object" && body !== null ? (body as ScheduleCreateInput) : {};
-      const result = await createScheduleOperation(input, { validate: false });
-      res.writeHead(201, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(result.data));
-      return;
-    }
-
-    if (req.method === "DELETE") {
-      const scheduleId = req.url?.replace("/schedules/", "").trim() ?? "";
-      if (!scheduleId) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Missing schedule id" }));
-        return;
-      }
-
-      const result = await deleteScheduleOperation(scheduleId);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(result.data));
-      return;
-    }
-
-    res.writeHead(405, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Method not allowed" }));
-  } catch (error) {
-    log.error("Pi schedules failed", serializeError(error));
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        error: error instanceof Error ? error.message : "Schedules failed"
-      })
-    );
-  }
-};
 
 const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
   log.info("Request received", { method: req.method, url: req.url ?? "" });
@@ -2713,43 +1686,43 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
   }
 
   if (req.method === "POST" && req.url === "/message") {
-    await handleMessage(req, res);
+    await handlers.handleMessage(req, res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "POST" && req.url === "/steer") {
-    await handleSteer(req, res);
+    await handlers.handleSteer(req, res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "GET" && req.url === "/queue") {
-    handleQueue(res);
+    await handlers.handleQueue(res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "POST" && req.url === "/clear-queue") {
-    handleClearQueue(res);
+    await handlers.handleClearQueue(res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "GET" && req.url === "/history") {
-    handleHistory(res);
+    await handlers.handleHistory(res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "GET" && req.url === "/sessions") {
-    await handleSessions(res);
+    await handlers.handleSessions(res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "GET" && req.url === "/stats") {
-    handleStats(res);
+    await handlers.handleStats(res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
@@ -2759,160 +1732,73 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
     (req.method === "POST" && req.url === "/schedules") ||
     (req.method === "DELETE" && req.url?.startsWith("/schedules/"))
   ) {
-    await handleSchedules(req, res);
+    await handlers.handleSchedules(req, res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "GET" && req.url === "/commands") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify(
-        Array.from(slashCommands.values()).map(({ name, description }) => ({
-          name,
-          description
-        }))
-      )
-    );
+    await handlers.handleCommands(res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
-  // Nudge status - observability for the nudge system
   if (req.method === "GET" && req.url === "/nudge/status") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(nudges.status()));
-    log.info("Response sent", { method: req.method, url: req.url, status: 200 });
+    await handlers.handleNudgeStatus(res);
+    log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
-  // Nudge endpoint - external triggers for proactive agent behavior
   if (req.method === "POST" && req.url === "/nudge") {
-    try {
-      const body = await getRequestBody(req);
-      const parsed = JSON.parse(body) as { event?: string; reason?: string };
-      const event = (parsed.event ?? "self") as NudgeEvent;
-      const reason = parsed.reason ?? "api-trigger";
-
-      // Validate event type (derived from NUDGE_EVENTS const)
-      if (!(NUDGE_EVENTS as readonly string[]).includes(event)) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Invalid event: ${event}`, valid: NUDGE_EVENTS }));
-        log.info("Response sent", { method: req.method, url: req.url, status: 400 });
-        return;
-      }
-
-      await nudges.emit(event, reason);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, event, reason }));
-      log.info("Response sent", { method: req.method, url: req.url, status: 200 });
-    } catch (error) {
-      log.error("Nudge endpoint failed", serializeError(error));
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Nudge failed" }));
-      log.info("Response sent", { method: req.method, url: req.url, status: 500 });
-    }
+    await handlers.handleNudge(req, res);
+    log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "POST" && req.url === "/reload") {
-    await handleReload(res);
+    await handlers.handleReload(res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "POST" && req.url === "/compact") {
-    await handleCompact(res);
+    await handlers.handleCompact(res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "POST" && req.url === "/abort") {
-    try {
-      log.info("Pi abort start", { sessionId: session.sessionId });
-      await session.abort();
-      log.info("Pi abort complete", { sessionId: session.sessionId });
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "aborted" }));
-    } catch (error) {
-      log.error("Pi abort failed", serializeError(error));
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: error instanceof Error ? error.message : "Abort failed" }));
-    }
+    await handlers.handleAbort(res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "POST" && req.url?.startsWith("/tasks/")) {
-    const pathname = new URL(req.url, "http://localhost").pathname;
-    const taskKillMatch = pathname.match(/^\/tasks\/([^/]+)\/kill$/);
-
-    if (taskKillMatch) {
-      const taskId = decodeURIComponent(taskKillMatch[1]);
-      const killBackgroundTask = (globalThis as any).__ghostbox_kill_bg_task as
-        | ((taskId: string) => { killed: boolean; taskId: string })
-        | undefined;
-
-      if (!killBackgroundTask) {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Background task extension not loaded" }));
-        log.info("Response sent", { method: req.method, url: req.url, status: 404 });
-        return;
-      }
-
-      const result = killBackgroundTask(taskId);
-      if (!result.killed) {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Background task "${taskId}" not found` }));
-        log.info("Response sent", { method: req.method, url: req.url, status: 404 });
-        return;
-      }
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "killed", taskId }));
-      log.info("Response sent", { method: req.method, url: req.url, status: 200 });
-      return;
-    }
+    await handlers.handleTaskKill(req, res);
+    log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
+    return;
   }
 
   if (req.method === "POST" && req.url === "/new") {
-    try {
-      log.info("Pi new session start", { sessionId: session.sessionId });
-      await runQueued(async () => {
-        await nudges.emit("pre-new-session", "api");
-        await session.reload();
-        await session.newSession();
-        nudges.resetCounters();
-      });
-      nudges.emit("session-start", "api-new").catch((e) => {
-        log.error("Session-start nudge failed", serializeError(e));
-      });
-      log.info("Pi new session complete", { sessionId: session.sessionId });
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "new_session", sessionId: session.sessionId }));
-    } catch (error) {
-      log.error("Pi new session failed", serializeError(error));
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: error instanceof Error ? error.message : "New session failed" }));
-    }
+    await handlers.handleNewSession(res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "POST" && req.url === "/sessions/switch") {
-    await handleSwitchSession(req, res);
+    await handlers.handleSwitchSession(req, res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "POST" && req.url === "/sessions/rename") {
-    await handleRenameSession(req, res);
+    await handlers.handleRenameSession(req, res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
 
   if (req.method === "DELETE" && req.url?.startsWith("/sessions/")) {
-    await handleDeleteSession(req, res);
+    await handlers.handleDeleteSession(req, res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
@@ -2921,33 +1807,6 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
   res.end(JSON.stringify({ error: "Not found" }));
   log.info("Response sent", { method: req.method, url: req.url, status: 404 });
 };
-
-// ---------------------------------------------------------------------------
-// Register nudge handlers
-// ---------------------------------------------------------------------------
-
-// Pre-compaction memory flush: gives the live agent one last turn before context loss
-nudges.register({
-  id: "memory-observer",
-  event: ["pre-compact", "pre-new-session"],
-  handler: async (event, context) => {
-    await flushMemories(`nudge:${event}:${context.reason}`);
-  },
-  background: true
-});
-
-// Optional fallback: explicit self/timer nudges can still invoke the observer model
-nudges.register({
-  id: "memory-observer-fallback",
-  event: ["self", "timer"],
-  handler: async (event, context) => {
-    if (!context.reason.includes("memory")) {
-      return;
-    }
-    await runMemoryObserver(`nudge:${event}:${context.reason}`);
-  },
-  background: true
-});
 
 const server = http.createServer((req, res) => {
   handleRequest(req, res).catch((error) => {

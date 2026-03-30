@@ -1,7 +1,8 @@
+import Observation
 import SwiftUI
 
 struct ChatHeaderView: View {
-    @ObservedObject var viewModel: AgentChatViewModel
+    let viewModel: AgentChatViewModel
     @Binding var showsVaultBrowser: Bool
     let statusColor: Color
     let toggleVaultBrowser: () -> Void
@@ -9,6 +10,8 @@ struct ChatHeaderView: View {
     let closeCurrentPanel: () -> Void
 
     var body: some View {
+        let store = viewModel.store
+
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 10) {
                 Circle()
@@ -26,17 +29,17 @@ struct ChatHeaderView: View {
                     .foregroundColor(Theme.Colors.accentLight)
 
                 ModelSwitcherMenu(
-                    currentModel: viewModel.ghost?.model ?? "Loading...",
-                    currentProvider: viewModel.ghost?.provider ?? "anthropic",
+                    currentModel: store.ghost?.model ?? "Loading...",
+                    currentProvider: store.ghost?.provider ?? "anthropic",
                     onSelect: { model in
                         viewModel.switchModel(to: model)
                     }
                 )
 
                 SessionSwitcherRow(
-                    sessions: viewModel.sessions,
-                    currentSession: viewModel.currentSession,
-                    isDisabled: viewModel.isStreaming || viewModel.isLoadingHistory || viewModel.isWakingGhost || viewModel.isCompacting || viewModel.isCreatingSession,
+                    sessions: store.sessions,
+                    currentSession: store.currentSession,
+                    isDisabled: viewModel.isStreaming || store.isLoadingHistory || viewModel.isWakingGhost || store.isCompacting || store.isCreatingSession,
                     onSelect: { sessionId in
                         viewModel.switchSession(sessionId: sessionId)
                     },
@@ -70,30 +73,15 @@ struct ChatHeaderView: View {
                 )
                 .fixedSize()
 
-                Button(action: toggleFullscreen) {
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: Theme.FontSize.xs, weight: .semibold))
-                        .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
-                        .frame(width: 24, height: 24)
-                        .background(Color.white.opacity(0.05))
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
+                CircularIconButton(
+                    systemImage: "arrow.up.left.and.arrow.down.right",
+                    action: toggleFullscreen
+                )
 
-                Button {
-                    closeCurrentPanel()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: Theme.FontSize.xs, weight: .semibold))
-                        .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
-                        .frame(width: 24, height: 24)
-                        .background(Color.white.opacity(0.05))
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
+                CircularIconButton(systemImage: "xmark", action: closeCurrentPanel)
             }
 
-            if viewModel.isCreatingSession {
+            if store.isCreatingSession {
                 Text("Starting new session...")
                     .font(Theme.Typography.label(weight: .regular))
                     .foregroundColor(Theme.Colors.accentLight)
@@ -101,7 +89,7 @@ struct ChatHeaderView: View {
                 Text("Waking ghost...")
                     .font(Theme.Typography.label(weight: .regular))
                     .foregroundColor(Theme.Colors.accentLight)
-            } else if viewModel.isLoadingHistory {
+            } else if store.isLoadingHistory {
                 Text("Loading chat history...")
                     .font(Theme.Typography.label(weight: .regular))
                     .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
@@ -177,29 +165,17 @@ private struct SessionSwitcherRow: View {
                         .font(.system(size: 8, weight: .semibold))
                         .foregroundColor(Color.white.opacity(Theme.Text.quaternary))
                 }
-                .foregroundColor(Theme.Colors.accentLightest)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background(Color.white.opacity(0.05))
-                .overlay(
-                    Capsule()
-                        .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
-                )
-                .clipShape(Capsule())
+                .capsuleControlStyle()
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
             .disabled(isDisabled || sessions?.sessions.isEmpty != false)
 
-            Button(action: onCreate) {
-                Image(systemName: "plus")
-                    .font(.system(size: Theme.FontSize.xs, weight: .semibold))
-                    .foregroundColor(Theme.Colors.accentLightest)
-                    .frame(width: 24, height: 24)
-                    .background(Color.white.opacity(0.05))
-                    .clipShape(Circle())
-            }
-            .buttonStyle(.plain)
+            CircularIconButton(
+                systemImage: "plus",
+                action: onCreate,
+                foregroundColor: Theme.Colors.accentLightest
+            )
             .disabled(isDisabled)
         }
         .sheet(item: $renamingSession) { session in
@@ -323,15 +299,7 @@ struct ModelSwitcherMenu: View {
                     .font(.system(size: 8, weight: .semibold))
                     .foregroundColor(Color.white.opacity(Theme.Text.quaternary))
             }
-            .foregroundColor(Theme.Colors.accentLightest)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(Color.white.opacity(0.05))
-            .overlay(
-                Capsule()
-                    .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
-            )
-            .clipShape(Capsule())
+            .capsuleControlStyle()
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
@@ -430,15 +398,7 @@ struct ChatHeaderButton: View {
                 Text(title)
                     .font(Theme.Typography.label())
             }
-            .foregroundColor(Theme.Colors.accentLightest)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(Color.white.opacity(0.05))
-            .overlay(
-                Capsule()
-                    .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
-            )
-            .clipShape(Capsule())
+            .capsuleControlStyle()
         }
         .buttonStyle(.plain)
     }

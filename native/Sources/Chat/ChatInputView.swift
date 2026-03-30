@@ -29,47 +29,28 @@ struct ChatInputView: View {
     var body: some View {
         VStack(spacing: 8) {
             if isHistoryModeActive {
-                HStack(spacing: 8) {
+                StatusBanner(
+                    text: "History mode - up/down select, return rewinds, esc exits"
+                ) {
                     Image(systemName: "arrow.up.arrow.down")
                         .font(.system(size: Theme.FontSize.xs, weight: .semibold))
-
-                    Text("History mode - up/down select, return rewinds, esc exits")
-                        .font(Theme.Typography.caption(weight: .medium))
-
-                    Spacer(minLength: 0)
                 }
-                .foregroundColor(Theme.Colors.accentLightest)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(Theme.Colors.accent.opacity(0.2))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(Theme.Colors.accentLight.opacity(0.35), lineWidth: 0.8)
-                }
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .padding(.horizontal, 18)
             }
 
             if isCompacting {
-                HStack(spacing: 10) {
+                StatusBanner(
+                    text: "Compacting conversation...",
+                    spacing: 10,
+                    verticalPadding: 8,
+                    backgroundColor: Theme.Colors.accent.opacity(0.16),
+                    borderColor: Theme.Colors.accentLight.opacity(0.22),
+                    lineWidth: 0.6
+                ) {
                     ProgressView()
                         .controlSize(.small)
                         .tint(Theme.Colors.accentLight)
-
-                    Text("Compacting conversation...")
-                        .font(Theme.Typography.caption(weight: .medium))
-
-                    Spacer(minLength: 0)
                 }
-                .foregroundColor(Theme.Colors.accentLightest)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(Theme.Colors.accent.opacity(0.16))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(Theme.Colors.accentLight.opacity(0.22), lineWidth: 0.6)
-                }
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .padding(.horizontal, 18)
             }
 
@@ -77,8 +58,8 @@ struct ChatInputView: View {
                 text: $inputText,
                 height: $inputHeight,
                 placeholder: inputPlaceholder,
-                font: NSFont.systemFont(ofSize: Theme.FontSize.lg),
-                textColor: NSColor.white.withAlphaComponent(CGFloat(Theme.Text.primary)),
+                font: Theme.Typography.editor(Theme.FontSize.lg),
+                textColor: Theme.Colors.primaryTextNS,
                 isDisabled: isInputDisabled,
                 minHeight: ChatInputLayout.minHeight,
                 maxHeight: ChatInputLayout.maxHeight,
@@ -92,7 +73,7 @@ struct ChatInputView: View {
             .padding(.horizontal, 18)
             .padding(.vertical, 14)
             .background(Color.white.opacity(0.02))
-            .clipShape(RoundedRectangle(cornerRadius: 18))
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Layout.inputCornerRadius))
             .padding(.horizontal, 18)
 
             HStack(spacing: 0) {
@@ -193,7 +174,7 @@ struct ChatInputView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text("Background Tasks")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(Theme.Typography.caption(weight: .semibold))
                     .foregroundColor(.white.opacity(0.9))
                 Spacer()
                 Text("\(backgroundTasks.count)")
@@ -213,7 +194,7 @@ struct ChatInputView: View {
                         .tint(Theme.Colors.accentLight)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(task.label)
-                            .font(.system(size: 11, weight: .medium))
+                            .font(Theme.Typography.caption(11, weight: .medium))
                             .foregroundColor(.white.opacity(0.85))
                             .lineLimit(1)
                         Text(String(task.id.prefix(20)))

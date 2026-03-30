@@ -171,40 +171,27 @@ struct HubView: View {
             Spacer(minLength: 0)
 
             HStack(spacing: 8) {
-                Button(action: toggleSettings) {
-                    Image(systemName: showsSettings ? "gearshape.fill" : "gearshape")
-                        .font(.system(size: Theme.FontSize.sm, weight: .semibold))
-                        .foregroundColor(showsSettings ? Theme.Colors.accentLightest : Color.white.opacity(0.72))
-                        .frame(width: 30, height: 30)
-                        .background(showsSettings ? Theme.Colors.accent.opacity(0.22) : Color.white.opacity(0.05))
-                        .overlay(
-                            Circle()
-                                .strokeBorder(
-                                    showsSettings
-                                        ? Theme.Colors.accentLight.opacity(0.28)
-                                        : Color.white.opacity(0.06),
-                                    lineWidth: 0.6
-                                )
-                        )
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
+                CircularIconButton(
+                    systemImage: showsSettings ? "gearshape.fill" : "gearshape",
+                    action: toggleSettings,
+                    size: 30,
+                    iconSize: Theme.FontSize.sm,
+                    foregroundColor: showsSettings ? Theme.Colors.accentLightest : Color.white.opacity(0.72),
+                    backgroundColor: showsSettings ? Theme.Colors.accent.opacity(0.22) : Theme.Colors.controlBackground,
+                    borderColor: showsSettings ? Theme.Colors.accentLight.opacity(0.28) : Color.white.opacity(0.06)
+                )
 
-                Button {
-                    NSApp.keyWindow?.orderOut(nil)
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(Color.white.opacity(0.4))
-                        .frame(width: 30, height: 30)
-                        .background(Color.white.opacity(0.05))
-                        .overlay(
-                            Circle()
-                                .strokeBorder(Color.white.opacity(0.06), lineWidth: 0.6)
-                        )
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
+                CircularIconButton(
+                    systemImage: "xmark",
+                    action: {
+                        NSApp.keyWindow?.orderOut(nil)
+                    },
+                    size: 30,
+                    iconSize: 10,
+                    foregroundColor: Color.white.opacity(0.4),
+                    backgroundColor: Theme.Colors.controlBackground,
+                    borderColor: Color.white.opacity(0.06)
+                )
             }
         }
         .padding(.horizontal, 20)
@@ -230,10 +217,10 @@ struct HubView: View {
                     .padding(.vertical, 13)
                     .background(Theme.Colors.accent.opacity(0.35))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 18)
+                        RoundedRectangle(cornerRadius: Theme.Layout.inputCornerRadius)
                             .strokeBorder(Theme.Colors.accentLight.opacity(0.3), lineWidth: 0.5)
                     )
-                    .clipShape(RoundedRectangle(cornerRadius: 18))
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.Layout.inputCornerRadius))
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 20)
@@ -278,7 +265,7 @@ struct HubView: View {
             .padding(.vertical, 12)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.orange.opacity(0.08))
-            .clipShape(RoundedRectangle(cornerRadius: 18))
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Layout.inputCornerRadius))
     }
 
     private func toggleSettings() {

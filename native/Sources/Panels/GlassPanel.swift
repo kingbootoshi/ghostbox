@@ -163,14 +163,6 @@ class GlassPanel: NSPanel {
         alphaValue = 1
     }
 
-    func fadeOut(completion: (() -> Void)? = nil) {
-        snapOut(completion: completion)
-    }
-
-    // Keep for compatibility but use snapIn/snapOut for toggle
-    func slideIn() { slideFromCenter() }
-    func slideOut(completion: (() -> Void)? = nil) { snapOut(completion: completion) }
-
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
@@ -214,7 +206,7 @@ struct BorderlessGlass<Content: View>: View {
     var body: some View {
         ZStack {
             // Dark tint over the real blur
-            Color(red: 0.04, green: 0.04, blue: 0.06).opacity(0.55)
+            Theme.Colors.glassTint.opacity(0.55)
 
             // Purple accent gradient
             LinearGradient(

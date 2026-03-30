@@ -1,12 +1,25 @@
-import { spawn as nodeSpawn } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
+import {
+  type ApiAuthContext,
+  authenticateApiToken,
+  deleteMail,
+  ensureApiAdminToken,
+  getPublicConfig,
+  type LegacyConfig,
+  listMail,
+  markMailRead,
+  normalizeGhostImages,
+  normalizeStreamingBehavior,
+  resolveAllowedCorsOrigins,
+  sendMail,
+  updateStoredConfig
+} from "./auth-config";
 import { createLogger } from "./logger";
 import { getAuthStatus } from "./oauth";
 import {
@@ -33,7 +46,6 @@ import {
   removeGhost,
   renameGhostSession,
   revokeApiKey,
-  saveState,
   sendMessage,
   spawnGhost,
   steerGhost,
@@ -41,30 +53,14 @@ import {
   updateGhost,
   wakeGhost
 } from "./orchestrator";
-import type {
-  GhostboxConfig,
-  GhostboxConfigResponse,
-  GhostboxConfigSensitiveStatus,
-  GhostboxConfigUpdate,
-  GhostboxState,
-  GhostImage,
-  GhostSchedule,
-  GhostStreamingBehavior,
-  MailboxState,
-  MailMessage,
-  VaultEntry
-} from "./types";
-import { getHomeDirectory, isNodeError } from "./utils";
-import { commitVault, getVaultPath } from "./vault";
+import { scheduleManager } from "./schedule-manager";
+import type { GhostboxConfig, GhostboxConfigUpdate } from "./types";
+import { commitVault } from "./vault";
+import { deleteVaultFile, listVaultDirectory, readVaultFile, writeVaultFile } from "./vault-routes";
 
 const DEFAULT_PORT = 8008;
 const port = Number(process.env.GHOSTBOX_PORT) || DEFAULT_PORT;
 const log = createLogger("api");
-
-type ApiAuthContext = {
-  authenticatedBy: string;
-  ghostName: string | null;
-};
 
 const app = new Hono<{
   Variables: {
@@ -147,569 +143,6 @@ type ScheduleCreateBody = {
 
 type ConfigUpdateBody = GhostboxConfigUpdate & Record<string, unknown>;
 
-type LegacyConfig = GhostboxConfig & {
-  defaultProvider?: string | null;
-};
-
-type CronFieldName = "minute" | "hour" | "dayOfMonth" | "month" | "dayOfWeek";
-
-type ParsedCronField = {
-  values: Set<number>;
-  wildcard: boolean;
-};
-
-type ParsedCron = Record<CronFieldName, ParsedCronField>;
-
-const CRON_WEEKDAY_MAP: Record<string, number> = {
-  Sun: 0,
-  Mon: 1,
-  Tue: 2,
-  Wed: 3,
-  Thu: 4,
-  Fri: 5,
-  Sat: 6
-};
-
-const CRON_FIELD_RANGES: Array<{ name: CronFieldName; min: number; max: number }> = [
-  { name: "minute", min: 0, max: 59 },
-  { name: "hour", min: 0, max: 23 },
-  { name: "dayOfMonth", min: 1, max: 31 },
-  { name: "month", min: 1, max: 12 },
-  { name: "dayOfWeek", min: 0, max: 7 }
-];
-
-const SYSTEM_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-const MAX_CRON_SEARCH_MINUTES = 366 * 24 * 60;
-const MAIL_RATE_LIMIT_WINDOW_MS = 60_000;
-const MAIL_RATE_LIMIT_MAX_MESSAGES = 10;
-const MAIL_SUBJECT_MAX_LENGTH = 200;
-const MAIL_BODY_MAX_LENGTH = 10_000;
-const MAILBOX_MAX_MESSAGES_PER_RECIPIENT = 500;
-const DEFAULT_CORS_ORIGINS = ["http://localhost:8008", "http://localhost:3000"];
-const mailRateLimitState = new Map<string, { count: number; windowStart: number }>();
-
-const getSchedulePath = (): string => resolve(getHomeDirectory(), ".ghostbox", "schedules.json");
-const getMailboxPath = (): string => join(getHomeDirectory(), ".ghostbox", "mailbox.json");
-const getLegacyApiUserToken = (): string | null => {
-  const configured = process.env.GHOSTBOX_MAIL_USER_TOKEN?.trim() || process.env.GHOSTBOX_ADMIN_TOKEN?.trim() || "";
-  return configured || null;
-};
-
-const normalizeConfiguredOrigins = (origins: unknown): string[] => {
-  if (!Array.isArray(origins)) {
-    return [];
-  }
-
-  return Array.from(
-    new Set(
-      origins
-        .filter((origin): origin is string => typeof origin === "string")
-        .map((origin) => origin.trim())
-        .filter((origin) => origin.length > 0)
-    )
-  );
-};
-
-const parseCorsOriginsEnv = (): string[] => {
-  const configured = process.env.GHOSTBOX_CORS_ORIGINS?.trim() || "";
-  if (!configured) {
-    return [];
-  }
-
-  return Array.from(
-    new Set(
-      configured
-        .split(",")
-        .map((origin) => origin.trim())
-        .filter((origin) => origin.length > 0)
-    )
-  );
-};
-
-const resolveAllowedCorsOrigins = (config: GhostboxConfig): string[] => {
-  const configuredOrigins = normalizeConfiguredOrigins(config.corsOrigins);
-  const baseOrigins = configuredOrigins.length > 0 ? configuredOrigins : DEFAULT_CORS_ORIGINS;
-
-  return Array.from(new Set([...baseOrigins, ...parseCorsOriginsEnv()]));
-};
-
-const resolveConfigAdminToken = (config: GhostboxConfig): string | null => {
-  const token = config.adminToken?.trim() || "";
-  return token || null;
-};
-
-export const ensureApiAdminToken = async (): Promise<string> => {
-  const state = await loadState();
-  const existingToken = resolveConfigAdminToken(state.config);
-
-  if (existingToken) {
-    if (state.config.adminToken !== existingToken) {
-      state.config.adminToken = existingToken;
-      await saveState(state);
-    }
-
-    return existingToken;
-  }
-
-  const adminToken = randomBytes(32).toString("hex");
-  state.config.adminToken = adminToken;
-  await saveState(state);
-  log.info({ adminToken }, "Generated API admin token");
-  return adminToken;
-};
-
-const normalizeScheduleTimezone = (value: unknown): string => {
-  if (value === undefined) {
-    return SYSTEM_TIMEZONE;
-  }
-
-  if (typeof value !== "string") {
-    throw new ApiError(400, "Invalid timezone");
-  }
-
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return SYSTEM_TIMEZONE;
-  }
-
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: trimmed }).format(new Date());
-    return trimmed;
-  } catch {
-    throw new ApiError(400, "Invalid timezone");
-  }
-};
-
-const normalizeSchedulePrompt = (value: unknown): string => {
-  if (typeof value !== "string") {
-    throw new ApiError(400, "Missing prompt");
-  }
-
-  const trimmed = value.trim();
-  if (!trimmed) {
-    throw new ApiError(400, "Missing prompt");
-  }
-
-  return trimmed;
-};
-
-const normalizeScheduleCron = (value: unknown): string => {
-  if (typeof value !== "string") {
-    throw new ApiError(400, "Missing cron");
-  }
-
-  const trimmed = value.trim();
-  if (!trimmed) {
-    throw new ApiError(400, "Missing cron");
-  }
-
-  return trimmed;
-};
-
-const normalizeScheduleOnce = (value: unknown): boolean => {
-  if (value === undefined) {
-    return false;
-  }
-
-  if (typeof value !== "boolean") {
-    throw new ApiError(400, "Invalid once");
-  }
-
-  return value;
-};
-
-const parseCronNumber = (token: string, min: number, max: number, fieldName: CronFieldName): number => {
-  const value = Number(token);
-  if (!Number.isInteger(value)) {
-    throw new ApiError(400, `Invalid cron field: ${fieldName}`);
-  }
-
-  if (fieldName === "dayOfWeek" && value === 7) {
-    return 0;
-  }
-
-  if (value < min || value > max) {
-    throw new ApiError(400, `Invalid cron field: ${fieldName}`);
-  }
-
-  return value;
-};
-
-const expandCronSegment = (token: string, min: number, max: number, fieldName: CronFieldName): number[] => {
-  const [rangePart, stepPart] = token.split("/");
-  const step = stepPart === undefined ? 1 : Number(stepPart);
-
-  if (!Number.isInteger(step) || step <= 0) {
-    throw new ApiError(400, `Invalid cron field: ${fieldName}`);
-  }
-
-  let start = min;
-  let end = max;
-
-  if (rangePart !== "*") {
-    if (rangePart.includes("-")) {
-      const [startToken, endToken] = rangePart.split("-");
-      if (!startToken || !endToken) {
-        throw new ApiError(400, `Invalid cron field: ${fieldName}`);
-      }
-
-      start = parseCronNumber(startToken, min, max, fieldName);
-      end = parseCronNumber(endToken, min, max, fieldName);
-
-      if (start > end) {
-        throw new ApiError(400, `Invalid cron field: ${fieldName}`);
-      }
-    } else {
-      start = parseCronNumber(rangePart, min, max, fieldName);
-      end = start;
-    }
-  }
-
-  const values: number[] = [];
-  for (let value = start; value <= end; value += step) {
-    values.push(fieldName === "dayOfWeek" && value === 7 ? 0 : value);
-  }
-  return values;
-};
-
-const parseCronField = (rawField: string, fieldName: CronFieldName, min: number, max: number): ParsedCronField => {
-  const field = rawField.trim();
-  if (!field) {
-    throw new ApiError(400, `Invalid cron field: ${fieldName}`);
-  }
-
-  const wildcard = field === "*";
-  const values = new Set<number>();
-
-  for (const segment of field.split(",")) {
-    const trimmedSegment = segment.trim();
-    if (!trimmedSegment) {
-      throw new ApiError(400, `Invalid cron field: ${fieldName}`);
-    }
-
-    for (const value of expandCronSegment(trimmedSegment, min, max, fieldName)) {
-      values.add(value);
-    }
-  }
-
-  return { values, wildcard };
-};
-
-const parseCronExpression = (expression: string): ParsedCron => {
-  const fields = expression.trim().split(/\s+/);
-  if (fields.length !== 5) {
-    throw new ApiError(400, "Invalid cron");
-  }
-
-  return Object.fromEntries(
-    CRON_FIELD_RANGES.map(({ name, min, max }, index) => [
-      name,
-      parseCronField(fields[index] as string, name, min, max)
-    ])
-  ) as ParsedCron;
-};
-
-const getZonedDateParts = (
-  date: Date,
-  timeZone: string
-): { minute: number; hour: number; dayOfMonth: number; month: number; dayOfWeek: number } => {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    weekday: "short",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23"
-  }).formatToParts(date);
-
-  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  const weekday = CRON_WEEKDAY_MAP[values.weekday ?? ""];
-
-  if (weekday === undefined) {
-    throw new ApiError(400, "Invalid timezone");
-  }
-
-  return {
-    minute: Number(values.minute),
-    hour: Number(values.hour),
-    dayOfMonth: Number(values.day),
-    month: Number(values.month),
-    dayOfWeek: weekday
-  };
-};
-
-const cronMatchesDate = (parsedCron: ParsedCron, date: Date, timeZone: string): boolean => {
-  const zoned = getZonedDateParts(date, timeZone);
-
-  if (!parsedCron.minute.values.has(zoned.minute)) return false;
-  if (!parsedCron.hour.values.has(zoned.hour)) return false;
-  if (!parsedCron.month.values.has(zoned.month)) return false;
-
-  const dayOfMonthMatches = parsedCron.dayOfMonth.values.has(zoned.dayOfMonth);
-  const dayOfWeekMatches = parsedCron.dayOfWeek.values.has(zoned.dayOfWeek);
-
-  if (parsedCron.dayOfMonth.wildcard && parsedCron.dayOfWeek.wildcard) {
-    return true;
-  }
-
-  if (parsedCron.dayOfMonth.wildcard) {
-    return dayOfWeekMatches;
-  }
-
-  if (parsedCron.dayOfWeek.wildcard) {
-    return dayOfMonthMatches;
-  }
-
-  return dayOfMonthMatches || dayOfWeekMatches;
-};
-
-const getNextCronFire = (expression: string, timeZone: string, afterTimestamp: number): string => {
-  const parsedCron = parseCronExpression(expression);
-  const nextMinute = Math.floor(afterTimestamp / 60_000) * 60_000 + 60_000;
-
-  for (let offset = 0; offset < MAX_CRON_SEARCH_MINUTES; offset++) {
-    const candidate = new Date(nextMinute + offset * 60_000);
-    if (cronMatchesDate(parsedCron, candidate, timeZone)) {
-      return candidate.toISOString();
-    }
-  }
-
-  throw new ApiError(400, "Cron does not produce a future run time");
-};
-
-type ScheduleDispatcher = (schedule: GhostSchedule) => Promise<void>;
-
-export class ScheduleManager {
-  private intervalId?: ReturnType<typeof setInterval>;
-  private processing = false;
-  private readonly dispatchSchedule: ScheduleDispatcher;
-
-  constructor(dispatchSchedule: ScheduleDispatcher) {
-    this.dispatchSchedule = dispatchSchedule;
-  }
-
-  private async loadSchedules(): Promise<GhostSchedule[]> {
-    try {
-      const contents = await readFile(getSchedulePath(), "utf8");
-      const parsed = JSON.parse(contents) as unknown;
-      if (!Array.isArray(parsed)) {
-        throw new Error("Schedules file must contain an array");
-      }
-      return parsed as GhostSchedule[];
-    } catch (error) {
-      if (isNodeError(error) && error.code === "ENOENT") {
-        return [];
-      }
-      throw error;
-    }
-  }
-
-  private async saveSchedules(schedules: GhostSchedule[]): Promise<void> {
-    await mkdir(dirname(getSchedulePath()), { recursive: true });
-    await writeFile(getSchedulePath(), JSON.stringify(schedules, null, 2), "utf8");
-  }
-
-  async list(ghostName: string): Promise<GhostSchedule[]> {
-    const schedules = await this.loadSchedules();
-    return schedules.filter((schedule) => schedule.ghostName === ghostName);
-  }
-
-  async create(
-    ghostName: string,
-    input: { cron?: unknown; prompt?: unknown; timezone?: unknown; once?: unknown }
-  ): Promise<GhostSchedule> {
-    await getGhost(ghostName);
-
-    const cron = normalizeScheduleCron(input.cron);
-    const prompt = normalizeSchedulePrompt(input.prompt);
-    const timezone = normalizeScheduleTimezone(input.timezone);
-    const once = normalizeScheduleOnce(input.once);
-    const now = Date.now();
-
-    const schedule: GhostSchedule = {
-      id: randomUUID(),
-      ghostName,
-      cron,
-      prompt,
-      timezone,
-      once,
-      enabled: true,
-      createdAt: new Date(now).toISOString(),
-      lastFired: null,
-      nextFire: getNextCronFire(cron, timezone, now)
-    };
-
-    const schedules = await this.loadSchedules();
-    schedules.push(schedule);
-    await this.saveSchedules(schedules);
-    return schedule;
-  }
-
-  async delete(ghostName: string, id: string): Promise<void> {
-    const schedules = await this.loadSchedules();
-    const nextSchedules = schedules.filter((schedule) => !(schedule.ghostName === ghostName && schedule.id === id));
-
-    if (nextSchedules.length === schedules.length) {
-      throw new ApiError(404, `Schedule "${id}" not found.`);
-    }
-
-    await this.saveSchedules(nextSchedules);
-  }
-
-  start(): void {
-    if (this.intervalId) {
-      return;
-    }
-
-    void this.processDueSchedules();
-    this.intervalId = setInterval(() => {
-      void this.processDueSchedules();
-    }, 30_000);
-    this.intervalId.unref?.();
-  }
-
-  stop(): void {
-    if (!this.intervalId) {
-      return;
-    }
-
-    clearInterval(this.intervalId);
-    this.intervalId = undefined;
-  }
-
-  async processDueSchedules(referenceTime = Date.now()): Promise<void> {
-    if (this.processing) {
-      return;
-    }
-
-    this.processing = true;
-
-    try {
-      const schedules = await this.loadSchedules();
-      const dueSchedules = schedules.filter(
-        (schedule) =>
-          schedule.enabled && typeof schedule.nextFire === "string" && Date.parse(schedule.nextFire) <= referenceTime
-      );
-
-      if (dueSchedules.length === 0) {
-        return;
-      }
-
-      for (const schedule of dueSchedules) {
-        try {
-          log.info({ id: schedule.id, ghostName: schedule.ghostName }, "Firing scheduled prompt");
-          await this.dispatchSchedule(schedule);
-          schedule.lastFired = new Date(referenceTime).toISOString();
-          if (schedule.once) {
-            schedule.enabled = false;
-            schedule.nextFire = null;
-          } else {
-            schedule.nextFire = getNextCronFire(schedule.cron, schedule.timezone, referenceTime);
-          }
-        } catch (error) {
-          log.error({ err: error, scheduleId: schedule.id, ghostName: schedule.ghostName }, "Scheduled prompt failed");
-        }
-      }
-
-      await this.saveSchedules(schedules);
-    } finally {
-      this.processing = false;
-    }
-  }
-}
-
-const ensureGhostExists = async (name: string): Promise<string> => {
-  await getGhost(name);
-  return resolve(getVaultPath(name));
-};
-
-const toVaultApiPath = (vaultPath: string, fullPath: string): string => {
-  const nextRelativePath = relative(vaultPath, fullPath);
-  if (!nextRelativePath) {
-    return "/";
-  }
-
-  return `/${nextRelativePath.split(sep).join("/")}`;
-};
-
-const resolveVaultItemPath = async (
-  ghostName: string,
-  inputPath: string | undefined,
-  options?: { allowRoot?: boolean }
-): Promise<{ vaultPath: string; fullPath: string; apiPath: string }> => {
-  const vaultPath = await ensureGhostExists(ghostName);
-  const rawPath = inputPath?.trim() ?? "";
-  const requestedPath = rawPath || "/";
-
-  if (!rawPath && options?.allowRoot !== true) {
-    throw new ApiError(400, "Missing path");
-  }
-
-  if (requestedPath.includes("..")) {
-    throw new ApiError(400, "Invalid path");
-  }
-
-  const relativePath = requestedPath.replace(/\\/g, "/").replace(/^\/+/, "");
-  const fullPath = resolve(vaultPath, relativePath);
-  const vaultPrefix = vaultPath.endsWith(sep) ? vaultPath : `${vaultPath}${sep}`;
-
-  if (fullPath !== vaultPath && !fullPath.startsWith(vaultPrefix)) {
-    throw new ApiError(400, "Invalid path");
-  }
-
-  if (fullPath === vaultPath && options?.allowRoot !== true) {
-    throw new ApiError(400, "Invalid path");
-  }
-
-  return {
-    vaultPath,
-    fullPath,
-    apiPath: toVaultApiPath(vaultPath, fullPath)
-  };
-};
-
-const getVaultEntryType = (stats: Awaited<ReturnType<typeof stat>>): VaultEntry["type"] => {
-  return stats.isDirectory() ? "directory" : "file";
-};
-
-const readVaultEntries = async (vaultPath: string, directoryPath: string): Promise<VaultEntry[]> => {
-  const directoryEntries = await readdir(directoryPath, { withFileTypes: true });
-
-  const entries = await Promise.all(
-    directoryEntries.map(async (entry) => {
-      const entryPath = resolve(directoryPath, entry.name);
-      const entryStats = await stat(entryPath);
-      const entryType = getVaultEntryType(entryStats);
-
-      return {
-        name: entry.name,
-        path: toVaultApiPath(vaultPath, entryPath),
-        type: entryType,
-        size: entryType === "file" ? entryStats.size : undefined,
-        modified: entryStats.mtime.toISOString()
-      } satisfies VaultEntry;
-    })
-  );
-
-  return entries.sort((left, right) => {
-    if (left.type !== right.type) {
-      return left.type === "directory" ? -1 : 1;
-    }
-
-    return left.name.localeCompare(right.name);
-  });
-};
-
-const throwVaultFsError = (error: unknown): never => {
-  if (isNodeError(error) && error.code === "ENOENT") {
-    throw new ApiError(404, "Path not found");
-  }
-
-  throw error;
-};
-
 const parseProviderAndModel = (value: string): { provider: string | null; model: string } => {
   const trimmed = value.trim();
   const separatorIndex = trimmed.indexOf("/");
@@ -736,411 +169,25 @@ const getDefaultProvider = (config: LegacyConfig): string => {
     .toLowerCase();
 };
 
-const hasConfigValue = (value: string | null | undefined): boolean => {
-  return typeof value === "string" && value.length > 0;
-};
-
-const maskSensitiveConfigValue = (value: string | null | undefined): string => {
-  if (!hasConfigValue(value)) {
-    return "";
+const getApiErrorStatus = (error: unknown): ApiStatusCode | null => {
+  if (error instanceof ApiError) {
+    return error.status;
   }
 
-  const sensitiveValue = value as string;
-  const prefix = sensitiveValue.slice(0, 12);
-  const suffix = sensitiveValue.slice(-4);
-  return `${prefix}...${suffix}`;
-};
-
-const toConfigSensitiveStatus = (config: GhostboxConfig): GhostboxConfigSensitiveStatus => {
-  return {
-    githubToken: hasConfigValue(config.githubToken),
-    telegramToken: hasConfigValue(config.telegramToken)
-  };
-};
-
-const toConfigResponse = (config: GhostboxConfig): GhostboxConfigResponse => {
-  const { adminToken: _adminToken, ...publicConfig } = config;
-
-  return {
-    ...publicConfig,
-    githubToken: maskSensitiveConfigValue(config.githubToken),
-    telegramToken: maskSensitiveConfigValue(config.telegramToken),
-    hasSensitive: toConfigSensitiveStatus(config)
-  };
-};
-
-const normalizeRequiredConfigValue = (value: unknown, field: string): string => {
-  if (typeof value !== "string") {
-    throw new ApiError(400, `Invalid ${field}`);
-  }
-
-  const trimmed = value.trim();
-
-  if (!trimmed) {
-    throw new ApiError(400, `Missing ${field}`);
-  }
-
-  return trimmed;
-};
-
-const normalizeNullableConfigValue = (value: unknown, field: string): string | null => {
-  if (value === null) {
-    return null;
-  }
-
-  if (typeof value !== "string") {
-    throw new ApiError(400, `Invalid ${field}`);
-  }
-
-  const trimmed = value.trim();
-  return trimmed ? trimmed : null;
-};
-
-const normalizeSensitiveConfigValue = (
-  value: unknown,
-  field: "githubToken" | "telegramToken"
-): string | null | undefined => {
-  if (value === null) {
-    return null;
-  }
-
-  if (typeof value !== "string") {
-    throw new ApiError(400, `Invalid ${field}`);
-  }
-
-  const trimmed = value.trim();
-
-  if (!trimmed) {
-    return null;
-  }
-
-  if (trimmed.includes("...")) {
-    return undefined;
-  }
-
-  return trimmed;
-};
-
-const normalizeGhostImages = (value: unknown): GhostImage[] | undefined => {
-  if (value === undefined) {
-    return undefined;
-  }
-
-  if (!Array.isArray(value)) {
-    throw new ApiError(400, "Invalid images");
-  }
-
-  return value.map((image) => {
-    if (typeof image !== "object" || image === null) {
-      throw new ApiError(400, "Invalid images");
-    }
-
-    const { mediaType, data } = image as {
-      mediaType?: unknown;
-      data?: unknown;
-    };
-
-    if (typeof mediaType !== "string" || typeof data !== "string") {
-      throw new ApiError(400, "Invalid images");
-    }
-
-    return { mediaType, data };
-  });
-};
-
-const normalizeStreamingBehavior = (value: unknown): GhostStreamingBehavior | undefined => {
-  if (value === undefined) {
-    return undefined;
-  }
-
-  if (value === "steer" || value === "followUp") {
-    return value;
-  }
-
-  throw new ApiError(400, "Invalid streamingBehavior");
-};
-
-const normalizeMailTextField = (value: unknown, field: "from" | "to" | "subject" | "body"): string => {
-  if (typeof value !== "string") {
-    throw new ApiError(400, `Missing ${field}`);
-  }
-
-  if (field === "body") {
-    if (!value.trim()) {
-      throw new ApiError(400, "Missing body");
-    }
-
-    return value;
-  }
-
-  const trimmed = value.trim();
-  if (!trimmed) {
-    throw new ApiError(400, `Missing ${field}`);
-  }
-
-  return trimmed;
-};
-
-const normalizeMailPriority = (value: unknown): "normal" | "urgent" => {
-  if (value === undefined) {
-    return "normal";
-  }
-
-  if (value === "normal" || value === "urgent") {
-    return value;
-  }
-
-  throw new ApiError(400, "Invalid priority");
-};
-
-const normalizeMailThreadId = (value: unknown): string | null => {
-  if (value === undefined) {
-    return null;
-  }
-
-  if (typeof value !== "string") {
-    throw new ApiError(400, "Invalid threadId");
-  }
-
-  const trimmed = value.trim();
-  return trimmed || null;
-};
-
-const normalizeStoredMailMessage = (value: unknown): MailMessage => {
-  if (typeof value !== "object" || value === null) {
-    throw new Error("Mailbox file contains an invalid message");
-  }
-
-  const message = value as Partial<MailMessage>;
-
-  if (
-    typeof message.id !== "string" ||
-    typeof message.from !== "string" ||
-    typeof message.to !== "string" ||
-    typeof message.subject !== "string" ||
-    typeof message.body !== "string" ||
-    typeof message.sentAt !== "string" ||
-    (message.readAt !== null && typeof message.readAt !== "string") ||
-    (message.threadId !== null && typeof message.threadId !== "string") ||
-    (message.priority !== "normal" && message.priority !== "urgent")
-  ) {
-    throw new Error("Mailbox file contains an invalid message");
-  }
-
-  return {
-    id: message.id,
-    from: message.from,
-    authenticatedBy: typeof message.authenticatedBy === "string" ? message.authenticatedBy : null,
-    to: message.to,
-    subject: message.subject,
-    body: message.body,
-    sentAt: message.sentAt,
-    readAt: message.readAt,
-    threadId: message.threadId,
-    priority: message.priority
-  };
-};
-
-const parseMailboxState = (value: unknown): MailboxState => {
-  if (typeof value !== "object" || value === null || !Array.isArray((value as { messages?: unknown }).messages)) {
-    throw new Error("Mailbox file must contain a messages array");
-  }
-
-  return {
-    messages: (value as { messages: unknown[] }).messages.map((message) => normalizeStoredMailMessage(message))
-  };
-};
-
-const pruneMailboxMessagesForRecipient = (messages: MailMessage[], recipient: string): MailMessage[] => {
-  const recipientMessages = messages.filter((message) => message.to === recipient);
-
-  if (recipientMessages.length <= MAILBOX_MAX_MESSAGES_PER_RECIPIENT) {
-    return messages;
-  }
-
-  const overflowCount = recipientMessages.length - MAILBOX_MAX_MESSAGES_PER_RECIPIENT;
-  const oldestFirst = (left: MailMessage, right: MailMessage) => Date.parse(left.sentAt) - Date.parse(right.sentAt);
-  const removableMessages = [
-    ...recipientMessages.filter((message) => message.readAt !== null).sort(oldestFirst),
-    ...recipientMessages.filter((message) => message.readAt === null).sort(oldestFirst)
-  ];
-  const removedIds = new Set(removableMessages.slice(0, overflowCount).map((message) => message.id));
-
-  return messages.filter((message) => !removedIds.has(message.id));
-};
-
-const applyMailboxCaps = (mailboxState: MailboxState): MailboxState => {
-  let messages = mailboxState.messages.map((message) => ({
-    ...message,
-    authenticatedBy: message.authenticatedBy ?? null
-  }));
-
-  for (const recipient of new Set(messages.map((message) => message.to))) {
-    messages = pruneMailboxMessagesForRecipient(messages, recipient);
-  }
-
-  return { messages };
-};
-
-const findGhostNameByApiKey = (state: GhostboxState, token: string): string | null => {
-  for (const [ghostName, ghost] of Object.entries(state.ghosts)) {
-    if (ghost.apiKeys.some((apiKey) => apiKey.key === token)) {
-      return ghostName;
+  if (typeof error === "object" && error !== null && "status" in error) {
+    const status = (error as { status?: unknown }).status;
+    if (status === 400 || status === 401 || status === 403 || status === 404 || status === 409 || status === 429 || status === 500) {
+      return status;
     }
   }
 
   return null;
-};
-
-const extractBearerToken = (authorizationHeader: string | undefined): string | null => {
-  if (!authorizationHeader) {
-    return null;
-  }
-
-  const match = authorizationHeader.match(/^Bearer\s+(.+)$/i);
-  if (!match) {
-    return null;
-  }
-
-  const token = match[1]?.trim();
-  return token || null;
-};
-
-const authenticateApiToken = async (token: string | null): Promise<ApiAuthContext | null> => {
-  if (!token) {
-    return null;
-  }
-
-  const state = await loadState();
-  const ghostName = findGhostNameByApiKey(state, token);
-
-  if (ghostName) {
-    return {
-      authenticatedBy: ghostName,
-      ghostName
-    };
-  }
-
-  if (token === resolveConfigAdminToken(state.config)) {
-    return {
-      authenticatedBy: "user",
-      ghostName: null
-    };
-  }
-
-  if (token === getLegacyApiUserToken()) {
-    return {
-      authenticatedBy: "user",
-      ghostName: null
-    };
-  }
-
-  return null;
-};
-
-const validateMailSize = (subject: string, body: string): void => {
-  if (subject.length > MAIL_SUBJECT_MAX_LENGTH) {
-    throw new ApiError(400, `Subject exceeds ${MAIL_SUBJECT_MAX_LENGTH} characters`);
-  }
-
-  if (body.length > MAIL_BODY_MAX_LENGTH) {
-    throw new ApiError(400, `Body exceeds ${MAIL_BODY_MAX_LENGTH} characters`);
-  }
-};
-
-const resolveAuthenticatedMailSender = (
-  requestedFrom: unknown,
-  auth: ApiAuthContext
-): Pick<MailMessage, "from" | "authenticatedBy"> => {
-  const normalizedFrom =
-    requestedFrom === undefined
-      ? undefined
-      : (() => {
-          if (typeof requestedFrom !== "string") {
-            throw new ApiError(400, "Invalid from");
-          }
-
-          const trimmed = requestedFrom.trim();
-          if (!trimmed) {
-            throw new ApiError(400, "Missing from");
-          }
-
-          return trimmed;
-        })();
-
-  if (normalizedFrom === "user") {
-    return {
-      from: "user",
-      authenticatedBy: auth.authenticatedBy
-    };
-  }
-
-  if (auth.ghostName) {
-    return {
-      from: auth.ghostName,
-      authenticatedBy: auth.authenticatedBy
-    };
-  }
-
-  if (normalizedFrom !== undefined) {
-    throw new ApiError(403, "User token can only send mail from user");
-  }
-
-  return {
-    from: "user",
-    authenticatedBy: auth.authenticatedBy
-  };
-};
-
-const checkMailSendRateLimit = (sender: string): number | null => {
-  const now = Date.now();
-  const current = mailRateLimitState.get(sender);
-
-  if (!current || now - current.windowStart >= MAIL_RATE_LIMIT_WINDOW_MS) {
-    mailRateLimitState.set(sender, { count: 1, windowStart: now });
-    return null;
-  }
-
-  if (current.count >= MAIL_RATE_LIMIT_MAX_MESSAGES) {
-    return Math.max(1, Math.ceil((current.windowStart + MAIL_RATE_LIMIT_WINDOW_MS - now) / 1000));
-  }
-
-  current.count += 1;
-  return null;
-};
-
-const canAccessMailMessage = (message: MailMessage, ghostName: string | null): boolean => {
-  if (!ghostName) {
-    return false;
-  }
-
-  return message.to === ghostName || message.to === "all";
-};
-
-const loadMailboxState = async (): Promise<MailboxState> => {
-  const mailboxFile = Bun.file(getMailboxPath());
-
-  if (!(await mailboxFile.exists())) {
-    return { messages: [] };
-  }
-
-  const contents = await mailboxFile.text();
-  if (!contents.trim()) {
-    return { messages: [] };
-  }
-
-  return parseMailboxState(JSON.parse(contents) as unknown);
-};
-
-const saveMailboxState = async (mailboxState: MailboxState): Promise<void> => {
-  const nextMailboxState = applyMailboxCaps(mailboxState);
-  await mkdir(dirname(getMailboxPath()), { recursive: true });
-  await Bun.write(getMailboxPath(), `${JSON.stringify(nextMailboxState, null, 2)}\n`);
 };
 
 const getErrorStatus = (error: unknown): ApiStatusCode => {
-  if (error instanceof ApiError) {
-    return error.status;
+  const apiStatus = getApiErrorStatus(error);
+  if (apiStatus) {
+    return apiStatus;
   }
 
   const message = error instanceof Error ? error.message : "Internal server error";
@@ -1207,31 +254,15 @@ const parseJsonBody = async <T>(c: Context): Promise<T> => {
       );
       throw new ApiError(400, `Invalid JSON body: ${(parseErr as Error).message}`);
     }
-  } catch (err) {
-    if (err instanceof ApiError) throw err;
-    log.error({ method: c.req.method, path: c.req.path, err }, "Failed to read request body");
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw error;
+    }
+
+    log.error({ method: c.req.method, path: c.req.path, err: error }, "Failed to read request body");
     throw new ApiError(400, "Could not read request body");
   }
 };
-
-const dispatchScheduledPrompt = async (schedule: GhostSchedule): Promise<void> => {
-  const ghost = await getGhost(schedule.ghostName);
-
-  if (ghost.status === "stopped") {
-    await wakeGhost(schedule.ghostName);
-  }
-
-  void (async () => {
-    try {
-      for await (const _message of sendMessage(schedule.ghostName, schedule.prompt)) {
-      }
-    } catch (error) {
-      log.error({ err: error, scheduleId: schedule.id, ghostName: schedule.ghostName }, "Scheduled prompt failed");
-    }
-  })();
-};
-
-const scheduleManager = new ScheduleManager(dispatchScheduledPrompt);
 
 const handleRoute = async (c: Context, handler: () => Promise<Response>): Promise<Response> => {
   try {
@@ -1270,13 +301,12 @@ app.use(
       }
 
       const state = await loadState();
-      const allowedOrigins = resolveAllowedCorsOrigins(state.config);
+      const allowedOrigins = resolveAllowedCorsOrigins(state.config as GhostboxConfig);
       return allowedOrigins.includes(origin) ? origin : null;
     }
   })
 );
 
-// Polling endpoints that don't need per-request logging
 const QUIET_ROUTES = new Set(["/api/ghosts", "/api/config", "/api/auth"]);
 
 app.use("/api/*", async (c, next) => {
@@ -1302,8 +332,7 @@ app.get("/api/health", (c) => c.json({ status: "ok" }));
 
 app.use("/api/*", async (c, next) => {
   try {
-    const token = extractBearerToken(c.req.header("authorization"));
-    const auth = await authenticateApiToken(token);
+    const auth = await authenticateApiToken(c.req.header("authorization"));
 
     if (!auth) {
       return c.json({ error: "Unauthorized" }, { status: 401 });
@@ -1498,118 +527,32 @@ app.delete("/api/ghosts/:name/schedules/:id", (c) =>
 app.post("/api/mail/send", (c) =>
   handleRoute(c, async () => {
     const body = await parseJsonBody<MailSendBody>(c);
-    const auth = c.var.apiAuth;
-    const { from, authenticatedBy } = resolveAuthenticatedMailSender(body.from, auth);
-    const to = normalizeMailTextField(body.to, "to");
-    const subject = normalizeMailTextField(body.subject, "subject");
-    const mailBody = normalizeMailTextField(body.body, "body");
-    const priority = normalizeMailPriority(body.priority);
-    const threadId = normalizeMailThreadId(body.threadId);
+    const result = await sendMail(body, c.var.apiAuth);
 
-    validateMailSize(subject, mailBody);
-
-    const retryAfter = checkMailSendRateLimit(auth.authenticatedBy);
-    if (retryAfter !== null) {
-      return c.json({ error: "Rate limit exceeded", retryAfter }, { status: 429 });
+    if (result.rateLimited) {
+      return c.json({ error: "Rate limit exceeded", retryAfter: result.retryAfter }, { status: 429 });
     }
 
-    const message: MailMessage = {
-      id: randomUUID(),
-      from,
-      authenticatedBy,
-      to,
-      subject,
-      body: mailBody,
-      priority,
-      threadId,
-      sentAt: new Date().toISOString(),
-      readAt: null
-    };
-
-    const mailboxState = await loadMailboxState();
-    mailboxState.messages.push(message);
-    await saveMailboxState(mailboxState);
-
-    if (priority === "urgent") {
-      try {
-        const ghost = await getGhost(to);
-        if (ghost.status === "running") {
-          await steerGhost(to, `You have an urgent message from ${from}. Use mailbox(action: "check") to read it.`);
-        }
-      } catch (error) {
-        if (!(error instanceof Error) || !error.message.includes("not found")) {
-          throw error;
-        }
-      }
-    }
-
-    return c.json({ status: "sent", id: message.id });
+    return c.json(result.response);
   })
 );
 
 app.get("/api/mail/:ghostName", (c) =>
   handleRoute(c, async () => {
     const unreadOnly = c.req.query("unread") === "true";
-    const mailboxState = await loadMailboxState();
-    const ghostName = c.req.param("ghostName");
-
-    if (c.var.apiAuth.ghostName !== ghostName) {
-      throw new ApiError(403, "Forbidden");
-    }
-
-    const messages = mailboxState.messages
-      .filter((message) => message.to === ghostName || message.to === "all")
-      .filter((message) => !unreadOnly || message.readAt === null)
-      .sort((left, right) => {
-        if ((left.readAt === null) !== (right.readAt === null)) {
-          return left.readAt === null ? -1 : 1;
-        }
-
-        return Date.parse(right.sentAt) - Date.parse(left.sentAt);
-      });
-
-    return c.json({ messages });
+    return c.json(await listMail(c.req.param("ghostName"), unreadOnly, c.var.apiAuth));
   })
 );
 
 app.post("/api/mail/:id/read", (c) =>
   handleRoute(c, async () => {
-    const mailboxState = await loadMailboxState();
-    const message = mailboxState.messages.find((entry) => entry.id === c.req.param("id"));
-
-    if (!message) {
-      throw new ApiError(404, `Mail message "${c.req.param("id")}" not found.`);
-    }
-
-    if (!canAccessMailMessage(message, c.var.apiAuth.ghostName)) {
-      throw new ApiError(403, "Forbidden");
-    }
-
-    message.readAt = new Date().toISOString();
-    await saveMailboxState(mailboxState);
-
-    return c.json({ status: "read" });
+    return c.json(await markMailRead(c.req.param("id"), c.var.apiAuth));
   })
 );
 
 app.delete("/api/mail/:id", (c) =>
   handleRoute(c, async () => {
-    const mailboxState = await loadMailboxState();
-    const message = mailboxState.messages.find((entry) => entry.id === c.req.param("id"));
-
-    if (!message) {
-      throw new ApiError(404, `Mail message "${c.req.param("id")}" not found.`);
-    }
-
-    if (!canAccessMailMessage(message, c.var.apiAuth.ghostName)) {
-      throw new ApiError(403, "Forbidden");
-    }
-
-    const nextMessages = mailboxState.messages.filter((message) => message.id !== c.req.param("id"));
-
-    await saveMailboxState({ messages: nextMessages });
-
-    return c.json({ status: "deleted" });
+    return c.json(await deleteMail(c.req.param("id"), c.var.apiAuth));
   })
 );
 
@@ -1729,41 +672,13 @@ app.post("/api/ghosts/:name/save", (c) =>
 
 app.get("/api/ghosts/:name/vault", (c) =>
   handleRoute(c, async () => {
-    try {
-      const { vaultPath, fullPath } = await resolveVaultItemPath(c.req.param("name"), c.req.query("path"), {
-        allowRoot: true
-      });
-      const directoryStats = await stat(fullPath);
-
-      if (!directoryStats.isDirectory()) {
-        throw new ApiError(400, "Path must be a directory");
-      }
-
-      return c.json({ entries: await readVaultEntries(vaultPath, fullPath) });
-    } catch (error) {
-      return throwVaultFsError(error);
-    }
+    return c.json(await listVaultDirectory(c.req.param("name"), c.req.query("path")));
   })
 );
 
 app.get("/api/ghosts/:name/vault/read", (c) =>
   handleRoute(c, async () => {
-    try {
-      const { fullPath, apiPath } = await resolveVaultItemPath(c.req.param("name"), c.req.query("path"));
-      const fileStats = await stat(fullPath);
-
-      if (!fileStats.isFile()) {
-        throw new ApiError(400, "Path must be a file");
-      }
-
-      return c.json({
-        path: apiPath,
-        content: await readFile(fullPath, "utf8"),
-        size: fileStats.size
-      });
-    } catch (error) {
-      return throwVaultFsError(error);
-    }
+    return c.json(await readVaultFile(c.req.param("name"), c.req.query("path")));
   })
 );
 
@@ -1772,20 +687,7 @@ app.put("/api/ghosts/:name/vault/write", (c) =>
     const body = await parseJsonBody<VaultWriteBody>(c);
     const inputPath = typeof body.path === "string" ? body.path : undefined;
     const content = typeof body.content === "string" ? body.content : null;
-
-    if (content === null) {
-      throw new ApiError(400, "Missing content");
-    }
-
-    const { fullPath, apiPath } = await resolveVaultItemPath(c.req.param("name"), inputPath);
-    await mkdir(dirname(fullPath), { recursive: true });
-    await writeFile(fullPath, content, "utf8");
-    const fileStats = await stat(fullPath);
-
-    return c.json({
-      path: apiPath,
-      size: fileStats.size
-    });
+    return c.json(await writeVaultFile(c.req.param("name"), inputPath, content));
   })
 );
 
@@ -1793,35 +695,7 @@ app.delete("/api/ghosts/:name/vault/delete", (c) =>
   handleRoute(c, async () => {
     const body = await parseJsonBody<VaultDeleteBody>(c);
     const inputPath = typeof body.path === "string" ? body.path : undefined;
-
-    try {
-      const { fullPath, apiPath } = await resolveVaultItemPath(c.req.param("name"), inputPath);
-      const fileStats = await stat(fullPath);
-
-      if (!fileStats.isFile()) {
-        throw new ApiError(400, "Path must be a file");
-      }
-
-      const { exitCode, stderr: trashStdErr } = await new Promise<{ exitCode: number; stderr: string }>(
-        (resolve, reject) => {
-          const proc = nodeSpawn("trash", [fullPath], { stdio: ["ignore", "pipe", "pipe"] });
-          let stderr = "";
-          proc.stderr?.on("data", (chunk: Buffer) => {
-            stderr += chunk.toString();
-          });
-          proc.on("error", reject);
-          proc.on("close", (code) => resolve({ exitCode: code ?? 1, stderr }));
-        }
-      );
-
-      if (exitCode !== 0) {
-        throw new Error(`Trash command failed: ${trashStdErr.trim()}`);
-      }
-
-      return c.json({ path: apiPath, status: "deleted" as const });
-    } catch (error) {
-      return throwVaultFsError(error);
-    }
+    return c.json(await deleteVaultFile(c.req.param("name"), inputPath));
   })
 );
 
@@ -1846,54 +720,14 @@ app.get("/api/auth", (c) =>
 
 app.get("/api/config", (c) =>
   handleRoute(c, async () => {
-    return c.json(toConfigResponse(await getConfig()));
+    return c.json(await getPublicConfig());
   })
 );
 
 app.put("/api/config", (c) =>
   handleRoute(c, async () => {
     const body = await parseJsonBody<ConfigUpdateBody>(c);
-    const state = await loadState();
-    const nextConfig = { ...state.config };
-
-    if ("defaultProvider" in body) {
-      nextConfig.defaultProvider = normalizeRequiredConfigValue(body.defaultProvider, "defaultProvider");
-    }
-
-    if ("defaultModel" in body) {
-      nextConfig.defaultModel = normalizeRequiredConfigValue(body.defaultModel, "defaultModel");
-    }
-
-    if ("imageName" in body) {
-      nextConfig.imageName = normalizeRequiredConfigValue(body.imageName, "imageName");
-    }
-
-    if ("githubRemote" in body) {
-      nextConfig.githubRemote = normalizeNullableConfigValue(body.githubRemote, "githubRemote");
-    }
-
-    if ("githubToken" in body) {
-      const githubToken = normalizeSensitiveConfigValue(body.githubToken, "githubToken");
-      if (githubToken === null) {
-        nextConfig.githubToken = null;
-      } else if (typeof githubToken === "string") {
-        nextConfig.githubToken = githubToken;
-      }
-    }
-
-    if ("telegramToken" in body) {
-      const telegramToken = normalizeSensitiveConfigValue(body.telegramToken, "telegramToken");
-      if (telegramToken === null) {
-        nextConfig.telegramToken = "";
-      } else if (typeof telegramToken === "string") {
-        nextConfig.telegramToken = telegramToken;
-      }
-    }
-
-    state.config = nextConfig;
-    await saveState(state);
-
-    return c.json(toConfigResponse(nextConfig));
+    return c.json(await updateStoredConfig(body));
   })
 );
 
@@ -2017,7 +851,6 @@ if (import.meta.main || process.argv[1] === __apiFilename) {
     return app.fetch(req);
   };
 
-  // Try preferred port, fall back up to 10 ports higher
   let boundPort = port;
   let server: ReturnType<typeof createServer> | null = null;
 
@@ -2027,14 +860,16 @@ if (import.meta.main || process.argv[1] === __apiFilename) {
         const url = `http://localhost:${p}${req.url ?? "/"}`;
         const headers: Record<string, string> = {};
         for (const [key, value] of Object.entries(req.headers)) {
-          if (typeof value === "string") headers[key] = value;
+          if (typeof value === "string") {
+            headers[key] = value;
+          }
         }
         const hasBody = req.method !== "GET" && req.method !== "HEAD";
         const reqBody = hasBody
-          ? await new Promise<Buffer>((resolve) => {
+          ? await new Promise<Buffer>((resolveBody) => {
               const chunks: Buffer[] = [];
               req.on("data", (chunk: Buffer) => chunks.push(chunk));
-              req.on("end", () => resolve(Buffer.concat(chunks)));
+              req.on("end", () => resolveBody(Buffer.concat(chunks)));
             })
           : undefined;
         const response = await handler(
@@ -2050,7 +885,9 @@ if (import.meta.main || process.argv[1] === __apiFilename) {
           try {
             while (true) {
               const { done, value } = await reader.read();
-              if (done) break;
+              if (done) {
+                break;
+              }
               res.write(value);
             }
           } finally {
@@ -2061,8 +898,6 @@ if (import.meta.main || process.argv[1] === __apiFilename) {
           res.end();
         }
       });
-      // Disable request timeout so SSE streams for long-running agent
-      // tool calls (bash polling, file reads) don't get killed at 5 min.
       s.requestTimeout = 0;
       s.headersTimeout = 0;
       s.once("error", () => resolve(false));
@@ -2088,7 +923,6 @@ if (import.meta.main || process.argv[1] === __apiFilename) {
     process.exit(1);
   }
 
-  // Reconcile ghost states - restart containers that should be running
   reconcileGhostStates()
     .then(({ started, marked }) => {
       if (marked.length > 0) {
@@ -2096,19 +930,20 @@ if (import.meta.main || process.argv[1] === __apiFilename) {
       }
       scheduleManager.start();
     })
-    .catch((err) => {
-      log.error({ err }, "Ghost state reconciliation failed");
+    .catch((error) => {
+      log.error({ err: error }, "Ghost state reconciliation failed");
       scheduleManager.start();
     });
 
-  // Graceful shutdown - stop all running ghost containers
   const shutdown = async () => {
     log.info("Shutting down - stopping ghost containers...");
     scheduleManager.stop();
     try {
       const ghosts = await listGhosts();
       for (const [name, ghost] of Object.entries(ghosts)) {
-        if (ghost.status !== "running") continue;
+        if (ghost.status !== "running") {
+          continue;
+        }
         try {
           await killGhost(name);
           log.info({ name }, "Stopped ghost");
@@ -2127,4 +962,6 @@ if (import.meta.main || process.argv[1] === __apiFilename) {
 }
 
 export { app };
+export { ensureApiAdminToken } from "./auth-config";
+export { ScheduleManager } from "./schedule-manager";
 export default app;
