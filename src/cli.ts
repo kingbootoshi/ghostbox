@@ -778,6 +778,13 @@ const launchServer = async (): Promise<void> => {
   }
 };
 
+const buildDockerImage = async (imageName: string, dockerDir: string): Promise<void> => {
+  await runCommandInherit("bun", ["run", "build:ghost-server"]);
+  await runCommandInherit("bun", ["run", "build:ghost-server-claude"]);
+  await runCommandInherit("bun", ["run", "build:mcp-server"]);
+  await runCommandInherit("docker", ["build", "-t", imageName, dockerDir]);
+};
+
 const init = async (forceReset = false): Promise<void> => {
   const TOTAL_STEPS = 6;
   const statuses: InitStatus[] = [];
@@ -962,9 +969,8 @@ const init = async (forceReset = false): Promise<void> => {
   await saveState(state);
 
   try {
-    // docker/ ships pre-built with ghost-server.js inside the package
     const dockerDir = join(__dirname, "..", "docker");
-    await runCommandInherit("docker", ["build", "-t", DEFAULT_IMAGE_NAME, dockerDir]);
+    await buildDockerImage(DEFAULT_IMAGE_NAME, dockerDir);
 
     const { computeImageVersion } = await import("./orchestrator");
     const imageVersion = computeImageVersion(dockerDir);
@@ -1082,7 +1088,7 @@ const upgrade = async (): Promise<void> => {
   const imageName = state.config.imageName || DEFAULT_IMAGE_NAME;
   const dockerDir = join(__dirname, "..", "docker");
 
-  await runCommandInherit("docker", ["build", "-t", imageName, dockerDir]);
+  await buildDockerImage(imageName, dockerDir);
 
   const result = await upgradeGhosts(dockerDir);
   log.info(`Upgraded: ${result.upgraded.length}, Skipped: ${result.skipped.length}, Failed: ${result.failed.length}`);

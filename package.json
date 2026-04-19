@@ -16,11 +16,13 @@
     "node": ">=20"
   },
   "scripts": {
-    "build:ghost": "bun build src/ghost-server.ts --target=node --outfile=docker/ghost-server.js --external @mariozechner/pi-coding-agent",
+    "build:ghost-server": "bun build src/ghost-server.ts --target=node --outfile=docker/ghost-server.js --external @mariozechner/pi-coding-agent",
+    "build:ghost-server-claude": "bun build docker/ghost-server-claude.ts --target=node --outfile=docker/ghost-server-claude.js",
+    "build:mcp-server": "bun build docker/ghostbox-mcp-server.ts --target=node --outfile=docker/ghostbox-mcp-server.js --external @modelcontextprotocol/sdk --external zod",
     "build:cli": "bun build src/cli.ts --outdir=dist --target=node --external pino --external pino-pretty --external thread-stream --external sonic-boom --external dockerode --external ssh2 --external @grpc/grpc-js && bun build src/api.ts --outdir=dist --target=node --external pino --external pino-pretty --external thread-stream --external sonic-boom --external dockerode --external ssh2 --external @grpc/grpc-js && printf '#!/usr/bin/env node\\n' | cat - dist/cli.js > dist/cli.tmp && mv dist/cli.tmp dist/cli.js && chmod +x dist/cli.js",
-    "build:image": "docker build -t ghostbox-agent docker/",
-    "build": "bun run build:ghost && bun run build:cli",
-    "prepublishOnly": "bun run build:ghost && bun run build:cli",
+    "build:image": "bun run build:ghost-server && bun run build:ghost-server-claude && bun run build:mcp-server && docker build -t ghostbox-agent docker/",
+    "build": "bun run build:ghost-server && bun run build:ghost-server-claude && bun run build:mcp-server && bun run build:cli",
+    "prepublishOnly": "bun run build:ghost-server && bun run build:ghost-server-claude && bun run build:mcp-server && bun run build:cli",
     "dev": "bun run src/cli.ts",
     "dev:api": "bun run --watch src/api.ts",
     "test": "bun test",

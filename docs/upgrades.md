@@ -37,17 +37,19 @@ Rebuilds the image and rolls through stale ghosts one at a time:
 
 ```bash
 $ ghostbox upgrade
-# 1. bun build src/ghost-server.ts -> docker/ghost-server.js
-# 2. docker build -t ghostbox-agent docker/
-# 3. Compute new image version
-# 4. For each running ghost (one at a time):
+# 1. bun run build:ghost-server
+# 2. bun run build:ghost-server-claude
+# 3. bun run build:mcp-server
+# 4. docker build -t ghostbox-agent docker/
+# 5. Compute new image version
+# 6. For each running ghost (one at a time):
 #    - Skip if version matches (already current)
-#    - Refresh auth (copy fresh auth.json from ~/.pi/agent/)
+#    - Refresh runtime auth files
 #    - Kill (commits vault first)
 #    - Wake (creates new container from new image)
 #    - Verify health check
 #    - Stamp new version
-# 5. Print summary
+# 7. Print summary
 
 Upgraded: 2, Skipped: 1, Failed: 0
 ```
@@ -76,7 +78,9 @@ You can manually investigate and `ghostbox wake <name>` to retry.
 
 ### Auth refresh
 
-Every upgrade rollover copies fresh auth from `~/.pi/agent/auth.json` to the ghost's pi-agent directory. This ensures expired OAuth tokens are replaced without manual intervention.
+Every upgrade rollover refreshes the runtime auth files before restart:
+- Pi ghosts copy fresh auth from `~/.pi/agent/auth.json`
+- Claude Code ghosts rewrite `/vault/.claude/.credentials.json` from the stored Claude Code token
 
 ### Stopped ghosts
 
