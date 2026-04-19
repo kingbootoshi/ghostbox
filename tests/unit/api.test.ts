@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import app, { ensureApiAdminToken, ScheduleManager } from "../../src/api";
+import { app, ensureApiAdminToken, ScheduleManager } from "../../src/api";
 import { createConfig, createGhostState, createState, createTestHome } from "../support/test-state";
 
 type TestHome = Awaited<ReturnType<typeof createTestHome>>;

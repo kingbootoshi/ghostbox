@@ -966,4 +966,3 @@ if (import.meta.main || process.argv[1] === __apiFilename) {
 export { app };
 export { ensureApiAdminToken } from "./auth-config";
 export { ScheduleManager } from "./schedule-manager";
-export default app;
