@@ -51,6 +51,10 @@ type QueueState = {
   messages: string[];
 };
 
+type NudgeEvent = "pre-compact" | "pre-new-session" | "message-complete";
+
+type NudgeHandler = (event: NudgeEvent, reason: string) => Promise<void> | void;
+
 type StreamState = {
   textBuffer: string;
   lastAssistantText: string;
@@ -111,6 +115,23 @@ type ScheduleBody = {
   timezone?: unknown;
 };
 
+class NudgeRegistry {
+  #handlers = new Map<NudgeEvent, NudgeHandler[]>();
+
+  register(event: NudgeEvent, handler: NudgeHandler): void {
+    const handlers = this.#handlers.get(event) ?? [];
+    handlers.push(handler);
+    this.#handlers.set(event, handlers);
+  }
+
+  async emit(event: NudgeEvent, reason: string): Promise<void> {
+    const handlers = this.#handlers.get(event) ?? [];
+    for (const handler of handlers) {
+      await handler(event, reason);
+    }
+  }
+}
+
 const parseApiKeys = (value: string | undefined): string[] => {
   if (!value || value.trim().length === 0) {
     return [];
@@ -125,6 +146,7 @@ const parseApiKeys = (value: string | undefined): string[] => {
 };
 
 const configuredApiKeys = parseApiKeys(process.env.GHOSTBOX_API_KEYS);
+const nudges = new NudgeRegistry();
 
 const log = (level: "INFO" | "ERROR", message: string, context?: JsonRecord): void => {
   const suffix = context ? ` ${JSON.stringify(context)}` : "";
@@ -992,6 +1014,12 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: string[]): Prom
         const parsed = JSON.parse(trimmed) as JsonRecord;
         handleClaudeStreamLine(res, parsed, state);
         if (getEventName(parsed) === "result") {
+          void nudges.emit("message-complete", "result").catch((error) => {
+            log("ERROR", "Message-complete nudge failed", {
+              error: error instanceof Error ? error.message : String(error),
+              sessionId: currentSessionId ?? ""
+            });
+          });
           activeTurn.finished = true;
           if (!res.writableEnded) {
             res.end();
@@ -1080,6 +1108,7 @@ const runCompactCommand = async (): Promise<string> => {
     throw new Error("No active session to compact.");
   }
 
+  await nudges.emit("pre-compact", "compact");
   await ensureClaudeSupportFiles();
 
   return new Promise((resolve, reject) => {
@@ -1226,6 +1255,7 @@ const handleSlashCommand = async (
   }
 
   if (slash.command === "new") {
+    await nudges.emit("pre-new-session", "slash-command");
     currentSessionId = null;
     queue.messages = [];
     sendAssistantResult(res, "New session started.", "");
@@ -1417,7 +1447,8 @@ const handleCompact = async (res: ServerResponse): Promise<void> => {
   sendJson(res, 200, { status: "compacted", summary });
 };
 
-const handleNew = (res: ServerResponse): void => {
+const handleNew = async (res: ServerResponse): Promise<void> => {
+  await nudges.emit("pre-new-session", "api");
   currentSessionId = null;
   queue.messages = [];
   latestStats = null;
@@ -1692,7 +1723,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
   }
 
   if (req.method === "POST" && req.url === "/new") {
-    handleNew(res);
+    await handleNew(res);
     return;
   }
 

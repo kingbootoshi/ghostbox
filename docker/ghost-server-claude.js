@@ -29,6 +29,21 @@ var MEMORY_BLOCK_PLACEHOLDER = "<!-- GHOSTBOX_MEMORY_BLOCKS -->";
 var defaultSystemPrompt = 'You are a ghost agent. Your vault at /vault is your persistent memory. Use memory_write to save facts (target "memory" for notes, target "user" for user profile). Use memory_show to check your current memory. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
 var memoryCharLimit = 4000;
 var userCharLimit = 2000;
+
+class NudgeRegistry {
+  #handlers = new Map;
+  register(event, handler) {
+    const handlers = this.#handlers.get(event) ?? [];
+    handlers.push(handler);
+    this.#handlers.set(event, handlers);
+  }
+  async emit(event, reason) {
+    const handlers = this.#handlers.get(event) ?? [];
+    for (const handler of handlers) {
+      await handler(event, reason);
+    }
+  }
+}
 var parseApiKeys = (value) => {
   if (!value || value.trim().length === 0) {
     return [];
@@ -40,6 +55,7 @@ var parseApiKeys = (value) => {
   return parsed;
 };
 var configuredApiKeys = parseApiKeys(process.env.GHOSTBOX_API_KEYS);
+var nudges = new NudgeRegistry;
 var log = (level, message, context) => {
   const suffix = context ? ` ${JSON.stringify(context)}` : "";
   const line = `[${new Date().toISOString()}] [ghost-server-claude] ${level} ${message}${suffix}
@@ -725,6 +741,12 @@ var spawnClaudeMessage = async (res, messages) => {
         const parsed = JSON.parse(trimmed);
         handleClaudeStreamLine(res, parsed, state);
         if (getEventName(parsed) === "result") {
+          nudges.emit("message-complete", "result").catch((error) => {
+            log("ERROR", "Message-complete nudge failed", {
+              error: error instanceof Error ? error.message : String(error),
+              sessionId: currentSessionId ?? ""
+            });
+          });
           activeTurn.finished = true;
           if (!res.writableEnded) {
             res.end();
@@ -803,6 +825,7 @@ var runCompactCommand = async () => {
   if (!currentSessionId || !await sessionFileExists(currentSessionId)) {
     throw new Error("No active session to compact.");
   }
+  await nudges.emit("pre-compact", "compact");
   await ensureClaudeSupportFiles();
   return new Promise((resolve, reject) => {
     const args = [
@@ -922,6 +945,7 @@ var handleSlashCommand = async (res, prompt) => {
     return true;
   }
   if (slash.command === "new") {
+    await nudges.emit("pre-new-session", "slash-command");
     currentSessionId = null;
     queue.messages = [];
     sendAssistantResult(res, "New session started.", "");
@@ -1083,7 +1107,8 @@ var handleCompact = async (res) => {
   const summary = await runCompactCommand();
   sendJson(res, 200, { status: "compacted", summary });
 };
-var handleNew = (res) => {
+var handleNew = async (res) => {
+  await nudges.emit("pre-new-session", "api");
   currentSessionId = null;
   queue.messages = [];
   latestStats = null;
@@ -1294,7 +1319,7 @@ var handleRequest = async (req, res) => {
     return;
   }
   if (req.method === "POST" && req.url === "/new") {
-    handleNew(res);
+    await handleNew(res);
     return;
   }
   if (req.method === "POST" && req.url === "/abort") {
