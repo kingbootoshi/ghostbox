@@ -21,9 +21,14 @@ var GHOSTBOX_SKILL_PATH = "/opt/ghostbox/skills/ghostbox-api/SKILL.md";
 var GHOSTBOX_API_PORT = process.env.GHOSTBOX_API_PORT || "8008";
 var GHOSTBOX_HOST_BASE = `http://host.docker.internal:${GHOSTBOX_API_PORT}`;
 var GHOSTBOX_GHOST_NAME = process.env.GHOSTBOX_GHOST_NAME || "";
-var SYSTEM_PROMPT = process.env.GHOSTBOX_SYSTEM_PROMPT?.trim() || "";
+var MEMORY_PATH = "/vault/MEMORY.md";
+var USER_PATH = "/vault/USER.md";
 var HEARTBEAT_INTERVAL_MS = 30000;
 var SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var MEMORY_BLOCK_PLACEHOLDER = "<!-- GHOSTBOX_MEMORY_BLOCKS -->";
+var defaultSystemPrompt = 'You are a ghost agent. Your vault at /vault is your persistent memory. Use memory_write to save facts (target "memory" for notes, target "user" for user profile). Use memory_show to check your current memory. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
+var memoryCharLimit = 4000;
+var userCharLimit = 2000;
 var parseApiKeys = (value) => {
   if (!value || value.trim().length === 0) {
     return [];
@@ -214,15 +219,55 @@ var readFileText = async (path) => {
     return "";
   }
 };
+var renderMemoryBlock = (label, content, limit) => {
+  if (!content) {
+    return "";
+  }
+  const pct = Math.round(content.length / limit * 100);
+  const separator = "=".repeat(50);
+  return `${separator}
+${label} [${pct}% - ${content.length}/${limit} chars]
+${separator}
+${content}`;
+};
+var getBaseSystemPrompt = () => {
+  return process.env.GHOSTBOX_SYSTEM_PROMPT?.trim() || defaultSystemPrompt;
+};
+var buildMemoryBlocks = async () => {
+  const memoryContent = (await readFileText(MEMORY_PATH)).trim();
+  const userContent = (await readFileText(USER_PATH)).trim();
+  const blocks = [];
+  if (memoryContent) {
+    blocks.push(renderMemoryBlock("MEMORY (your personal notes)", memoryContent, memoryCharLimit));
+  }
+  if (userContent) {
+    blocks.push(renderMemoryBlock("USER PROFILE (who the user is)", userContent, userCharLimit));
+  }
+  return blocks.join(`
+
+`);
+};
+var buildAppendSystemPrompt = async () => {
+  const staticPrompt = await readFileText(CLAUDE_APPEND_PROMPT_PATH);
+  const memoryBlocks = await buildMemoryBlocks();
+  const replacement = memoryBlocks.length > 0 ? `${memoryBlocks}
+
+` : "";
+  return staticPrompt.replace(`${MEMORY_BLOCK_PLACEHOLDER}
+
+`, replacement).replace(MEMORY_BLOCK_PLACEHOLDER, "");
+};
 var ensureClaudeSupportFiles = async () => {
   await mkdir(CLAUDE_CONFIG_DIR, { recursive: true, mode: 448 });
   await mkdir(CLAUDE_PROJECTS_DIR, { recursive: true, mode: 448 });
-  const skillText = await readFileText(GHOSTBOX_SKILL_PATH);
-  const promptParts = [SYSTEM_PROMPT, skillText.trim()].filter((part) => part.length > 0);
-  await writeFile(CLAUDE_APPEND_PROMPT_PATH, `${promptParts.join(`
+  if (!await fileExists(CLAUDE_APPEND_PROMPT_PATH)) {
+    const skillText = await readFileText(GHOSTBOX_SKILL_PATH);
+    const promptParts = [getBaseSystemPrompt(), MEMORY_BLOCK_PLACEHOLDER, skillText.trim()].filter((part) => part.length > 0);
+    await writeFile(CLAUDE_APPEND_PROMPT_PATH, `${promptParts.join(`
 
 `)}
 `, "utf8");
+  }
   if (!await fileExists(CLAUDE_MCP_CONFIG_PATH)) {
     const payload = {
       mcpServers: {
@@ -620,7 +665,7 @@ var buildClaudeArgs = async (messages) => {
     "stream-json",
     "--verbose",
     "--append-system-prompt",
-    await readFileText(CLAUDE_APPEND_PROMPT_PATH),
+    await buildAppendSystemPrompt(),
     "--mcp-config",
     CLAUDE_MCP_CONFIG_PATH,
     "--dangerously-skip-permissions"
