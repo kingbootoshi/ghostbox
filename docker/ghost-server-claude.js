@@ -591,16 +591,20 @@ var emitTextBlockIfNeeded = (res, state) => {
   if (state.currentBlockType !== "text") {
     return;
   }
-  if (state.textBuffer.trim().length === 0) {
+  if (state.emittedAssistantForBlock) {
+    state.lastAssistantText = state.assistantFallback || state.lastAssistantText;
     state.textBuffer = "";
     state.emittedAssistantForBlock = false;
+    return;
+  }
+  if (state.textBuffer.trim().length === 0) {
+    state.textBuffer = "";
     return;
   }
   sendJsonLine(res, { type: "assistant", text: state.textBuffer });
   state.lastAssistantText = state.textBuffer;
   state.assistantFallback = state.textBuffer;
   state.textBuffer = "";
-  state.emittedAssistantForBlock = true;
 };
 var emitToolUseIfNeeded = (res, state) => {
   if (state.currentBlockType !== "tool_use" || !state.currentToolName) {
@@ -677,6 +681,23 @@ var handleClaudeStreamLine = (res, line, state) => {
     }
     return;
   }
+  if (eventName === "user") {
+    const messageRecord = isRecord(line.message) ? line.message : null;
+    const content = messageRecord?.content;
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (!isRecord(block) || getString(block.type) !== "tool_result") {
+          continue;
+        }
+        const output = extractText(block.content) || extractText(block.text) || "";
+        if (!output) {
+          continue;
+        }
+        sendJsonLine(res, { type: "tool_result", output });
+      }
+    }
+    return;
+  }
   if (eventName === "result") {
     state.receivedResultEvent = true;
     if (!state.lastAssistantText && state.assistantFallback) {
@@ -725,7 +746,14 @@ var handleClaudeStreamLine = (res, line, state) => {
   if (streamType === "content_block_delta") {
     const deltaType = getString(delta?.type);
     if (deltaType === "text_delta" && typeof delta?.text === "string") {
+      if (delta.text.length === 0) {
+        return;
+      }
+      sendJsonLine(res, { type: "assistant", text: delta.text });
       state.textBuffer += delta.text;
+      state.assistantFallback = state.textBuffer;
+      state.lastAssistantText = state.textBuffer;
+      state.emittedAssistantForBlock = true;
       return;
     }
     if (deltaType === "thinking_delta" && typeof delta?.thinking === "string") {
