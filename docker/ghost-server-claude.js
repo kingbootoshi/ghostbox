@@ -1,5 +1,6 @@
 // docker/ghost-server-claude.ts
 import { spawn as nodeSpawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
   mkdir,
@@ -17,6 +18,7 @@ var CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || "/vault/.claude";
 var CLAUDE_PROJECTS_DIR = join(CLAUDE_CONFIG_DIR, "projects", "-vault");
 var CLAUDE_MCP_CONFIG_PATH = join(CLAUDE_CONFIG_DIR, ".mcp.json");
 var CLAUDE_APPEND_PROMPT_PATH = join(CLAUDE_CONFIG_DIR, "ghostbox-system-prompt.md");
+var SESSION_NAMES_PATH = join(CLAUDE_CONFIG_DIR, "session-names.json");
 var GHOSTBOX_SKILL_PATH = "/opt/ghostbox/skills/ghostbox-api/SKILL.md";
 var GHOSTBOX_API_PORT = process.env.GHOSTBOX_API_PORT || "8008";
 var GHOSTBOX_HOST_BASE = `http://host.docker.internal:${GHOSTBOX_API_PORT}`;
@@ -25,6 +27,7 @@ var MEMORY_PATH = "/vault/MEMORY.md";
 var USER_PATH = "/vault/USER.md";
 var HEARTBEAT_INTERVAL_MS = 30000;
 var SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var SESSION_NAME_PATTERN = /^[a-zA-Z0-9 _-]+$/;
 var SNAPSHOT_SUFFIX = ".snapshot.txt";
 var FLUSH_MEMORY_TIMEOUT_MS = 60000;
 var DISALLOWED_NATIVE_TOOLS = "ScheduleWakeup CronCreate CronList CronDelete RemoteTrigger PushNotification";
@@ -193,13 +196,8 @@ var parseRequestImages = (imagesValue) => {
 var validateSessionId = (sessionId) => {
   return SESSION_ID_PATTERN.test(sessionId);
 };
-var sanitizeSessionName = (name) => {
-  const sanitized = name.trim();
-  const fileName = basename(sanitized);
-  if (!fileName || fileName !== sanitized || fileName.startsWith(".") || fileName.includes("/") || fileName.includes("\\") || fileName.toLowerCase().endsWith(".jsonl")) {
-    return null;
-  }
-  return fileName;
+var validateSessionName = (name) => {
+  return name.length >= 1 && name.length <= 80 && SESSION_NAME_PATTERN.test(name);
 };
 var getSessionFilePath = (sessionId) => {
   return join(CLAUDE_PROJECTS_DIR, `${sessionId}.jsonl`);
@@ -320,6 +318,25 @@ var clearSessionSnapshot = async (sessionId) => {
     return;
   }
   await unlink(getSnapshotPath(sessionId)).catch(() => {});
+};
+var readSessionNames = async () => {
+  try {
+    const raw = await readFile(SESSION_NAMES_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!isRecord(parsed)) {
+      return {};
+    }
+    return Object.fromEntries(Object.entries(parsed).filter(([sessionId, name]) => validateSessionId(sessionId) && typeof name === "string" && validateSessionName(name)));
+  } catch {
+    return {};
+  }
+};
+var writeSessionNames = async (records) => {
+  await mkdir(CLAUDE_CONFIG_DIR, { recursive: true, mode: 448 });
+  const tempPath = `${SESSION_NAMES_PATH}.${randomUUID()}.tmp`;
+  await writeFile(tempPath, `${JSON.stringify(records, null, 2)}
+`, { encoding: "utf8", mode: 384 });
+  await rename(tempPath, SESSION_NAMES_PATH);
 };
 var ensureClaudeSupportFiles = async () => {
   await mkdir(CLAUDE_CONFIG_DIR, { recursive: true, mode: 448 });
@@ -458,6 +475,7 @@ var loadSessions = async () => {
   if (!await fileExists(CLAUDE_PROJECTS_DIR)) {
     return { current: currentSessionId ?? "", sessions: [] };
   }
+  const sessionNames = await readSessionNames();
   const entries = await readdir(CLAUDE_PROJECTS_DIR);
   const sessionFiles = entries.filter((entry) => entry.endsWith(".jsonl")).sort();
   const sessions = [];
@@ -465,10 +483,11 @@ var loadSessions = async () => {
     const fullPath = join(CLAUDE_PROJECTS_DIR, entry);
     const stats = await stat(fullPath);
     const lines = await readJsonLines(fullPath).catch(() => []);
+    const sessionId = basename(entry, ".jsonl");
     const createdAt = readSessionTimestamp(lines[0], stats.birthtime);
     sessions.push({
-      id: basename(entry, ".jsonl"),
-      name: null,
+      id: sessionId,
+      name: sessionNames[sessionId] ?? null,
       path: fullPath,
       createdAt,
       lastActiveAt: stats.mtime.toISOString()
@@ -1355,35 +1374,34 @@ var handleRenameSession = async (req, res) => {
     sendJsonError(res, 400, "Missing name");
     return;
   }
+  if (!validateSessionName(name)) {
+    sendJsonError(res, 400, "Invalid session name");
+    return;
+  }
   const sourcePath = getSessionFilePath(sessionId);
   if (!await fileExists(sourcePath)) {
     sendJsonError(res, 404, `Session "${sessionId}" not found`);
-    return;
-  }
-  const sanitizedName = sanitizeSessionName(name);
-  if (!sanitizedName) {
-    sendJsonError(res, 400, "Invalid session name");
     return;
   }
   if (activeTurn || sessionOpLock) {
     sendJsonError(res, 409, "Turn in progress, try again.");
     return;
   }
-  const targetPath = getSessionFilePath(sanitizedName);
   sessionOpLock = true;
   try {
-    if (await fileExists(targetPath)) {
+    const sessionNames = await readSessionNames();
+    if (Object.entries(sessionNames).some(([existingId, existingName]) => existingId !== sessionId && existingName === name)) {
       sendJsonError(res, 409, "A session with that name already exists.");
       return;
     }
-    await rename(sourcePath, targetPath);
-    if (currentSessionId === sessionId) {
-      currentSessionId = sanitizedName;
-    }
+    await writeSessionNames({
+      ...sessionNames,
+      [sessionId]: name
+    });
   } finally {
     sessionOpLock = false;
   }
-  sendJson(res, 200, { status: "renamed", sessionId: sanitizedName, name: sanitizedName });
+  sendJson(res, 200, { status: "renamed", sessionId, name });
 };
 var handleDeleteSession = async (req, res) => {
   const sessionId = req.url?.replace("/sessions/", "").trim() ?? "";
@@ -1406,6 +1424,11 @@ var handleDeleteSession = async (req, res) => {
   }
   await unlink(targetPath);
   await clearSessionSnapshot(sessionId);
+  const sessionNames = await readSessionNames();
+  if (sessionNames[sessionId] !== undefined) {
+    delete sessionNames[sessionId];
+    await writeSessionNames(sessionNames);
+  }
   sendJson(res, 200, { status: "deleted", sessionId });
 };
 var handleSchedules = async (req, res) => {

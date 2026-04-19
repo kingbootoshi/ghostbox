@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
   mkdir,
@@ -30,6 +31,7 @@ const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || "/vault/.claude";
 const CLAUDE_PROJECTS_DIR = join(CLAUDE_CONFIG_DIR, "projects", "-vault");
 const CLAUDE_MCP_CONFIG_PATH = join(CLAUDE_CONFIG_DIR, ".mcp.json");
 const CLAUDE_APPEND_PROMPT_PATH = join(CLAUDE_CONFIG_DIR, "ghostbox-system-prompt.md");
+const SESSION_NAMES_PATH = join(CLAUDE_CONFIG_DIR, "session-names.json");
 const GHOSTBOX_SKILL_PATH = "/opt/ghostbox/skills/ghostbox-api/SKILL.md";
 const GHOSTBOX_API_PORT = process.env.GHOSTBOX_API_PORT || "8008";
 const GHOSTBOX_HOST_BASE = `http://host.docker.internal:${GHOSTBOX_API_PORT}`;
@@ -38,6 +40,7 @@ const MEMORY_PATH = "/vault/MEMORY.md";
 const USER_PATH = "/vault/USER.md";
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SESSION_NAME_PATTERN = /^[a-zA-Z0-9 _-]+$/;
 const SNAPSHOT_SUFFIX = ".snapshot.txt";
 const FLUSH_MEMORY_TIMEOUT_MS = 60_000;
 const DISALLOWED_NATIVE_TOOLS =
@@ -331,22 +334,8 @@ const validateSessionId = (sessionId: string): boolean => {
   return SESSION_ID_PATTERN.test(sessionId);
 };
 
-const sanitizeSessionName = (name: string): string | null => {
-  const sanitized = name.trim();
-  const fileName = basename(sanitized);
-
-  if (
-    !fileName ||
-    fileName !== sanitized ||
-    fileName.startsWith(".") ||
-    fileName.includes("/") ||
-    fileName.includes("\\") ||
-    fileName.toLowerCase().endsWith(".jsonl")
-  ) {
-    return null;
-  }
-
-  return fileName;
+const validateSessionName = (name: string): boolean => {
+  return name.length >= 1 && name.length <= 80 && SESSION_NAME_PATTERN.test(name);
 };
 
 const getSessionFilePath = (sessionId: string): string => {
@@ -493,6 +482,31 @@ const clearSessionSnapshot = async (sessionId: string | null): Promise<void> => 
   }
 
   await unlink(getSnapshotPath(sessionId)).catch(() => {});
+};
+
+const readSessionNames = async (): Promise<Record<string, string>> => {
+  try {
+    const raw = await readFile(SESSION_NAMES_PATH, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) {
+      return {};
+    }
+
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        ([sessionId, name]) => validateSessionId(sessionId) && typeof name === "string" && validateSessionName(name)
+      )
+    );
+  } catch {
+    return {};
+  }
+};
+
+const writeSessionNames = async (records: Record<string, string>): Promise<void> => {
+  await mkdir(CLAUDE_CONFIG_DIR, { recursive: true, mode: 0o700 });
+  const tempPath = `${SESSION_NAMES_PATH}.${randomUUID()}.tmp`;
+  await writeFile(tempPath, `${JSON.stringify(records, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await rename(tempPath, SESSION_NAMES_PATH);
 };
 
 const ensureClaudeSupportFiles = async (): Promise<void> => {
@@ -674,6 +688,7 @@ const loadSessions = async (): Promise<SessionListResponse> => {
     return { current: currentSessionId ?? "", sessions: [] };
   }
 
+  const sessionNames = await readSessionNames();
   const entries = await readdir(CLAUDE_PROJECTS_DIR);
   const sessionFiles = entries.filter((entry) => entry.endsWith(".jsonl")).sort();
   const sessions: SessionInfo[] = [];
@@ -682,10 +697,11 @@ const loadSessions = async (): Promise<SessionListResponse> => {
     const fullPath = join(CLAUDE_PROJECTS_DIR, entry);
     const stats = await stat(fullPath);
     const lines = await readJsonLines(fullPath).catch(() => []);
+    const sessionId = basename(entry, ".jsonl");
     const createdAt = readSessionTimestamp(lines[0], stats.birthtime);
     sessions.push({
-      id: basename(entry, ".jsonl"),
-      name: null,
+      id: sessionId,
+      name: sessionNames[sessionId] ?? null,
       path: fullPath,
       createdAt,
       lastActiveAt: stats.mtime.toISOString()
@@ -1753,15 +1769,14 @@ const handleRenameSession = async (req: IncomingMessage, res: ServerResponse): P
     return;
   }
 
-  const sourcePath = getSessionFilePath(sessionId);
-  if (!(await fileExists(sourcePath))) {
-    sendJsonError(res, 404, `Session "${sessionId}" not found`);
+  if (!validateSessionName(name)) {
+    sendJsonError(res, 400, "Invalid session name");
     return;
   }
 
-  const sanitizedName = sanitizeSessionName(name);
-  if (!sanitizedName) {
-    sendJsonError(res, 400, "Invalid session name");
+  const sourcePath = getSessionFilePath(sessionId);
+  if (!(await fileExists(sourcePath))) {
+    sendJsonError(res, 404, `Session "${sessionId}" not found`);
     return;
   }
 
@@ -1770,24 +1785,24 @@ const handleRenameSession = async (req: IncomingMessage, res: ServerResponse): P
     return;
   }
 
-  const targetPath = getSessionFilePath(sanitizedName);
   sessionOpLock = true;
 
   try {
-    if (await fileExists(targetPath)) {
+    const sessionNames = await readSessionNames();
+    if (Object.entries(sessionNames).some(([existingId, existingName]) => existingId !== sessionId && existingName === name)) {
       sendJsonError(res, 409, "A session with that name already exists.");
       return;
     }
 
-    await rename(sourcePath, targetPath);
-    if (currentSessionId === sessionId) {
-      currentSessionId = sanitizedName;
-    }
+    await writeSessionNames({
+      ...sessionNames,
+      [sessionId]: name
+    });
   } finally {
     sessionOpLock = false;
   }
 
-  sendJson(res, 200, { status: "renamed", sessionId: sanitizedName, name: sanitizedName });
+  sendJson(res, 200, { status: "renamed", sessionId, name });
 };
 
 const handleDeleteSession = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -1815,6 +1830,11 @@ const handleDeleteSession = async (req: IncomingMessage, res: ServerResponse): P
 
   await unlink(targetPath);
   await clearSessionSnapshot(sessionId);
+  const sessionNames = await readSessionNames();
+  if (sessionNames[sessionId] !== undefined) {
+    delete sessionNames[sessionId];
+    await writeSessionNames(sessionNames);
+  }
   sendJson(res, 200, { status: "deleted", sessionId });
 };
 
