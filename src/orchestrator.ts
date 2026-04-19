@@ -5,7 +5,9 @@ import { copyFile, mkdir, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import Docker from "dockerode";
+import { refreshClaudeCodeToken, writeCredentialsFile } from "./claude-auth";
 import { createLogger } from "./logger";
+import { readClaudeCodeToken } from "./oauth";
 import type {
   AdapterType,
   GhostApiKey,
@@ -27,6 +29,7 @@ import { commitVault, getVaultPath, initVault, mergeVaults } from "./vault";
 const defaultImageName = "ghostbox-agent";
 const defaultProvider = "anthropic";
 const getGhostPiAgentPath = (name: string): string => join(getHomeDirectory(), ".ghostbox", "ghosts", name, "pi-agent");
+const getGhostClaudeConfigPath = (name: string): string => join(getVaultPath(name), ".claude");
 const getSharedPiAgentPath = (): string => join(getHomeDirectory(), ".pi", "agent");
 const getBasePath = (): string => join(getHomeDirectory(), ".ghostbox", "base");
 const getBaseExtensionsPath = (): string => join(getBasePath(), "extensions");
@@ -338,6 +341,32 @@ const inferAdapterFromProvider = (provider: string): AdapterType => {
   return provider === "anthropic" ? "claude-code" : "pi";
 };
 
+const writeClaudeMcpConfig = async (path: string): Promise<void> => {
+  const payload = {
+    mcpServers: {
+      ghostbox: {
+        command: "node",
+        args: ["/ghostbox-mcp-server.js"]
+      }
+    }
+  };
+
+  await writeFile(path, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+};
+
+const ensureClaudeCodeRuntimeFiles = async (name: string): Promise<void> => {
+  const record = await readClaudeCodeToken();
+  if (!record) {
+    throw new Error("Run ghostbox login claude-code first.");
+  }
+
+  const refreshed = await refreshClaudeCodeToken(record);
+  const claudeConfigPath = getGhostClaudeConfigPath(name);
+  await mkdir(claudeConfigPath, { recursive: true, mode: 0o700 });
+  await writeCredentialsFile(join(claudeConfigPath, ".credentials.json"), refreshed);
+  await writeClaudeMcpConfig(join(claudeConfigPath, ".mcp.json"));
+};
+
 const normalizeGhostState = (
   ghost: GhostState | (Omit<GhostState, "apiKeys"> & { apiKeys?: GhostApiKey[] })
 ): GhostState => {
@@ -522,27 +551,31 @@ const startGhostContainer = async (
     `${baseExtensionsPath}:/root/.pi/agent/extensions:ro`
   ];
 
-  if (existsSync(sharedAuthPath)) {
+  if (ghost.adapter !== "claude-code" && existsSync(sharedAuthPath)) {
     binds.push(`${sharedAuthPath}:/root/.pi/agent/auth.json:rw`);
   }
+
+  const env = [
+    `GHOSTBOX_MODEL=${fullModel}`,
+    `GHOSTBOX_SYSTEM_PROMPT=${systemPrompt || ""}`,
+    `GHOSTBOX_GHOST_NAME=${name}`,
+    `GHOSTBOX_GITHUB_TOKEN=${state.config.githubToken || ""}`,
+    `GHOSTBOX_GITHUB_REMOTE=${state.config.githubRemote || ""}`,
+    `GHOSTBOX_HOST_BASE_PORT=${ghost.portBase}`,
+    getGhostboxApiPortEnv(),
+    `GHOSTBOX_USER_PORTS=8001-8009`,
+    `GHOSTBOX_OBSERVER_MODEL=${state.config.observerModel || ""}`,
+    getGhostboxApiKeysEnv(ghost),
+    getGhostNudgeKeyEnv(ghost),
+    `GHOSTBOX_ADAPTER=${ghost.adapter ?? inferAdapterFromProvider(ghost.provider)}`,
+    ...(ghost.adapter === "claude-code" ? ["CLAUDE_CONFIG_DIR=/vault/.claude"] : [])
+  ];
 
   try {
     const container = await docker.createContainer({
       Image: state.config.imageName || defaultImageName,
       name: `ghostbox-${name}`,
-      Env: [
-        `GHOSTBOX_MODEL=${fullModel}`,
-        `GHOSTBOX_SYSTEM_PROMPT=${systemPrompt || ""}`,
-        `GHOSTBOX_GHOST_NAME=${name}`,
-        `GHOSTBOX_GITHUB_TOKEN=${state.config.githubToken || ""}`,
-        `GHOSTBOX_GITHUB_REMOTE=${state.config.githubRemote || ""}`,
-        `GHOSTBOX_HOST_BASE_PORT=${ghost.portBase}`,
-        getGhostboxApiPortEnv(),
-        `GHOSTBOX_USER_PORTS=8001-8009`,
-        `GHOSTBOX_OBSERVER_MODEL=${state.config.observerModel || ""}`,
-        getGhostboxApiKeysEnv(ghost),
-        getGhostNudgeKeyEnv(ghost)
-      ],
+      Env: env,
       ExposedPorts: buildExposedPorts(),
       HostConfig: {
         Binds: binds,
@@ -772,12 +805,18 @@ export const spawnGhost = async (
     portBase,
     model: resolvedModel.model,
     provider: resolvedModel.provider,
+    adapter: resolvedModel.provider === "anthropic" ? "claude-code" : "pi",
     imageVersion: "",
     status: "running",
     createdAt: new Date().toISOString(),
     systemPrompt: systemPrompt ?? null,
     apiKeys: [createGhostApiKey("default")]
   };
+
+  if (ghost.adapter === "claude-code") {
+    await ensureClaudeCodeRuntimeFiles(name);
+  }
+
   const containerId = await startGhostContainer(state, name, ghost, resolvedModel.fullModel, systemPrompt, "spawn");
 
   ghost.containerId = containerId;
@@ -831,6 +870,10 @@ export const wakeGhost = async (name: string): Promise<void> => {
   await ensureGhostPiAgent(name);
   await ensureBaseExtensions();
 
+  if ((ghost.adapter ?? inferAdapterFromProvider(ghost.provider)) === "claude-code") {
+    await ensureClaudeCodeRuntimeFiles(name);
+  }
+
   const resolvedModel = resolveProviderModel(ghost.provider, ghost.model, state.config.defaultProvider);
   const containerId = await startGhostContainer(
     state,
@@ -848,6 +891,13 @@ export const wakeGhost = async (name: string): Promise<void> => {
 };
 
 const refreshGhostAuth = async (name: string): Promise<void> => {
+  const state = await loadState();
+  const ghost = getGhostFromState(state, name);
+  if ((ghost.adapter ?? inferAdapterFromProvider(ghost.provider)) === "claude-code") {
+    await ensureClaudeCodeRuntimeFiles(name);
+    return;
+  }
+
   const ghostPiPath = getGhostPiAgentPath(name);
   await mkdir(ghostPiPath, { recursive: true });
 

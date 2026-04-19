@@ -1,5 +1,6 @@
 import { autoRetry } from "@grammyjs/auto-retry";
 import { Bot } from "grammy";
+import { startClaudeTokenRefresher } from "./claude-auth";
 import { createLogger } from "./logger";
 import {
   killGhost,
@@ -83,6 +84,7 @@ const getActiveGhostForChat = async (chatId: string): Promise<string | null> => 
 };
 
 export const startBot = async (token: string): Promise<void> => {
+  startClaudeTokenRefresher();
   const bot = new Bot(token);
   bot.api.config.use(autoRetry());
 

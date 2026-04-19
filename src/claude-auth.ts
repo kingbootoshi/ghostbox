@@ -1,13 +1,16 @@
 import { spawn as nodeSpawn } from "node:child_process";
-import { mkdir, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { createLogger } from "./logger";
 import { readAuthTokens, writeAuthTokens } from "./oauth";
 import type { AuthTokenStore, ClaudeCodeTokenRecord } from "./types";
+import { getHomeDirectory } from "./utils";
 
 const SETUP_TOKEN_PATTERN = /sk-ant-[^\s"'`]+/g;
 const EXPIRY_WARNING_BUFFER_MS = 5 * 60 * 1000;
+const CLAUDE_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const log = createLogger("claude-auth");
+let claudeTokenRefresherStarted = false;
 
 type ClaudeCredentialEnvelope = {
   claudeAiOauth?: {
@@ -170,4 +173,109 @@ export async function writeCredentialsFile(path: string, record: ClaudeCodeToken
     mode: 0o600
   });
   await rename(tempPath, path);
+  await chmod(path, 0o600);
+}
+
+const getStatePath = (): string => {
+  return join(getHomeDirectory(), ".ghostbox", "state.json");
+};
+
+const getGhostCredentialsPath = (ghostName: string): string => {
+  return join(getHomeDirectory(), ".ghostbox", "ghosts", ghostName, "vault", ".claude", ".credentials.json");
+};
+
+const inferAdapter = (provider: string | undefined, adapter: string | undefined): "pi" | "claude-code" => {
+  if (adapter === "pi" || adapter === "claude-code") {
+    return adapter;
+  }
+
+  return provider === "anthropic" ? "claude-code" : "pi";
+};
+
+type RefreshableGhostState = {
+  status?: unknown;
+  provider?: unknown;
+  adapter?: unknown;
+};
+
+type RefreshableGhostboxState = {
+  ghosts?: Record<string, RefreshableGhostState>;
+};
+
+const syncRunningGhostCredentials = async (record: ClaudeCodeTokenRecord): Promise<void> => {
+  let rawState = "";
+
+  try {
+    rawState = await readFile(getStatePath(), "utf8");
+  } catch {
+    return;
+  }
+
+  let state: RefreshableGhostboxState;
+  try {
+    state = JSON.parse(rawState) as RefreshableGhostboxState;
+  } catch {
+    return;
+  }
+
+  const ghosts = state.ghosts ?? {};
+  const syncJobs = Object.entries(ghosts)
+    .filter(([, ghost]) => {
+      const status = typeof ghost.status === "string" ? ghost.status : "";
+      const provider = typeof ghost.provider === "string" ? ghost.provider : undefined;
+      const adapter = typeof ghost.adapter === "string" ? ghost.adapter : undefined;
+      return status === "running" && inferAdapter(provider, adapter) === "claude-code";
+    })
+    .map(async ([name]) => {
+      const credentialsPath = getGhostCredentialsPath(name);
+      await writeCredentialsFile(credentialsPath, record);
+    });
+
+  await Promise.all(syncJobs);
+};
+
+export function startClaudeTokenRefresher(): void {
+  if (claudeTokenRefresherStarted) {
+    return;
+  }
+
+  claudeTokenRefresherStarted = true;
+
+  const tick = async (): Promise<void> => {
+    try {
+      const store = await readAuthTokens();
+      const current = store.claudeCode;
+      if (!current) {
+        return;
+      }
+
+      const refreshed = await refreshClaudeCodeToken(current);
+      const currentFingerprint = JSON.stringify(current);
+      const refreshedFingerprint = JSON.stringify(refreshed);
+
+      if (currentFingerprint === refreshedFingerprint) {
+        return;
+      }
+
+      const nextStore: AuthTokenStore = {
+        ...store,
+        claudeCode: refreshed
+      };
+
+      await writeAuthTokens(nextStore);
+      await syncRunningGhostCredentials(refreshed);
+    } catch (error) {
+      log.warn(
+        {
+          error: error instanceof Error ? error.message : String(error)
+        },
+        "Claude Code token refresh tick failed"
+      );
+    }
+  };
+
+  void tick();
+  setInterval(() => {
+    void tick();
+  }, CLAUDE_REFRESH_INTERVAL_MS);
 }

@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { startClaudeTokenRefresher } from "./claude-auth";
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
@@ -829,6 +830,7 @@ const __apiDirname = dirname(__apiFilename);
 if (import.meta.main || process.argv[1] === __apiFilename) {
   const webDir = resolve(__apiDirname, "..", "web");
   await ensureApiAdminToken();
+  startClaudeTokenRefresher();
 
   const handler = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);

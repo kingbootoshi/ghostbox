@@ -6,7 +6,7 @@ import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { checkbox, confirm, select } from "@inquirer/prompts";
 import chalk from "chalk";
-import { loginClaudeCode } from "./claude-auth";
+import { loginClaudeCode, startClaudeTokenRefresher } from "./claude-auth";
 import { createLogger } from "./logger";
 import { getAuthStatus, loginProvider } from "./oauth";
 import {
@@ -1244,6 +1244,7 @@ const remote = async (args: string[]): Promise<void> => {
 const bot = async (): Promise<void> => {
   const state = await loadState();
   log.info("Running bot pre-flight checks");
+  startClaudeTokenRefresher();
 
   const dockerCheck = await runCommandCapture("docker", ["info"]);
   if (dockerCheck.exitCode !== 0) {
