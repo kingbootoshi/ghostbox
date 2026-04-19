@@ -1,6 +1,6 @@
 FROM node:22-slim
 
-RUN npm install -g @mariozechner/pi-coding-agent@latest && \
+RUN npm install -g @mariozechner/pi-coding-agent@latest @anthropic-ai/claude-code@2.1.114 && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
       git \
@@ -30,10 +30,13 @@ RUN ln -s /usr/local/lib/node_modules/@mariozechner/pi-coding-agent/node_modules
       /root/.pi/agent/extensions/subagent
 
 COPY agents/ /opt/ghostbox/agents/
+COPY skills/ghostbox-api/SKILL.md /opt/ghostbox/skills/ghostbox-api/SKILL.md
 
 # auth.json is mounted at runtime and not baked into the image.
 
 COPY ghost-server.js /ghost-server.js
+COPY ghost-server-claude.js /ghost-server-claude.js
+COPY ghostbox-mcp-server.js /ghostbox-mcp-server.js
 COPY entrypoint.sh /entrypoint.sh
 COPY ghost-save /usr/local/bin/ghost-save
 COPY ghost-changelog /usr/local/bin/ghost-changelog

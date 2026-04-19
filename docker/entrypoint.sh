@@ -34,4 +34,10 @@ if [ -d /opt/ghostbox/agents ]; then
   done
 fi
 
+if [ "${GHOSTBOX_ADAPTER:-pi}" = "claude-code" ]; then
+  mkdir -p /vault/.claude
+  chmod 700 /vault/.claude
+  exec node /ghost-server-claude.js
+fi
+
 exec node /ghost-server.js

@@ -38,13 +38,16 @@ export const computeImageVersion = (dockerDir: string): string => {
   const resolvedDockerDir = dockerDir.startsWith("/") ? dockerDir : join(process.cwd(), dockerDir);
   const files = [
     "ghost-server.js",
+    "ghost-server-claude.js",
+    "ghostbox-mcp-server.js",
     "Dockerfile",
     "entrypoint.sh",
     "ghost-changelog",
     "ghost-nudge",
     "qmd",
     "ghost-save",
-    "exa-search"
+    "exa-search",
+    "skills/ghostbox-api/SKILL.md"
   ];
   const contents = files.map((file) => readFileSync(join(resolvedDockerDir, file), "utf8")).join("");
   const hash = createHash("sha256").update(contents).digest("hex");
