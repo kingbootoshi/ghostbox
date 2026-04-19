@@ -5,7 +5,6 @@ import {
   readFile,
   readdir,
   rename,
-  rm,
   stat,
   unlink,
   writeFile
@@ -39,7 +38,7 @@ const MEMORY_PATH = "/vault/MEMORY.md";
 const USER_PATH = "/vault/USER.md";
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const MEMORY_BLOCK_PLACEHOLDER = "<!-- GHOSTBOX_MEMORY_BLOCKS -->";
+const SNAPSHOT_SUFFIX = ".snapshot.txt";
 const FLUSH_MEMORY_TIMEOUT_MS = 60_000;
 const DISALLOWED_NATIVE_TOOLS =
   "ScheduleWakeup CronCreate CronList CronDelete RemoteTrigger PushNotification";
@@ -77,6 +76,8 @@ type ActiveTurn = {
   buffer: string;
   finished: boolean;
   pendingResultSessionId: string | null;
+  snapshotPrompt: string;
+  snapshotPersisted: boolean;
 };
 
 type ClaudeResultUsage = {
@@ -333,6 +334,10 @@ const getSessionFilePath = (sessionId: string): string => {
   return join(CLAUDE_PROJECTS_DIR, `${sessionId}.jsonl`);
 };
 
+const getSnapshotPath = (sessionId: string): string => {
+  return join(CLAUDE_PROJECTS_DIR, `${sessionId}${SNAPSHOT_SUFFIX}`);
+};
+
 const readJsonLines = async (path: string): Promise<JsonRecord[]> => {
   const content = await readFile(path, "utf8");
   const lines = content
@@ -425,23 +430,59 @@ const buildMemoryBlocks = async (): Promise<string> => {
   return blocks.join("\n\n");
 };
 
-const buildAppendSystemPrompt = async (): Promise<string> => {
+const buildStaticAppendSystemPrompt = async (): Promise<string> => {
+  const skillText = (await readFileText(GHOSTBOX_SKILL_PATH)).trim();
+  return `${[getBaseSystemPrompt(), skillText].filter((part) => part.length > 0).join("\n\n")}\n`;
+};
+
+const buildSessionSnapshot = async (): Promise<string> => {
   const staticPrompt = await readFileText(CLAUDE_APPEND_PROMPT_PATH);
   const memoryBlocks = await buildMemoryBlocks();
-  const replacement = memoryBlocks.length > 0 ? `${memoryBlocks}\n\n` : "";
-  return staticPrompt.replace(`${MEMORY_BLOCK_PLACEHOLDER}\n\n`, replacement).replace(MEMORY_BLOCK_PLACEHOLDER, "");
+  return memoryBlocks.length > 0 ? `${staticPrompt.trimEnd()}\n\n${memoryBlocks}` : staticPrompt;
+};
+
+const persistSessionSnapshot = async (sessionId: string, snapshot: string): Promise<void> => {
+  await writeFile(getSnapshotPath(sessionId), snapshot, { encoding: "utf8", mode: 0o600 });
+};
+
+const ensureSessionSnapshot = async (sessionId: string | null): Promise<string> => {
+  if (sessionId) {
+    const snapshotPath = getSnapshotPath(sessionId);
+    if (await fileExists(snapshotPath)) {
+      return await readFile(snapshotPath, "utf8");
+    }
+
+    const snapshot = await buildSessionSnapshot();
+    await persistSessionSnapshot(sessionId, snapshot);
+    return snapshot;
+  }
+
+  return await buildSessionSnapshot();
+};
+
+const rebuildSessionSnapshot = async (sessionId: string | null): Promise<string> => {
+  const snapshot = await buildSessionSnapshot();
+  if (sessionId) {
+    await persistSessionSnapshot(sessionId, snapshot);
+  }
+  return snapshot;
+};
+
+const clearSessionSnapshot = async (sessionId: string | null): Promise<void> => {
+  if (!sessionId) {
+    return;
+  }
+
+  await unlink(getSnapshotPath(sessionId)).catch(() => {});
 };
 
 const ensureClaudeSupportFiles = async (): Promise<void> => {
   await mkdir(CLAUDE_CONFIG_DIR, { recursive: true, mode: 0o700 });
   await mkdir(CLAUDE_PROJECTS_DIR, { recursive: true, mode: 0o700 });
 
-  if (!(await fileExists(CLAUDE_APPEND_PROMPT_PATH))) {
-    const skillText = await readFileText(GHOSTBOX_SKILL_PATH);
-    const promptParts = [getBaseSystemPrompt(), MEMORY_BLOCK_PLACEHOLDER, skillText.trim()].filter(
-      (part) => part.length > 0
-    );
-    await writeFile(CLAUDE_APPEND_PROMPT_PATH, `${promptParts.join("\n\n")}\n`, "utf8");
+  const baselinePrompt = await buildStaticAppendSystemPrompt();
+  if ((await readFileText(CLAUDE_APPEND_PROMPT_PATH)) !== baselinePrompt) {
+    await writeFile(CLAUDE_APPEND_PROMPT_PATH, baselinePrompt, { encoding: "utf8", mode: 0o600 });
   }
 
   if (!(await fileExists(CLAUDE_MCP_CONFIG_PATH))) {
@@ -789,6 +830,16 @@ const createStreamState = (): StreamState => ({
   emittedAssistantForBlock: false
 });
 
+const persistPendingSessionSnapshot = async (sessionId: string | null): Promise<void> => {
+  const turn = activeTurn;
+  if (!turn || turn.snapshotPersisted || !sessionId) {
+    return;
+  }
+
+  await persistSessionSnapshot(sessionId, turn.snapshotPrompt);
+  turn.snapshotPersisted = true;
+};
+
 const applyResultUsage = (line: JsonRecord): void => {
   const usageRecord = isRecord(line.usage) ? line.usage : null;
   const inputTokens =
@@ -820,6 +871,12 @@ const handleClaudeStreamLine = (res: ServerResponse, line: JsonRecord, state: St
   const sessionId = extractSessionId(line);
   if (sessionId) {
     currentSessionId = sessionId;
+    void persistPendingSessionSnapshot(sessionId).catch((error) => {
+      log("ERROR", "Failed to persist session snapshot", {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
   }
 
   if (eventName === "system/init") {
@@ -934,11 +991,15 @@ const handleClaudeStreamLine = (res: ServerResponse, line: JsonRecord, state: St
   }
 };
 
-const buildClaudeArgs = async (messages: string[]): Promise<string[]> => {
+const buildClaudeArgs = async (
+  messages: string[]
+): Promise<{ args: string[]; snapshotPrompt: string; snapshotPersisted: boolean }> => {
   await ensureClaudeSupportFiles();
+  const resumeSessionId = currentSessionId && (await sessionFileExists(currentSessionId)) ? currentSessionId : null;
+  const snapshotPrompt = await ensureSessionSnapshot(resumeSessionId);
 
   const args = [
-    ...(currentSessionId && (await sessionFileExists(currentSessionId)) ? ["--resume", currentSessionId] : []),
+    ...(resumeSessionId ? ["--resume", resumeSessionId] : []),
     "--model",
     currentModel,
     "--input-format",
@@ -947,7 +1008,7 @@ const buildClaudeArgs = async (messages: string[]): Promise<string[]> => {
     "stream-json",
     "--verbose",
     "--append-system-prompt",
-    await buildAppendSystemPrompt(),
+    snapshotPrompt,
     "--mcp-config",
     CLAUDE_MCP_CONFIG_PATH,
     "--disallowedTools",
@@ -959,7 +1020,11 @@ const buildClaudeArgs = async (messages: string[]): Promise<string[]> => {
     throw new Error("No user messages to send.");
   }
 
-  return args;
+  return {
+    args,
+    snapshotPrompt,
+    snapshotPersisted: resumeSessionId !== null
+  };
 };
 
 const startHeartbeat = (res: ServerResponse): ReturnType<typeof setInterval> => {
@@ -1079,7 +1144,7 @@ const flushMemories = async (reason: string): Promise<void> => {
 };
 
 const spawnClaudeMessage = async (res: ServerResponse, messages: string[]): Promise<void> => {
-  const args = await buildClaudeArgs(messages);
+  const { args, snapshotPrompt, snapshotPersisted } = await buildClaudeArgs(messages);
   const child = nodeSpawn("claude", args, {
     cwd: "/vault",
     env: {
@@ -1096,7 +1161,9 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: string[]): Prom
     heartbeat: startHeartbeat(res),
     buffer: "",
     finished: false,
-    pendingResultSessionId: null
+    pendingResultSessionId: null,
+    snapshotPrompt,
+    snapshotPersisted
   };
 
   child.stderr.on("data", (chunk: Buffer) => {
@@ -1155,7 +1222,7 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: string[]): Prom
     clearActiveTurn();
   });
 
-  child.on("close", (code) => {
+  child.on("close", async (code) => {
     if (activeTurn) {
       activeTurn.buffer += stdoutDecoder.end();
     }
@@ -1172,6 +1239,13 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: string[]): Prom
         });
       }
     }
+
+    await persistPendingSessionSnapshot(currentSessionId).catch((error) => {
+      log("ERROR", "Failed to persist final session snapshot", {
+        sessionId: currentSessionId ?? "",
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
 
     if (activeTurn?.heartbeat) {
       clearInterval(activeTurn.heartbeat);
@@ -1217,6 +1291,7 @@ const runCompactCommand = async (): Promise<string> => {
   }
 
   await nudges.emit("pre-compact", "compact");
+  await rebuildSessionSnapshot(currentSessionId);
   await ensureClaudeSupportFiles();
 
   return new Promise((resolve, reject) => {
@@ -1366,8 +1441,10 @@ const handleSlashCommand = async (
 
   if (slash.command === "new") {
     await nudges.emit("pre-new-session", "slash-command");
+    await clearSessionSnapshot(currentSessionId);
     currentSessionId = null;
     queue.messages = [];
+    latestStats = null;
     sendAssistantResult(res, "New session started.", "");
     return true;
   }
@@ -1566,6 +1643,7 @@ const handleCompact = async (res: ServerResponse): Promise<void> => {
 
 const handleNew = async (res: ServerResponse): Promise<void> => {
   await nudges.emit("pre-new-session", "api");
+  await clearSessionSnapshot(currentSessionId);
   currentSessionId = null;
   queue.messages = [];
   latestStats = null;
@@ -1698,6 +1776,7 @@ const handleDeleteSession = async (req: IncomingMessage, res: ServerResponse): P
   }
 
   await unlink(targetPath);
+  await clearSessionSnapshot(sessionId);
   sendJson(res, 200, { status: "deleted", sessionId });
 };
 

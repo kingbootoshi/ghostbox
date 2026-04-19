@@ -25,7 +25,7 @@ var MEMORY_PATH = "/vault/MEMORY.md";
 var USER_PATH = "/vault/USER.md";
 var HEARTBEAT_INTERVAL_MS = 30000;
 var SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-var MEMORY_BLOCK_PLACEHOLDER = "<!-- GHOSTBOX_MEMORY_BLOCKS -->";
+var SNAPSHOT_SUFFIX = ".snapshot.txt";
 var FLUSH_MEMORY_TIMEOUT_MS = 60000;
 var DISALLOWED_NATIVE_TOOLS = "ScheduleWakeup CronCreate CronList CronDelete RemoteTrigger PushNotification";
 var defaultSystemPrompt = 'You are a ghost agent. Your vault at /vault is your persistent memory. Use memory_write to save facts (target "memory" for notes, target "user" for user profile). Use memory_show to check your current memory. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
@@ -193,6 +193,9 @@ var sanitizeSessionName = (name) => {
 var getSessionFilePath = (sessionId) => {
   return join(CLAUDE_PROJECTS_DIR, `${sessionId}.jsonl`);
 };
+var getSnapshotPath = (sessionId) => {
+  return join(CLAUDE_PROJECTS_DIR, `${sessionId}${SNAPSHOT_SUFFIX}`);
+};
 var readJsonLines = async (path) => {
   const content = await readFile(path, "utf8");
   const lines = content.split(`
@@ -265,26 +268,54 @@ var buildMemoryBlocks = async () => {
 
 `);
 };
-var buildAppendSystemPrompt = async () => {
+var buildStaticAppendSystemPrompt = async () => {
+  const skillText = (await readFileText(GHOSTBOX_SKILL_PATH)).trim();
+  return `${[getBaseSystemPrompt(), skillText].filter((part) => part.length > 0).join(`
+
+`)}
+`;
+};
+var buildSessionSnapshot = async () => {
   const staticPrompt = await readFileText(CLAUDE_APPEND_PROMPT_PATH);
   const memoryBlocks = await buildMemoryBlocks();
-  const replacement = memoryBlocks.length > 0 ? `${memoryBlocks}
+  return memoryBlocks.length > 0 ? `${staticPrompt.trimEnd()}
 
-` : "";
-  return staticPrompt.replace(`${MEMORY_BLOCK_PLACEHOLDER}
-
-`, replacement).replace(MEMORY_BLOCK_PLACEHOLDER, "");
+${memoryBlocks}` : staticPrompt;
+};
+var persistSessionSnapshot = async (sessionId, snapshot) => {
+  await writeFile(getSnapshotPath(sessionId), snapshot, { encoding: "utf8", mode: 384 });
+};
+var ensureSessionSnapshot = async (sessionId) => {
+  if (sessionId) {
+    const snapshotPath = getSnapshotPath(sessionId);
+    if (await fileExists(snapshotPath)) {
+      return await readFile(snapshotPath, "utf8");
+    }
+    const snapshot = await buildSessionSnapshot();
+    await persistSessionSnapshot(sessionId, snapshot);
+    return snapshot;
+  }
+  return await buildSessionSnapshot();
+};
+var rebuildSessionSnapshot = async (sessionId) => {
+  const snapshot = await buildSessionSnapshot();
+  if (sessionId) {
+    await persistSessionSnapshot(sessionId, snapshot);
+  }
+  return snapshot;
+};
+var clearSessionSnapshot = async (sessionId) => {
+  if (!sessionId) {
+    return;
+  }
+  await unlink(getSnapshotPath(sessionId)).catch(() => {});
 };
 var ensureClaudeSupportFiles = async () => {
   await mkdir(CLAUDE_CONFIG_DIR, { recursive: true, mode: 448 });
   await mkdir(CLAUDE_PROJECTS_DIR, { recursive: true, mode: 448 });
-  if (!await fileExists(CLAUDE_APPEND_PROMPT_PATH)) {
-    const skillText = await readFileText(GHOSTBOX_SKILL_PATH);
-    const promptParts = [getBaseSystemPrompt(), MEMORY_BLOCK_PLACEHOLDER, skillText.trim()].filter((part) => part.length > 0);
-    await writeFile(CLAUDE_APPEND_PROMPT_PATH, `${promptParts.join(`
-
-`)}
-`, "utf8");
+  const baselinePrompt = await buildStaticAppendSystemPrompt();
+  if (await readFileText(CLAUDE_APPEND_PROMPT_PATH) !== baselinePrompt) {
+    await writeFile(CLAUDE_APPEND_PROMPT_PATH, baselinePrompt, { encoding: "utf8", mode: 384 });
   }
   if (!await fileExists(CLAUDE_MCP_CONFIG_PATH)) {
     const payload = {
@@ -556,6 +587,14 @@ var createStreamState = () => ({
   currentToolInputValue: null,
   emittedAssistantForBlock: false
 });
+var persistPendingSessionSnapshot = async (sessionId) => {
+  const turn = activeTurn;
+  if (!turn || turn.snapshotPersisted || !sessionId) {
+    return;
+  }
+  await persistSessionSnapshot(sessionId, turn.snapshotPrompt);
+  turn.snapshotPersisted = true;
+};
 var applyResultUsage = (line) => {
   const usageRecord = isRecord(line.usage) ? line.usage : null;
   const inputTokens = getNumber(usageRecord?.input_tokens) ?? getNumber(usageRecord?.inputTokens) ?? getNumber(usageRecord?.prompt_tokens) ?? 0;
@@ -577,6 +616,12 @@ var handleClaudeStreamLine = (res, line, state) => {
   const sessionId = extractSessionId(line);
   if (sessionId) {
     currentSessionId = sessionId;
+    persistPendingSessionSnapshot(sessionId).catch((error) => {
+      log("ERROR", "Failed to persist session snapshot", {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
   }
   if (eventName === "system/init") {
     return;
@@ -673,8 +718,10 @@ var handleClaudeStreamLine = (res, line, state) => {
 };
 var buildClaudeArgs = async (messages) => {
   await ensureClaudeSupportFiles();
+  const resumeSessionId = currentSessionId && await sessionFileExists(currentSessionId) ? currentSessionId : null;
+  const snapshotPrompt = await ensureSessionSnapshot(resumeSessionId);
   const args = [
-    ...currentSessionId && await sessionFileExists(currentSessionId) ? ["--resume", currentSessionId] : [],
+    ...resumeSessionId ? ["--resume", resumeSessionId] : [],
     "--model",
     currentModel,
     "--input-format",
@@ -683,7 +730,7 @@ var buildClaudeArgs = async (messages) => {
     "stream-json",
     "--verbose",
     "--append-system-prompt",
-    await buildAppendSystemPrompt(),
+    snapshotPrompt,
     "--mcp-config",
     CLAUDE_MCP_CONFIG_PATH,
     "--disallowedTools",
@@ -693,7 +740,11 @@ var buildClaudeArgs = async (messages) => {
   if (messages.length === 0) {
     throw new Error("No user messages to send.");
   }
-  return args;
+  return {
+    args,
+    snapshotPrompt,
+    snapshotPersisted: resumeSessionId !== null
+  };
 };
 var startHeartbeat = (res) => {
   return setInterval(() => {
@@ -795,7 +846,7 @@ var flushMemories = async (reason) => {
   }
 };
 var spawnClaudeMessage = async (res, messages) => {
-  const args = await buildClaudeArgs(messages);
+  const { args, snapshotPrompt, snapshotPersisted } = await buildClaudeArgs(messages);
   const child = nodeSpawn("claude", args, {
     cwd: "/vault",
     env: {
@@ -811,7 +862,9 @@ var spawnClaudeMessage = async (res, messages) => {
     heartbeat: startHeartbeat(res),
     buffer: "",
     finished: false,
-    pendingResultSessionId: null
+    pendingResultSessionId: null,
+    snapshotPrompt,
+    snapshotPersisted
   };
   child.stderr.on("data", (chunk) => {
     process.stderr.write(chunk);
@@ -864,7 +917,7 @@ var spawnClaudeMessage = async (res, messages) => {
     }
     clearActiveTurn();
   });
-  child.on("close", (code) => {
+  child.on("close", async (code) => {
     if (activeTurn) {
       activeTurn.buffer += stdoutDecoder.end();
     }
@@ -880,6 +933,12 @@ var spawnClaudeMessage = async (res, messages) => {
         });
       }
     }
+    await persistPendingSessionSnapshot(currentSessionId).catch((error) => {
+      log("ERROR", "Failed to persist final session snapshot", {
+        sessionId: currentSessionId ?? "",
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
     if (activeTurn?.heartbeat) {
       clearInterval(activeTurn.heartbeat);
     }
@@ -918,6 +977,7 @@ var runCompactCommand = async () => {
     throw new Error("No active session to compact.");
   }
   await nudges.emit("pre-compact", "compact");
+  await rebuildSessionSnapshot(currentSessionId);
   await ensureClaudeSupportFiles();
   return new Promise((resolve, reject) => {
     const args = [
@@ -1040,8 +1100,10 @@ var handleSlashCommand = async (res, prompt) => {
   }
   if (slash.command === "new") {
     await nudges.emit("pre-new-session", "slash-command");
+    await clearSessionSnapshot(currentSessionId);
     currentSessionId = null;
     queue.messages = [];
+    latestStats = null;
     sendAssistantResult(res, "New session started.", "");
     return true;
   }
@@ -1209,6 +1271,7 @@ var handleCompact = async (res) => {
 };
 var handleNew = async (res) => {
   await nudges.emit("pre-new-session", "api");
+  await clearSessionSnapshot(currentSessionId);
   currentSessionId = null;
   queue.messages = [];
   latestStats = null;
@@ -1316,6 +1379,7 @@ var handleDeleteSession = async (req, res) => {
     return;
   }
   await unlink(targetPath);
+  await clearSessionSnapshot(sessionId);
   sendJson(res, 200, { status: "deleted", sessionId });
 };
 var handleSchedules = async (req, res) => {
