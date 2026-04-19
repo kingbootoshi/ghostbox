@@ -11,3 +11,4 @@ Available tools:
 - `mcp__ghostbox__memory_show` - inspect current memory contents and usage
 
 Use these tools directly when you need mailbox, scheduling, or warm-memory operations.
+Scheduling: use `mcp__ghostbox__schedule` exclusively. Native `ScheduleWakeup` and `CronCreate` are denied in this environment and will not persist past the current subprocess.

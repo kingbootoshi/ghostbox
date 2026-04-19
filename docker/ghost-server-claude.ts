@@ -950,6 +950,8 @@ const buildClaudeArgs = async (messages: string[]): Promise<string[]> => {
     await buildAppendSystemPrompt(),
     "--mcp-config",
     CLAUDE_MCP_CONFIG_PATH,
+    "--disallowedTools",
+    DISALLOWED_NATIVE_TOOLS,
     "--dangerously-skip-permissions"
   ];
 
@@ -1230,7 +1232,9 @@ const runCompactCommand = async (): Promise<string> => {
       "15",
       "--dangerously-skip-permissions",
       "--mcp-config",
-      CLAUDE_MCP_CONFIG_PATH
+      CLAUDE_MCP_CONFIG_PATH,
+      "--disallowedTools",
+      DISALLOWED_NATIVE_TOOLS
     ];
 
     const child = nodeSpawn("claude", args, {

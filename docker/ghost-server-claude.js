@@ -686,6 +686,8 @@ var buildClaudeArgs = async (messages) => {
     await buildAppendSystemPrompt(),
     "--mcp-config",
     CLAUDE_MCP_CONFIG_PATH,
+    "--disallowedTools",
+    DISALLOWED_NATIVE_TOOLS,
     "--dangerously-skip-permissions"
   ];
   if (messages.length === 0) {
@@ -930,7 +932,9 @@ var runCompactCommand = async () => {
       "15",
       "--dangerously-skip-permissions",
       "--mcp-config",
-      CLAUDE_MCP_CONFIG_PATH
+      CLAUDE_MCP_CONFIG_PATH,
+      "--disallowedTools",
+      DISALLOWED_NATIVE_TOOLS
     ];
     const child = nodeSpawn("claude", args, {
       cwd: "/vault",
