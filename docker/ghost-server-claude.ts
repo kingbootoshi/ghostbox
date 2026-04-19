@@ -1142,6 +1142,30 @@ let latestStats: ClaudeStatsSnapshot | null = null;
 
 await ensureClaudeSupportFiles();
 
+const recoverMostRecentSession = async (): Promise<void> => {
+  if (!(await fileExists(CLAUDE_PROJECTS_DIR))) {
+    return;
+  }
+  const entries = await readdir(CLAUDE_PROJECTS_DIR);
+  const sessionFiles = entries.filter((entry) => entry.endsWith(".jsonl"));
+  if (sessionFiles.length === 0) {
+    return;
+  }
+  let newest: { id: string; mtime: number } | null = null;
+  for (const entry of sessionFiles) {
+    const stats = await stat(join(CLAUDE_PROJECTS_DIR, entry));
+    const mtime = stats.mtime.getTime();
+    if (!newest || mtime > newest.mtime) {
+      newest = { id: basename(entry, ".jsonl"), mtime };
+    }
+  }
+  if (newest) {
+    currentSessionId = newest.id;
+  }
+};
+
+await recoverMostRecentSession();
+
 const handleMessage = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
   const body = await parseJsonBodyOrRespond<RequestBodyMessage>(req, res);
   if (body === undefined) {

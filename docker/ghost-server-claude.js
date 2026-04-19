@@ -849,6 +849,28 @@ var activeTurn = null;
 var queue = { messages: [] };
 var latestStats = null;
 await ensureClaudeSupportFiles();
+var recoverMostRecentSession = async () => {
+  if (!await fileExists(CLAUDE_PROJECTS_DIR)) {
+    return;
+  }
+  const entries = await readdir(CLAUDE_PROJECTS_DIR);
+  const sessionFiles = entries.filter((entry) => entry.endsWith(".jsonl"));
+  if (sessionFiles.length === 0) {
+    return;
+  }
+  let newest = null;
+  for (const entry of sessionFiles) {
+    const stats = await stat(join(CLAUDE_PROJECTS_DIR, entry));
+    const mtime = stats.mtime.getTime();
+    if (!newest || mtime > newest.mtime) {
+      newest = { id: basename(entry, ".jsonl"), mtime };
+    }
+  }
+  if (newest) {
+    currentSessionId = newest.id;
+  }
+};
+await recoverMostRecentSession();
 var handleMessage = async (req, res) => {
   const body = await parseJsonBodyOrRespond(req, res);
   if (body === undefined) {
