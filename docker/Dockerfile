@@ -1,6 +1,6 @@
 FROM node:22-slim
 
-RUN npm install -g @mariozechner/pi-coding-agent@latest @anthropic-ai/claude-code@2.1.114 && \
+RUN npm install -g @mariozechner/pi-coding-agent@latest @anthropic-ai/claude-code@2.1.114 @modelcontextprotocol/sdk@1.29.0 zod@3.25.76 && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
       git \
