@@ -354,7 +354,7 @@ const writeClaudeMcpConfig = async (path: string): Promise<void> => {
   await writeFile(path, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
 };
 
-const ensureClaudeCodeRuntimeFiles = async (name: string): Promise<void> => {
+const ensureClaudeCodeRuntimeFiles = async (name: string): Promise<string> => {
   const record = await readClaudeCodeToken();
   if (!record) {
     throw new Error("Run ghostbox login claude-code first.");
@@ -365,6 +365,7 @@ const ensureClaudeCodeRuntimeFiles = async (name: string): Promise<void> => {
   await mkdir(claudeConfigPath, { recursive: true, mode: 0o700 });
   await writeCredentialsFile(join(claudeConfigPath, ".credentials.json"), refreshed);
   await writeClaudeMcpConfig(join(claudeConfigPath, ".mcp.json"));
+  return refreshed.accessToken;
 };
 
 const normalizeGhostState = (
@@ -555,6 +556,7 @@ const startGhostContainer = async (
     binds.push(`${sharedAuthPath}:/root/.pi/agent/auth.json:rw`);
   }
 
+  const adapter = ghost.adapter ?? inferAdapterFromProvider(ghost.provider);
   const env = [
     `GHOSTBOX_MODEL=${fullModel}`,
     `GHOSTBOX_SYSTEM_PROMPT=${systemPrompt || ""}`,
@@ -567,9 +569,15 @@ const startGhostContainer = async (
     `GHOSTBOX_OBSERVER_MODEL=${state.config.observerModel || ""}`,
     getGhostboxApiKeysEnv(ghost),
     getGhostNudgeKeyEnv(ghost),
-    `GHOSTBOX_ADAPTER=${ghost.adapter ?? inferAdapterFromProvider(ghost.provider)}`,
-    ...(ghost.adapter === "claude-code" ? ["CLAUDE_CONFIG_DIR=/vault/.claude"] : [])
+    `GHOSTBOX_ADAPTER=${adapter}`
   ];
+
+  if (adapter === "claude-code") {
+    const claudeToken = await ensureClaudeCodeRuntimeFiles(name);
+    env.push("CLAUDE_CONFIG_DIR=/vault/.claude");
+    env.push(`CLAUDE_CODE_OAUTH_TOKEN=${claudeToken}`);
+    env.push("IS_SANDBOX=1");
+  }
 
   try {
     const container = await docker.createContainer({
@@ -813,10 +821,6 @@ export const spawnGhost = async (
     apiKeys: [createGhostApiKey("default")]
   };
 
-  if (ghost.adapter === "claude-code") {
-    await ensureClaudeCodeRuntimeFiles(name);
-  }
-
   const containerId = await startGhostContainer(state, name, ghost, resolvedModel.fullModel, systemPrompt, "spawn");
 
   ghost.containerId = containerId;
@@ -869,10 +873,6 @@ export const wakeGhost = async (name: string): Promise<void> => {
 
   await ensureGhostPiAgent(name);
   await ensureBaseExtensions();
-
-  if ((ghost.adapter ?? inferAdapterFromProvider(ghost.provider)) === "claude-code") {
-    await ensureClaudeCodeRuntimeFiles(name);
-  }
 
   const resolvedModel = resolveProviderModel(ghost.provider, ghost.model, state.config.defaultProvider);
   const containerId = await startGhostContainer(
