@@ -40,6 +40,9 @@ const USER_PATH = "/vault/USER.md";
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MEMORY_BLOCK_PLACEHOLDER = "<!-- GHOSTBOX_MEMORY_BLOCKS -->";
+const FLUSH_MEMORY_TIMEOUT_MS = 60_000;
+const DISALLOWED_NATIVE_TOOLS =
+  "ScheduleWakeup CronCreate CronList CronDelete RemoteTrigger PushNotification";
 const defaultSystemPrompt =
   'You are a ghost agent. Your vault at /vault is your persistent memory. Use memory_write to save facts (target "memory" for notes, target "user" for user profile). Use memory_show to check your current memory. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
 const memoryCharLimit = 4000;
@@ -970,6 +973,109 @@ const clearActiveTurn = (): void => {
   activeTurn = null;
 };
 
+const flushMemories = async (reason: string): Promise<void> => {
+  if (!currentSessionId || !(await sessionFileExists(currentSessionId))) {
+    return;
+  }
+
+  const flushPrompt = `This session is ending (reason: ${reason}). Before context is lost, use mcp__ghostbox__memory_write to save any facts worth remembering: user preferences, important decisions, ongoing work, names and contacts. Skip if nothing notable. Call mcp__ghostbox__memory_show when done to confirm, or just reply done if nothing to save.`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FLUSH_MEMORY_TIMEOUT_MS);
+  const claudeOauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const isSandbox = process.env.IS_SANDBOX;
+  let timedOut = false;
+
+  timeout.unref?.();
+  controller.signal.addEventListener("abort", () => {
+    timedOut = true;
+  });
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const child = nodeSpawn(
+        "claude",
+        [
+          "--resume",
+          currentSessionId,
+          "-p",
+          flushPrompt,
+          "--model",
+          currentModel,
+          "--max-turns",
+          "3",
+          "--output-format",
+          "json",
+          "--dangerously-skip-permissions",
+          "--mcp-config",
+          CLAUDE_MCP_CONFIG_PATH,
+          "--disallowedTools",
+          DISALLOWED_NATIVE_TOOLS
+        ],
+        {
+          cwd: "/vault",
+          env: {
+            ...process.env,
+            CLAUDE_CONFIG_DIR,
+            ...(claudeOauthToken ? { CLAUDE_CODE_OAUTH_TOKEN: claudeOauthToken } : {}),
+            ...(isSandbox ? { IS_SANDBOX: isSandbox } : {})
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+          signal: controller.signal
+        }
+      );
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        log("INFO", "Memory flush output", {
+          reason,
+          sessionId: currentSessionId ?? "",
+          output: chunk.toString("utf8").trim()
+        });
+      });
+
+      child.stderr.on("data", (chunk: Buffer) => {
+        process.stderr.write(chunk);
+      });
+
+      child.on("error", (error) => {
+        if (timedOut || error.name === "AbortError") {
+          resolve();
+          return;
+        }
+
+        reject(error);
+      });
+
+      child.on("close", (code) => {
+        if (timedOut) {
+          resolve();
+          return;
+        }
+
+        if (code !== 0) {
+          reject(new Error(`claude memory flush failed with exit code ${code ?? 1}.`));
+          return;
+        }
+
+        resolve();
+      });
+    });
+  } catch (error) {
+    log("ERROR", "Memory flush failed", {
+      reason,
+      sessionId: currentSessionId ?? "",
+      error: error instanceof Error ? error.message : String(error)
+    });
+  } finally {
+    clearTimeout(timeout);
+    if (timedOut) {
+      log("ERROR", "Memory flush timed out", {
+        reason,
+        sessionId: currentSessionId ?? ""
+      });
+    }
+  }
+};
+
 const spawnClaudeMessage = async (res: ServerResponse, messages: string[]): Promise<void> => {
   const args = await buildClaudeArgs(messages);
   const child = nodeSpawn("claude", args, {
@@ -1282,6 +1388,13 @@ let activeTurn: ActiveTurn | null = null;
 let sessionOpLock = false;
 const queue: QueueState = { messages: [] };
 let latestStats: ClaudeStatsSnapshot | null = null;
+
+nudges.register("pre-compact", async (_event, reason) => {
+  await flushMemories(reason);
+});
+nudges.register("pre-new-session", async (_event, reason) => {
+  await flushMemories(reason);
+});
 
 await ensureClaudeSupportFiles();
 
