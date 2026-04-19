@@ -42,15 +42,21 @@ const SNAPSHOT_SUFFIX = ".snapshot.txt";
 const FLUSH_MEMORY_TIMEOUT_MS = 60_000;
 const DISALLOWED_NATIVE_TOOLS =
   "ScheduleWakeup CronCreate CronList CronDelete RemoteTrigger PushNotification";
+const SUPPORTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 const defaultSystemPrompt =
   'You are a ghost agent. Your vault at /vault is your persistent memory. Use memory_write to save facts (target "memory" for notes, target "user" for user profile). Use memory_show to check your current memory. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
 const memoryCharLimit = 4000;
 const userCharLimit = 2000;
 
+type UserTurn = {
+  text: string;
+  images: GhostImage[];
+};
+
 type JsonRecord = Record<string, unknown>;
 
 type QueueState = {
-  messages: string[];
+  messages: UserTurn[];
 };
 
 type NudgeEvent = "pre-compact" | "pre-new-session" | "message-complete";
@@ -292,20 +298,33 @@ const parseJsonBodyOrRespond = async <T>(req: IncomingMessage, res: ServerRespon
   }
 };
 
-const ensureNoImages = (imagesValue: unknown): { error?: string } => {
+const parseRequestImages = (imagesValue: unknown): { images: GhostImage[]; error?: string } => {
   if (imagesValue === undefined) {
-    return {};
+    return { images: [] };
   }
 
   if (!Array.isArray(imagesValue)) {
-    return { error: "Invalid images" };
+    return { images: [], error: "Invalid images" };
   }
 
-  if (imagesValue.length > 0) {
-    return { error: "Images are not supported by the claude-code adapter." };
+  const images: GhostImage[] = [];
+
+  for (const imageValue of imagesValue) {
+    if (!isRecord(imageValue) || typeof imageValue.mediaType !== "string" || typeof imageValue.data !== "string") {
+      return { images: [], error: "Invalid images" };
+    }
+
+    if (!SUPPORTED_IMAGE_TYPES.has(imageValue.mediaType)) {
+      return { images: [], error: `Unsupported image type: ${imageValue.mediaType}` };
+    }
+
+    images.push({
+      mediaType: imageValue.mediaType,
+      data: imageValue.data
+    });
   }
 
-  return {};
+  return { images };
 };
 
 const validateSessionId = (sessionId: string): boolean => {
@@ -498,12 +517,30 @@ const ensureClaudeSupportFiles = async (): Promise<void> => {
   }
 };
 
-const createUserTurn = (text: string): string => {
+const createUserTurn = (text: string, images: GhostImage[] = []): string => {
+  const content =
+    images.length > 0
+      ? [
+          ...images.map((image) => ({
+            type: "image" as const,
+            source: {
+              type: "base64" as const,
+              media_type: image.mediaType,
+              data: image.data
+            }
+          })),
+          {
+            type: "text" as const,
+            text
+          }
+        ]
+      : text;
+
   return `${JSON.stringify({
     type: "user",
     message: {
       role: "user",
-      content: text
+      content
     }
   })}\n`;
 };
@@ -992,7 +1029,7 @@ const handleClaudeStreamLine = (res: ServerResponse, line: JsonRecord, state: St
 };
 
 const buildClaudeArgs = async (
-  messages: string[]
+  messages: UserTurn[]
 ): Promise<{ args: string[]; snapshotPrompt: string; snapshotPersisted: boolean }> => {
   await ensureClaudeSupportFiles();
   const resumeSessionId = currentSessionId && (await sessionFileExists(currentSessionId)) ? currentSessionId : null;
@@ -1143,7 +1180,7 @@ const flushMemories = async (reason: string): Promise<void> => {
   }
 };
 
-const spawnClaudeMessage = async (res: ServerResponse, messages: string[]): Promise<void> => {
+const spawnClaudeMessage = async (res: ServerResponse, messages: UserTurn[]): Promise<void> => {
   const { args, snapshotPrompt, snapshotPersisted } = await buildClaudeArgs(messages);
   const child = nodeSpawn("claude", args, {
     cwd: "/vault",
@@ -1280,7 +1317,7 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: string[]): Prom
   });
 
   for (const message of messages) {
-    child.stdin.write(createUserTurn(message));
+    child.stdin.write(createUserTurn(message.text, message.images));
   }
   child.stdin.end();
 };
@@ -1515,11 +1552,12 @@ const handleMessage = async (req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
-  const imageValidation = ensureNoImages(body.images);
-  if (imageValidation.error) {
-    sendJsonError(res, 400, imageValidation.error);
+  const imageParse = parseRequestImages(body.images);
+  if (imageParse.error) {
+    sendJsonError(res, 400, imageParse.error);
     return;
   }
+  const userTurn: UserTurn = { text: prompt, images: imageParse.images };
 
   if (typeof body.model === "string" && body.model.trim()) {
     currentModel = stripAnthropicPrefix(body.model.trim());
@@ -1535,7 +1573,7 @@ const handleMessage = async (req: IncomingMessage, res: ServerResponse): Promise
   }
 
   if (activeTurn) {
-    queue.messages.push(prompt);
+    queue.messages.push(userTurn);
     startNdjsonResponse(res);
     sendJsonLine(res, {
       type: "result",
@@ -1552,7 +1590,7 @@ const handleMessage = async (req: IncomingMessage, res: ServerResponse): Promise
 
   try {
     startNdjsonResponse(res);
-    await spawnClaudeMessage(res, [...queuedMessages, prompt]);
+    await spawnClaudeMessage(res, [...queuedMessages, userTurn]);
   } finally {
     sessionOpLock = false;
   }
@@ -1570,9 +1608,9 @@ const handleSteer = async (req: IncomingMessage, res: ServerResponse): Promise<v
     return;
   }
 
-  const imageValidation = ensureNoImages(body.images);
-  if (imageValidation.error) {
-    sendJsonError(res, 400, imageValidation.error);
+  const imageParse = parseRequestImages(body.images);
+  if (imageParse.error) {
+    sendJsonError(res, 400, imageParse.error);
     return;
   }
 
@@ -1581,14 +1619,14 @@ const handleSteer = async (req: IncomingMessage, res: ServerResponse): Promise<v
     return;
   }
 
-  activeTurn.child.stdin.write(createUserTurn(prompt));
+  activeTurn.child.stdin.write(createUserTurn(prompt, imageParse.images));
   sendJson(res, 200, { status: "queued", pendingCount: queue.messages.length });
 };
 
 const handleQueue = (res: ServerResponse): void => {
   const response: GhostQueueState = {
     steering: [],
-    followUp: [...queue.messages],
+    followUp: queue.messages.map((message) => message.text),
     pendingCount: queue.messages.length
   };
   sendJson(res, 200, response);
@@ -1598,7 +1636,7 @@ const handleClearQueue = (res: ServerResponse): void => {
   const response: GhostQueueClearResponse = {
     cleared: {
       steering: [],
-      followUp: [...queue.messages]
+      followUp: queue.messages.map((message) => message.text)
     }
   };
   queue.messages = [];

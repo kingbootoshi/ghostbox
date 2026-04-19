@@ -28,6 +28,7 @@ var SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 var SNAPSHOT_SUFFIX = ".snapshot.txt";
 var FLUSH_MEMORY_TIMEOUT_MS = 60000;
 var DISALLOWED_NATIVE_TOOLS = "ScheduleWakeup CronCreate CronList CronDelete RemoteTrigger PushNotification";
+var SUPPORTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 var defaultSystemPrompt = 'You are a ghost agent. Your vault at /vault is your persistent memory. Use memory_write to save facts (target "memory" for notes, target "user" for user profile). Use memory_show to check your current memory. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
 var memoryCharLimit = 4000;
 var userCharLimit = 2000;
@@ -167,17 +168,27 @@ var parseJsonBodyOrRespond = async (req, res) => {
     throw error;
   }
 };
-var ensureNoImages = (imagesValue) => {
+var parseRequestImages = (imagesValue) => {
   if (imagesValue === undefined) {
-    return {};
+    return { images: [] };
   }
   if (!Array.isArray(imagesValue)) {
-    return { error: "Invalid images" };
+    return { images: [], error: "Invalid images" };
   }
-  if (imagesValue.length > 0) {
-    return { error: "Images are not supported by the claude-code adapter." };
+  const images = [];
+  for (const imageValue of imagesValue) {
+    if (!isRecord(imageValue) || typeof imageValue.mediaType !== "string" || typeof imageValue.data !== "string") {
+      return { images: [], error: "Invalid images" };
+    }
+    if (!SUPPORTED_IMAGE_TYPES.has(imageValue.mediaType)) {
+      return { images: [], error: `Unsupported image type: ${imageValue.mediaType}` };
+    }
+    images.push({
+      mediaType: imageValue.mediaType,
+      data: imageValue.data
+    });
   }
-  return {};
+  return { images };
 };
 var validateSessionId = (sessionId) => {
   return SESSION_ID_PATTERN.test(sessionId);
@@ -330,12 +341,26 @@ var ensureClaudeSupportFiles = async () => {
 `, "utf8");
   }
 };
-var createUserTurn = (text) => {
+var createUserTurn = (text, images = []) => {
+  const content = images.length > 0 ? [
+    ...images.map((image) => ({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: image.mediaType,
+        data: image.data
+      }
+    })),
+    {
+      type: "text",
+      text
+    }
+  ] : text;
   return `${JSON.stringify({
     type: "user",
     message: {
       role: "user",
-      content: text
+      content
     }
   })}
 `;
@@ -968,7 +993,7 @@ var spawnClaudeMessage = async (res, messages) => {
     clearActiveTurn();
   });
   for (const message of messages) {
-    child.stdin.write(createUserTurn(message));
+    child.stdin.write(createUserTurn(message.text, message.images));
   }
   child.stdin.end();
 };
@@ -1164,11 +1189,12 @@ var handleMessage = async (req, res) => {
     sendJsonError(res, 400, "Missing prompt");
     return;
   }
-  const imageValidation = ensureNoImages(body.images);
-  if (imageValidation.error) {
-    sendJsonError(res, 400, imageValidation.error);
+  const imageParse = parseRequestImages(body.images);
+  if (imageParse.error) {
+    sendJsonError(res, 400, imageParse.error);
     return;
   }
+  const userTurn = { text: prompt, images: imageParse.images };
   if (typeof body.model === "string" && body.model.trim()) {
     currentModel = stripAnthropicPrefix(body.model.trim());
   }
@@ -1180,7 +1206,7 @@ var handleMessage = async (req, res) => {
     return;
   }
   if (activeTurn) {
-    queue.messages.push(prompt);
+    queue.messages.push(userTurn);
     startNdjsonResponse(res);
     sendJsonLine(res, {
       type: "result",
@@ -1195,7 +1221,7 @@ var handleMessage = async (req, res) => {
   sessionOpLock = true;
   try {
     startNdjsonResponse(res);
-    await spawnClaudeMessage(res, [...queuedMessages, prompt]);
+    await spawnClaudeMessage(res, [...queuedMessages, userTurn]);
   } finally {
     sessionOpLock = false;
   }
@@ -1210,22 +1236,22 @@ var handleSteer = async (req, res) => {
     sendJsonError(res, 400, "Missing prompt");
     return;
   }
-  const imageValidation = ensureNoImages(body.images);
-  if (imageValidation.error) {
-    sendJsonError(res, 400, imageValidation.error);
+  const imageParse = parseRequestImages(body.images);
+  if (imageParse.error) {
+    sendJsonError(res, 400, imageParse.error);
     return;
   }
   if (!activeTurn) {
     sendJsonError(res, 400, "no active turn to steer");
     return;
   }
-  activeTurn.child.stdin.write(createUserTurn(prompt));
+  activeTurn.child.stdin.write(createUserTurn(prompt, imageParse.images));
   sendJson(res, 200, { status: "queued", pendingCount: queue.messages.length });
 };
 var handleQueue = (res) => {
   const response = {
     steering: [],
-    followUp: [...queue.messages],
+    followUp: queue.messages.map((message) => message.text),
     pendingCount: queue.messages.length
   };
   sendJson(res, 200, response);
@@ -1234,7 +1260,7 @@ var handleClearQueue = (res) => {
   const response = {
     cleared: {
       steering: [],
-      followUp: [...queue.messages]
+      followUp: queue.messages.map((message) => message.text)
     }
   };
   queue.messages = [];
