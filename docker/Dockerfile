@@ -20,8 +20,10 @@ RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:$PATH"
 ENV NODE_PATH="/usr/local/lib/node_modules"
 
-RUN mkdir -p /vault /root/.pi/agent/agents /root/.pi/agent/extensions /node_modules/@mariozechner && \
-    ln -s /usr/local/lib/node_modules/@mariozechner/pi-coding-agent /node_modules/@mariozechner/pi-coding-agent
+RUN mkdir -p /vault /root/.pi/agent/agents /root/.pi/agent/extensions /node_modules/@mariozechner /node_modules/@modelcontextprotocol && \
+    ln -s /usr/local/lib/node_modules/@mariozechner/pi-coding-agent /node_modules/@mariozechner/pi-coding-agent && \
+    ln -s /usr/local/lib/node_modules/@modelcontextprotocol/sdk /node_modules/@modelcontextprotocol/sdk && \
+    ln -s /usr/local/lib/node_modules/zod /node_modules/zod
 
 RUN cd /usr/local/lib/node_modules/@mariozechner/pi-coding-agent && \
     npm install pi-subagents --save=false

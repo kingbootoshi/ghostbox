@@ -829,8 +829,8 @@ const buildClaudeArgs = async (messages: string[]): Promise<string[]> => {
     "--output-format",
     "stream-json",
     "--verbose",
-    "--append-system-prompt-file",
-    CLAUDE_APPEND_PROMPT_PATH,
+    "--append-system-prompt",
+    await readFileText(CLAUDE_APPEND_PROMPT_PATH),
     "--mcp-config",
     CLAUDE_MCP_CONFIG_PATH,
     "--dangerously-skip-permissions"
