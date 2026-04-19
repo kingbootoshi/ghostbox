@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import http from "node:http";
 import { basename, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 var CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || "/vault/.claude";
 var CLAUDE_PROJECTS_DIR = join(CLAUDE_CONFIG_DIR, "projects", "-vault");
 var CLAUDE_MCP_CONFIG_PATH = join(CLAUDE_CONFIG_DIR, ".mcp.json");
@@ -22,6 +23,7 @@ var GHOSTBOX_HOST_BASE = `http://host.docker.internal:${GHOSTBOX_API_PORT}`;
 var GHOSTBOX_GHOST_NAME = process.env.GHOSTBOX_GHOST_NAME || "";
 var SYSTEM_PROMPT = process.env.GHOSTBOX_SYSTEM_PROMPT?.trim() || "";
 var HEARTBEAT_INTERVAL_MS = 30000;
+var SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 var parseApiKeys = (value) => {
   if (!value || value.trim().length === 0) {
     return [];
@@ -154,13 +156,42 @@ var ensureNoImages = (imagesValue) => {
   }
   return {};
 };
+var validateSessionId = (sessionId) => {
+  return SESSION_ID_PATTERN.test(sessionId);
+};
+var sanitizeSessionName = (name) => {
+  const sanitized = name.trim();
+  const fileName = basename(sanitized);
+  if (!fileName || fileName !== sanitized || fileName.startsWith(".") || fileName.includes("/") || fileName.includes("\\") || fileName.toLowerCase().endsWith(".jsonl")) {
+    return null;
+  }
+  return fileName;
+};
 var getSessionFilePath = (sessionId) => {
   return join(CLAUDE_PROJECTS_DIR, `${sessionId}.jsonl`);
 };
 var readJsonLines = async (path) => {
   const content = await readFile(path, "utf8");
-  return content.split(`
-`).map((line) => line.trim()).filter((line) => line.length > 0).map((line) => JSON.parse(line));
+  const lines = content.split(`
+`).map((line) => line.trim()).filter((line) => line.length > 0);
+  const parsedLines = [];
+  for (const [index, line] of lines.entries()) {
+    try {
+      parsedLines.push(JSON.parse(line));
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) {
+        throw error;
+      }
+      if (index < lines.length - 1) {
+        log("ERROR", "Failed to parse JSONL line", {
+          path,
+          error: error.message,
+          line
+        });
+      }
+    }
+  }
+  return parsedLines;
 };
 var fileExists = async (path) => {
   try {
@@ -454,6 +485,7 @@ var createStreamState = () => ({
   textBuffer: "",
   lastAssistantText: "",
   assistantFallback: "",
+  receivedResultEvent: false,
   thinkingBuffer: "",
   currentBlockType: null,
   currentToolName: null,
@@ -494,6 +526,7 @@ var handleClaudeStreamLine = (res, line, state) => {
     return;
   }
   if (eventName === "result") {
+    state.receivedResultEvent = true;
     if (!state.lastAssistantText && state.assistantFallback) {
       sendJsonLine(res, { type: "assistant", text: state.assistantFallback });
       state.lastAssistantText = state.assistantFallback;
@@ -619,6 +652,7 @@ var spawnClaudeMessage = async (res, messages) => {
     stdio: ["pipe", "pipe", "pipe"]
   });
   const state = createStreamState();
+  const stdoutDecoder = new StringDecoder("utf8");
   activeTurn = {
     child,
     heartbeat: startHeartbeat(res),
@@ -633,7 +667,7 @@ var spawnClaudeMessage = async (res, messages) => {
     if (!activeTurn) {
       return;
     }
-    activeTurn.buffer += chunk.toString();
+    activeTurn.buffer += stdoutDecoder.write(chunk);
     const lines = activeTurn.buffer.split(`
 `);
     activeTurn.buffer = lines.pop() ?? "";
@@ -671,7 +705,10 @@ var spawnClaudeMessage = async (res, messages) => {
     }
     clearActiveTurn();
   });
-  child.on("close", () => {
+  child.on("close", (code) => {
+    if (activeTurn) {
+      activeTurn.buffer += stdoutDecoder.end();
+    }
     const trailingLine = activeTurn?.buffer.trim();
     if (trailingLine) {
       try {
@@ -688,6 +725,18 @@ var spawnClaudeMessage = async (res, messages) => {
       clearInterval(activeTurn.heartbeat);
     }
     if (!res.writableEnded) {
+      if ((code ?? 0) !== 0 && !state.receivedResultEvent) {
+        const message = `Claude subprocess exited with code ${code ?? 1}.`;
+        log("ERROR", message, { sessionId: currentSessionId ?? "" });
+        sendJsonLine(res, {
+          type: "result",
+          text: message,
+          sessionId: currentSessionId ?? ""
+        });
+        res.end();
+        clearActiveTurn();
+        return;
+      }
       if (!state.lastAssistantText && state.assistantFallback) {
         sendJsonLine(res, { type: "assistant", text: state.assistantFallback });
       }
@@ -736,11 +785,12 @@ var runCompactCommand = async () => {
     let buffer = "";
     let fallback = "";
     let lastText = "";
+    const stdoutDecoder = new StringDecoder("utf8");
     child.stderr.on("data", (chunk) => {
       process.stderr.write(chunk);
     });
     child.stdout.on("data", (chunk) => {
-      buffer += chunk.toString();
+      buffer += stdoutDecoder.write(chunk);
       const lines = buffer.split(`
 `);
       buffer = lines.pop() ?? "";
@@ -773,6 +823,7 @@ var runCompactCommand = async () => {
     });
     child.on("error", reject);
     child.on("close", (code) => {
+      buffer += stdoutDecoder.end();
       const trailingLine = buffer.trim();
       if (trailingLine) {
         try {
@@ -846,6 +897,7 @@ var handleSlashCommand = async (res, prompt) => {
 var currentSessionId = null;
 var currentModel = getInitialModel();
 var activeTurn = null;
+var sessionOpLock = false;
 var queue = { messages: [] };
 var latestStats = null;
 await ensureClaudeSupportFiles();
@@ -892,18 +944,30 @@ var handleMessage = async (req, res) => {
   if (await handleSlashCommand(res, prompt)) {
     return;
   }
+  if (sessionOpLock) {
+    sendJsonError(res, 409, "Turn in progress, try again.");
+    return;
+  }
   if (activeTurn) {
     queue.messages.push(prompt);
-    sendJsonError(res, 409, "Active turn in progress.", {
-      queued: true,
-      pendingCount: queue.messages.length
+    startNdjsonResponse(res);
+    sendJsonLine(res, {
+      type: "result",
+      text: "Queued for next turn.",
+      sessionId: currentSessionId ?? ""
     });
+    res.end();
     return;
   }
   const queuedMessages = [...queue.messages];
   queue.messages = [];
-  startNdjsonResponse(res);
-  await spawnClaudeMessage(res, [prompt, ...queuedMessages]);
+  sessionOpLock = true;
+  try {
+    startNdjsonResponse(res);
+    await spawnClaudeMessage(res, [...queuedMessages, prompt]);
+  } finally {
+    sessionOpLock = false;
+  }
 };
 var handleSteer = async (req, res) => {
   const body = await parseJsonBodyOrRespond(req, res);
@@ -1002,6 +1066,10 @@ var handleSwitchSession = async (req, res) => {
     sendJsonError(res, 400, "Missing sessionId");
     return;
   }
+  if (!validateSessionId(sessionId)) {
+    sendJsonError(res, 400, "Invalid session id");
+    return;
+  }
   if (!await sessionFileExists(sessionId)) {
     sendJsonError(res, 404, `Session "${sessionId}" not found`);
     return;
@@ -1020,6 +1088,10 @@ var handleRenameSession = async (req, res) => {
     sendJsonError(res, 400, "Missing sessionId");
     return;
   }
+  if (!validateSessionId(sessionId)) {
+    sendJsonError(res, 400, "Invalid session id");
+    return;
+  }
   if (!name) {
     sendJsonError(res, 400, "Missing name");
     return;
@@ -1029,11 +1101,28 @@ var handleRenameSession = async (req, res) => {
     sendJsonError(res, 404, `Session "${sessionId}" not found`);
     return;
   }
-  const sanitizedName = name.replace(/[\\/]/g, "-");
+  const sanitizedName = sanitizeSessionName(name);
+  if (!sanitizedName) {
+    sendJsonError(res, 400, "Invalid session name");
+    return;
+  }
+  if (activeTurn || sessionOpLock) {
+    sendJsonError(res, 409, "Turn in progress, try again.");
+    return;
+  }
   const targetPath = getSessionFilePath(sanitizedName);
-  await rename(sourcePath, targetPath);
-  if (currentSessionId === sessionId) {
-    currentSessionId = sanitizedName;
+  sessionOpLock = true;
+  try {
+    if (await fileExists(targetPath)) {
+      sendJsonError(res, 409, "A session with that name already exists.");
+      return;
+    }
+    await rename(sourcePath, targetPath);
+    if (currentSessionId === sessionId) {
+      currentSessionId = sanitizedName;
+    }
+  } finally {
+    sessionOpLock = false;
   }
   sendJson(res, 200, { status: "renamed", sessionId: sanitizedName, name: sanitizedName });
 };
@@ -1041,6 +1130,10 @@ var handleDeleteSession = async (req, res) => {
   const sessionId = req.url?.replace("/sessions/", "").trim() ?? "";
   if (!sessionId) {
     sendJsonError(res, 400, "Missing sessionId");
+    return;
+  }
+  if (!validateSessionId(sessionId)) {
+    sendJsonError(res, 400, "Invalid session id");
     return;
   }
   if (currentSessionId === sessionId) {

@@ -102,27 +102,38 @@ export async function runSetupToken(): Promise<ClaudeCodeTokenRecord> {
       stdio: ["inherit", "pipe", "inherit"]
     });
 
-    let stdout = "";
+    const stdoutChunks: Buffer[] = [];
+
+    const clearStdoutChunks = (): void => {
+      for (const chunk of stdoutChunks) {
+        chunk.fill(0);
+      }
+      stdoutChunks.length = 0;
+    };
 
     child.stdout?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString();
-      stdout += text;
-      process.stdout.write(text);
+      stdoutChunks.push(Buffer.from(chunk));
     });
 
     child.on("error", reject);
     child.on("close", (code) => {
       if (code !== 0) {
+        clearStdoutChunks();
         reject(new Error(`claude setup-token failed with exit code ${code ?? 1}.`));
         return;
       }
 
-      const matches = stdout.match(SETUP_TOKEN_PATTERN);
+      const stdoutBuffer = Buffer.concat(stdoutChunks);
+      const matches = stdoutBuffer.toString("utf8").match(SETUP_TOKEN_PATTERN);
+      stdoutBuffer.fill(0);
+      clearStdoutChunks();
       const accessToken = matches?.at(-1);
       if (!accessToken) {
         reject(new Error("claude setup-token did not print a Claude Code token."));
         return;
       }
+
+      process.stdout.write("Claude Code token captured.\n");
 
       resolve({
         type: "claude-code",

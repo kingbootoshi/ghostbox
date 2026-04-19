@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { basename, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type {
   CompactionInfo,
   GhostImage,
@@ -38,6 +39,7 @@ const SYSTEM_PROMPT = process.env.GHOSTBOX_SYSTEM_PROMPT?.trim() || "";
 const MEMORY_PATH = "/vault/MEMORY.md";
 const USER_PATH = "/vault/USER.md";
 const HEARTBEAT_INTERVAL_MS = 30_000;
+const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -49,6 +51,7 @@ type StreamState = {
   textBuffer: string;
   lastAssistantText: string;
   assistantFallback: string;
+  receivedResultEvent: boolean;
   thinkingBuffer: string;
   currentBlockType: "text" | "thinking" | "tool_use" | null;
   currentToolName: string | null;
@@ -275,17 +278,59 @@ const ensureNoImages = (imagesValue: unknown): { error?: string } => {
   return {};
 };
 
+const validateSessionId = (sessionId: string): boolean => {
+  return SESSION_ID_PATTERN.test(sessionId);
+};
+
+const sanitizeSessionName = (name: string): string | null => {
+  const sanitized = name.trim();
+  const fileName = basename(sanitized);
+
+  if (
+    !fileName ||
+    fileName !== sanitized ||
+    fileName.startsWith(".") ||
+    fileName.includes("/") ||
+    fileName.includes("\\") ||
+    fileName.toLowerCase().endsWith(".jsonl")
+  ) {
+    return null;
+  }
+
+  return fileName;
+};
+
 const getSessionFilePath = (sessionId: string): string => {
   return join(CLAUDE_PROJECTS_DIR, `${sessionId}.jsonl`);
 };
 
 const readJsonLines = async (path: string): Promise<JsonRecord[]> => {
   const content = await readFile(path, "utf8");
-  return content
+  const lines = content
     .split("\n")
     .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map((line) => JSON.parse(line) as JsonRecord);
+    .filter((line) => line.length > 0);
+  const parsedLines: JsonRecord[] = [];
+
+  for (const [index, line] of lines.entries()) {
+    try {
+      parsedLines.push(JSON.parse(line) as JsonRecord);
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) {
+        throw error;
+      }
+
+      if (index < lines.length - 1) {
+        log("ERROR", "Failed to parse JSONL line", {
+          path,
+          error: error.message,
+          line
+        });
+      }
+    }
+  }
+
+  return parsedLines;
 };
 
 const fileExists = async (path: string): Promise<boolean> => {
@@ -665,6 +710,7 @@ const createStreamState = (): StreamState => ({
   textBuffer: "",
   lastAssistantText: "",
   assistantFallback: "",
+  receivedResultEvent: false,
   thinkingBuffer: "",
   currentBlockType: null,
   currentToolName: null,
@@ -719,6 +765,7 @@ const handleClaudeStreamLine = (res: ServerResponse, line: JsonRecord, state: St
   }
 
   if (eventName === "result") {
+    state.receivedResultEvent = true;
     if (!state.lastAssistantText && state.assistantFallback) {
       sendJsonLine(res, { type: "assistant", text: state.assistantFallback });
       state.lastAssistantText = state.assistantFallback;
@@ -868,6 +915,7 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: string[]): Prom
   });
 
   const state = createStreamState();
+  const stdoutDecoder = new StringDecoder("utf8");
   activeTurn = {
     child,
     heartbeat: startHeartbeat(res),
@@ -885,7 +933,7 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: string[]): Prom
       return;
     }
 
-    activeTurn.buffer += chunk.toString();
+    activeTurn.buffer += stdoutDecoder.write(chunk);
     const lines = activeTurn.buffer.split("\n");
     activeTurn.buffer = lines.pop() ?? "";
 
@@ -926,7 +974,11 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: string[]): Prom
     clearActiveTurn();
   });
 
-  child.on("close", () => {
+  child.on("close", (code) => {
+    if (activeTurn) {
+      activeTurn.buffer += stdoutDecoder.end();
+    }
+
     const trailingLine = activeTurn?.buffer.trim();
     if (trailingLine) {
       try {
@@ -945,6 +997,19 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: string[]): Prom
     }
 
     if (!res.writableEnded) {
+      if ((code ?? 0) !== 0 && !state.receivedResultEvent) {
+        const message = `Claude subprocess exited with code ${code ?? 1}.`;
+        log("ERROR", message, { sessionId: currentSessionId ?? "" });
+        sendJsonLine(res, {
+          type: "result",
+          text: message,
+          sessionId: currentSessionId ?? ""
+        });
+        res.end();
+        clearActiveTurn();
+        return;
+      }
+
       if (!state.lastAssistantText && state.assistantFallback) {
         sendJsonLine(res, { type: "assistant", text: state.assistantFallback });
       }
@@ -1000,13 +1065,14 @@ const runCompactCommand = async (): Promise<string> => {
     let buffer = "";
     let fallback = "";
     let lastText = "";
+    const stdoutDecoder = new StringDecoder("utf8");
 
     child.stderr.on("data", (chunk: Buffer) => {
       process.stderr.write(chunk);
     });
 
     child.stdout.on("data", (chunk: Buffer) => {
-      buffer += chunk.toString();
+      buffer += stdoutDecoder.write(chunk);
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
 
@@ -1043,6 +1109,7 @@ const runCompactCommand = async (): Promise<string> => {
 
     child.on("error", reject);
     child.on("close", (code) => {
+      buffer += stdoutDecoder.end();
       const trailingLine = buffer.trim();
       if (trailingLine) {
         try {
@@ -1137,6 +1204,7 @@ const handleSlashCommand = async (
 let currentSessionId: string | null = null;
 let currentModel = getInitialModel();
 let activeTurn: ActiveTurn | null = null;
+let sessionOpLock = false;
 const queue: QueueState = { messages: [] };
 let latestStats: ClaudeStatsSnapshot | null = null;
 
@@ -1192,19 +1260,33 @@ const handleMessage = async (req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  if (sessionOpLock) {
+    sendJsonError(res, 409, "Turn in progress, try again.");
+    return;
+  }
+
   if (activeTurn) {
     queue.messages.push(prompt);
-    sendJsonError(res, 409, "Active turn in progress.", {
-      queued: true,
-      pendingCount: queue.messages.length
+    startNdjsonResponse(res);
+    sendJsonLine(res, {
+      type: "result",
+      text: "Queued for next turn.",
+      sessionId: currentSessionId ?? ""
     });
+    res.end();
     return;
   }
 
   const queuedMessages = [...queue.messages];
   queue.messages = [];
-  startNdjsonResponse(res);
-  await spawnClaudeMessage(res, [prompt, ...queuedMessages]);
+  sessionOpLock = true;
+
+  try {
+    startNdjsonResponse(res);
+    await spawnClaudeMessage(res, [...queuedMessages, prompt]);
+  } finally {
+    sessionOpLock = false;
+  }
 };
 
 const handleSteer = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -1324,6 +1406,11 @@ const handleSwitchSession = async (req: IncomingMessage, res: ServerResponse): P
     return;
   }
 
+  if (!validateSessionId(sessionId)) {
+    sendJsonError(res, 400, "Invalid session id");
+    return;
+  }
+
   if (!(await sessionFileExists(sessionId))) {
     sendJsonError(res, 404, `Session "${sessionId}" not found`);
     return;
@@ -1347,6 +1434,11 @@ const handleRenameSession = async (req: IncomingMessage, res: ServerResponse): P
     return;
   }
 
+  if (!validateSessionId(sessionId)) {
+    sendJsonError(res, 400, "Invalid session id");
+    return;
+  }
+
   if (!name) {
     sendJsonError(res, 400, "Missing name");
     return;
@@ -1358,12 +1450,32 @@ const handleRenameSession = async (req: IncomingMessage, res: ServerResponse): P
     return;
   }
 
-  const sanitizedName = name.replace(/[\\/]/g, "-");
-  const targetPath = getSessionFilePath(sanitizedName);
+  const sanitizedName = sanitizeSessionName(name);
+  if (!sanitizedName) {
+    sendJsonError(res, 400, "Invalid session name");
+    return;
+  }
 
-  await rename(sourcePath, targetPath);
-  if (currentSessionId === sessionId) {
-    currentSessionId = sanitizedName;
+  if (activeTurn || sessionOpLock) {
+    sendJsonError(res, 409, "Turn in progress, try again.");
+    return;
+  }
+
+  const targetPath = getSessionFilePath(sanitizedName);
+  sessionOpLock = true;
+
+  try {
+    if (await fileExists(targetPath)) {
+      sendJsonError(res, 409, "A session with that name already exists.");
+      return;
+    }
+
+    await rename(sourcePath, targetPath);
+    if (currentSessionId === sessionId) {
+      currentSessionId = sanitizedName;
+    }
+  } finally {
+    sessionOpLock = false;
   }
 
   sendJson(res, 200, { status: "renamed", sessionId: sanitizedName, name: sanitizedName });
@@ -1373,6 +1485,11 @@ const handleDeleteSession = async (req: IncomingMessage, res: ServerResponse): P
   const sessionId = req.url?.replace("/sessions/", "").trim() ?? "";
   if (!sessionId) {
     sendJsonError(res, 400, "Missing sessionId");
+    return;
+  }
+
+  if (!validateSessionId(sessionId)) {
+    sendJsonError(res, 400, "Invalid session id");
     return;
   }
 
