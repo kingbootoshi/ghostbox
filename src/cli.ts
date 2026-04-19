@@ -6,6 +6,7 @@ import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { checkbox, confirm, select } from "@inquirer/prompts";
 import chalk from "chalk";
+import { loginClaudeCode } from "./claude-auth";
 import { createLogger } from "./logger";
 import { getAuthStatus, loginProvider } from "./oauth";
 import {
@@ -666,7 +667,7 @@ const loadExistingState = async (): Promise<GhostboxState | null> => {
 const printUsage = (): void => {
   log.info(chalk.cyan("Usage:"));
   log.info("  ghostbox init                          Interactive setup wizard");
-  log.info("  ghostbox login [anthropic|openai]       Login to an adapter");
+  log.info("  ghostbox login [anthropic|openai-codex|claude-code]  Login to an adapter");
   log.info("  ghostbox auth                           Show auth status");
   log.info("  ghostbox spawn <name> [--model] [--provider] [--prompt]");
   log.info("  ghostbox list                           List agents");
@@ -1278,10 +1279,17 @@ const main = async (): Promise<void> => {
         await init(args.includes("--reset"));
         break;
       case "login": {
-        const provider = args[0] as AuthProvider | undefined;
-        if (!provider || !["anthropic", "openai-codex"].includes(provider)) {
-          throw new Error("Usage: ghostbox login [anthropic|openai-codex]");
+        const provider = args[0];
+        if (!provider || !["anthropic", "openai-codex", "claude-code"].includes(provider)) {
+          throw new Error("Usage: ghostbox login [anthropic|openai-codex|claude-code]");
         }
+
+        if (provider === "claude-code") {
+          await loginClaudeCode();
+          log.info(chalk.green("Claude Code connected."));
+          break;
+        }
+
         await loginProvider(provider as AuthProvider);
         log.info(chalk.green(`${provider === "anthropic" ? "Anthropic" : "OpenAI"} connected.`));
         break;
@@ -1300,6 +1308,15 @@ const main = async (): Promise<void> => {
             } else {
               log.info(chalk.dim(`${name}: not connected`));
             }
+          }
+
+          if (authStatus.claudeCode.authenticated) {
+            const expires = authStatus.claudeCode.expiresAt
+              ? new Date(authStatus.claudeCode.expiresAt).toLocaleString()
+              : "unknown";
+            log.info(chalk.green(`Claude Code: connected (expires ${expires})`));
+          } else {
+            log.info(chalk.dim("Claude Code: not connected"));
           }
         }
         break;

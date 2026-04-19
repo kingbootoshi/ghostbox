@@ -75,6 +75,7 @@ export interface GhostState {
   portBase: number;
   model: string;
   provider: string;
+  adapter?: AdapterType;
   imageVersion: string;
   status: GhostStatus;
   createdAt: string;
@@ -211,6 +212,8 @@ export type GhostMessage =
   | ResultMessage
   | HeartbeatMessage;
 
+export type AdapterType = "pi" | "claude-code";
+
 export type AuthProvider = "anthropic" | "openai-codex";
 
 export interface OAuthTokenRecord {
@@ -220,7 +223,17 @@ export interface OAuthTokenRecord {
   expires: number;
 }
 
-export type AuthTokenStore = Partial<Record<AuthProvider, OAuthTokenRecord>>;
+export interface ClaudeCodeTokenRecord {
+  type: "claude-code";
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt?: number;
+  source: "keychain" | "setup-token";
+}
+
+export type AuthTokenStore = Partial<Record<AuthProvider, OAuthTokenRecord>> & {
+  claudeCode?: ClaudeCodeTokenRecord;
+};
 
 export interface AuthProviderStatus {
   authenticated: boolean;
@@ -229,4 +242,5 @@ export interface AuthProviderStatus {
 
 export interface AuthStatus {
   providers: Record<AuthProvider, AuthProviderStatus>;
+  claudeCode: AuthProviderStatus;
 }

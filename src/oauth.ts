@@ -5,7 +5,14 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { AuthProvider, AuthProviderStatus, AuthStatus, AuthTokenStore, OAuthTokenRecord } from "./types";
+import type {
+  AuthProvider,
+  AuthProviderStatus,
+  AuthStatus,
+  AuthTokenStore,
+  ClaudeCodeTokenRecord,
+  OAuthTokenRecord
+} from "./types";
 
 const CALLBACK_HOST = "127.0.0.1";
 const EXPIRY_REFRESH_BUFFER_MS = 5 * 60 * 1000;
@@ -419,12 +426,21 @@ export async function readAuthToken(provider: AuthProvider): Promise<OAuthTokenR
   return store[provider] ?? null;
 }
 
+export async function readClaudeCodeToken(): Promise<ClaudeCodeTokenRecord | null> {
+  const store = await readAuthTokens();
+  return store.claudeCode ?? null;
+}
+
+export async function writeAuthTokens(store: AuthTokenStore): Promise<void> {
+  await writeProtectedJsonAtomic(authFile(), store);
+}
+
 export async function saveAuthToken(provider: AuthProvider, tokens: OAuthTokenRecord): Promise<void> {
   const nextStore = {
     ...(await readAuthTokens()),
     [provider]: tokens
   } satisfies AuthTokenStore;
-  await writeProtectedJsonAtomic(authFile(), nextStore);
+  await writeAuthTokens(nextStore);
 }
 
 export async function deleteAuthToken(provider: AuthProvider): Promise<void> {
@@ -436,7 +452,7 @@ export async function deleteAuthToken(provider: AuthProvider): Promise<void> {
     return;
   }
 
-  await writeProtectedJsonAtomic(authFile(), nextStore);
+  await writeAuthTokens(nextStore);
 }
 
 // ---------- Public API ----------
@@ -487,6 +503,10 @@ export async function getAuthStatus(): Promise<AuthStatus> {
     providers: {
       anthropic: toProviderStatus(tokens.anthropic ?? null),
       "openai-codex": toProviderStatus(tokens["openai-codex"] ?? null)
+    },
+    claudeCode: {
+      authenticated: tokens.claudeCode !== undefined,
+      expiresAt: tokens.claudeCode?.expiresAt ?? null
     }
   };
 }

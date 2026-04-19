@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import Docker from "dockerode";
 import { createLogger } from "./logger";
 import type {
+  AdapterType,
   GhostApiKey,
   GhostboxConfig,
   GhostboxState,
@@ -330,11 +331,16 @@ const getGhostAuthHeaders = (ghost: GhostState): Record<string, string> => {
   return getGhostAuthorizationHeader(ghost) ? { Authorization: getGhostAuthorizationHeader(ghost) as string } : {};
 };
 
+const inferAdapterFromProvider = (provider: string): AdapterType => {
+  return provider === "anthropic" ? "claude-code" : "pi";
+};
+
 const normalizeGhostState = (
   ghost: GhostState | (Omit<GhostState, "apiKeys"> & { apiKeys?: GhostApiKey[] })
 ): GhostState => {
   return {
     ...ghost,
+    adapter: ghost.adapter ?? inferAdapterFromProvider(ghost.provider),
     imageVersion: ghost.imageVersion || "",
     apiKeys: Array.isArray(ghost.apiKeys) ? ghost.apiKeys : []
   };
