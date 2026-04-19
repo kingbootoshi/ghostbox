@@ -1,104 +1,91 @@
 import Foundation
 import Security
 
+// Local-file token store. Keychain was abandoned because macOS rebinds the
+// keychain item's partition_list to the caller's cdhash on every SecItemAdd,
+// so unsigned Debug rebuilds prompt on every launch. Apple DTS confirms there
+// is no supported API to produce a partition-list-free item for unsigned
+// binaries. File storage at ~/.ghostbox/app-token (mode 0600) matches every
+// other credential in the ghostbox stack (auth.json, state.json) and every
+// similar dev tool (~/.aws/credentials, ~/.kube/config, ~/.claude.json).
 enum KeychainHelper {
-    private static let service = "com.ghostbox.app"
-    private static let account = "serverToken"
+    private static let legacyService = "com.ghostbox.app"
+    private static let legacyAccount = "serverToken"
+    private static let fileName = "app-token"
 
-    private enum KeychainError: Error {
-        case unexpectedStatus(OSStatus)
-        case accessCreationFailed
-    }
-
-    private static var baseQuery: [CFString: Any] {
-        [
-            kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
-            kSecAttrAccount: account,
-        ]
-    }
-
-    /// Creates a SecAccess that allows ALL applications to read the item without prompting.
-    /// This prevents Keychain from asking for a password every time the app is rebuilt
-    /// with a new code signature during development.
-    private static func createUnrestrictedAccess() throws -> SecAccess {
-        var accessRef: SecAccess?
-        let status = SecAccessCreate(service as CFString, [] as CFArray, &accessRef)
-        guard status == errSecSuccess, let access = accessRef else {
-            throw KeychainError.accessCreationFailed
-        }
-
-        // Get the default ACL for the decrypt authorization
-        guard let aclList = SecAccessCopyMatchingACLList(access, kSecACLAuthorizationDecrypt) as? [SecACL],
-              let decryptACL = aclList.first else {
-            throw KeychainError.accessCreationFailed
-        }
-
-        let allAuthorizations = SecACLCopyAuthorizations(decryptACL)
-        let removeStatus = SecACLRemove(decryptACL)
-        guard removeStatus == errSecSuccess else {
-            throw KeychainError.unexpectedStatus(removeStatus)
-        }
-
-        // Create a new ACL with nil trusted apps = all applications allowed
-        var newACLRef: SecACL?
-        let aclStatus = SecACLCreateWithSimpleContents(
-            access,
-            nil,
-            service as CFString,
-            [],
-            &newACLRef
-        )
-        guard aclStatus == errSecSuccess, let newACL = newACLRef else {
-            throw KeychainError.unexpectedStatus(aclStatus)
-        }
-
-        let updateStatus = SecACLUpdateAuthorizations(newACL, allAuthorizations)
-        guard updateStatus == errSecSuccess else {
-            throw KeychainError.unexpectedStatus(updateStatus)
-        }
-
-        return access
+    private static var storeURL: URL {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return home.appendingPathComponent(".ghostbox").appendingPathComponent(fileName)
     }
 
     static func save(token: String) throws {
-        // Delete first to recreate with proper ACLs
-        SecItemDelete(baseQuery as CFDictionary)
+        let directory = storeURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
 
-        let tokenData = Data(token.utf8)
-        var addQuery = baseQuery
-        addQuery[kSecValueData] = tokenData
+        let data = Data(token.utf8)
+        try data.write(to: storeURL, options: [.atomic])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: storeURL.path
+        )
 
-        // Use SecAccess with unrestricted ACLs so any code signature can read it
-        let access = try createUnrestrictedAccess()
-        addQuery[kSecAttrAccess] = access
-
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw KeychainError.unexpectedStatus(status)
-        }
+        removeLegacyKeychainItem()
     }
 
     static func loadToken() -> String? {
-        var query = baseQuery
+        if let data = try? Data(contentsOf: storeURL),
+           let token = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !token.isEmpty {
+            return token
+        }
+
+        if let migrated = migrateLegacyKeychainItem() {
+            return migrated
+        }
+
+        return nil
+    }
+
+    static func deleteToken() {
+        try? FileManager.default.removeItem(at: storeURL)
+        removeLegacyKeychainItem()
+    }
+
+    // Reads the old keychain item (if any), writes it to file, then removes it
+    // from the keychain. This may prompt once if the old partition_list blocks
+    // the current binary; after success the keychain entry is gone and no
+    // further prompts can occur.
+    private static func migrateLegacyKeychainItem() -> String? {
+        var query = legacyBaseQuery
         query[kSecReturnData] = kCFBooleanTrue
         query[kSecMatchLimit] = kSecMatchLimitOne
 
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
-
-        guard status != errSecItemNotFound else {
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let token = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty else {
             return nil
         }
 
-        guard status == errSecSuccess, let data = item as? Data else {
-            return nil
-        }
-
-        return String(data: data, encoding: .utf8)
+        try? save(token: token)
+        return token
     }
 
-    static func deleteToken() {
-        SecItemDelete(baseQuery as CFDictionary)
+    private static func removeLegacyKeychainItem() {
+        SecItemDelete(legacyBaseQuery as CFDictionary)
+    }
+
+    private static var legacyBaseQuery: [CFString: Any] {
+        [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: legacyService,
+            kSecAttrAccount: legacyAccount,
+        ]
     }
 }
