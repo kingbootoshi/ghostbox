@@ -1090,6 +1090,7 @@ const buildClaudeArgs = async (
     "--output-format",
     "stream-json",
     "--verbose",
+    "--include-partial-messages",
     "--append-system-prompt",
     snapshotPrompt,
     "--mcp-config",
