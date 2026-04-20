@@ -524,6 +524,14 @@ const ensureClaudeSupportFiles = async (): Promise<void> => {
         ghostbox: {
           command: "node",
           args: ["/ghostbox-mcp-server.js"]
+        },
+        exa: {
+          type: "http",
+          url: "https://mcp.exa.ai/mcp"
+        },
+        qmd: {
+          command: "node",
+          args: ["/qmd-mcp-server.js"]
         }
       }
     };

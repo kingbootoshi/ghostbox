@@ -39,6 +39,7 @@ COPY skills/ghostbox-api/SKILL.md /opt/ghostbox/skills/ghostbox-api/SKILL.md
 COPY ghost-server.js /ghost-server.js
 COPY ghost-server-claude.js /ghost-server-claude.js
 COPY ghostbox-mcp-server.js /ghostbox-mcp-server.js
+COPY qmd-mcp-server.js /qmd-mcp-server.js
 COPY entrypoint.sh /entrypoint.sh
 COPY ghost-save /usr/local/bin/ghost-save
 COPY ghost-changelog /usr/local/bin/ghost-changelog

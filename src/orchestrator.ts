@@ -283,7 +283,7 @@ const syncBundledBaseExtensions = async (destinationPath: string): Promise<void>
   );
 };
 
-export const ensureBaseExtensions = async (): Promise<void> => {
+const ensureBaseExtensions = async (): Promise<void> => {
   const basePath = getBasePath();
   const baseExtensionsPath = getBaseExtensionsPath();
 
@@ -347,6 +347,14 @@ const writeClaudeMcpConfig = async (path: string): Promise<void> => {
       ghostbox: {
         command: "node",
         args: ["/ghostbox-mcp-server.js"]
+      },
+      exa: {
+        type: "http",
+        url: "https://mcp.exa.ai/mcp"
+      },
+      qmd: {
+        command: "node",
+        args: ["/qmd-mcp-server.js"]
       }
     }
   };
