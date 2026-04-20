@@ -1159,6 +1159,7 @@ var runCompactCommand = async () => {
   });
 };
 var listSupportedCommands = () => [
+  { name: "/model", description: "Show or switch model: /model <provider/id>" },
   { name: "/compact", description: "Compact the current session and reduce context." },
   { name: "/new", description: "Start a fresh Claude Code session." },
   { name: "/reload", description: "No-op for Claude Code compatibility." },
@@ -1173,6 +1174,16 @@ var handleSlashCommand = async (res, prompt) => {
   if (slash.command === "help") {
     sendAssistantResult(res, listSupportedCommands().map((command) => `${command.name} - ${command.description}`).join(`
 `), currentSessionId ?? "");
+    return true;
+  }
+  if (slash.command === "model") {
+    const nextModelValue = slash.args.trim();
+    if (!nextModelValue) {
+      sendAssistantResult(res, `Current model: ${currentModel}`, currentSessionId ?? "");
+      return true;
+    }
+    currentModel = stripAnthropicPrefix(nextModelValue);
+    sendAssistantResult(res, `Model switched to ${currentModel}.`, currentSessionId ?? "");
     return true;
   }
   if (slash.command === "reload") {
