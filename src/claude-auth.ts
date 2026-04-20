@@ -1,6 +1,8 @@
 import { spawn as nodeSpawn } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { createLogger } from "./logger";
 import { readAuthTokens, writeAuthTokens } from "./oauth";
 import type { AuthTokenStore, ClaudeCodeTokenRecord } from "./types";
@@ -9,6 +11,11 @@ import { getHomeDirectory } from "./utils";
 const SETUP_TOKEN_PATTERN = /sk-ant-[^\s"'`]+/g;
 const EXPIRY_WARNING_BUFFER_MS = 5 * 60 * 1000;
 const CLAUDE_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
+const CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+const CLAUDE_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback";
+const CLAUDE_TOKEN_LIFETIME_SECONDS = 31_536_000;
 const log = createLogger("claude-auth");
 let claudeTokenRefresherStarted = false;
 
@@ -50,7 +57,7 @@ const saveClaudeCodeToken = async (record: ClaudeCodeTokenRecord): Promise<void>
   await writeAuthTokens(nextStore);
 };
 
-export async function readKeychainClaudeToken(): Promise<ClaudeCodeTokenRecord | null> {
+async function readKeychainClaudeToken(): Promise<ClaudeCodeTokenRecord | null> {
   if (process.platform !== "darwin") {
     return null;
   }
@@ -96,7 +103,7 @@ export async function readKeychainClaudeToken(): Promise<ClaudeCodeTokenRecord |
   return toClaudeCodeTokenRecord(parsed.claudeAiOauth, "keychain");
 }
 
-export async function runSetupToken(): Promise<ClaudeCodeTokenRecord> {
+async function runSetupToken(): Promise<ClaudeCodeTokenRecord> {
   return new Promise((resolve, reject) => {
     const child = nodeSpawn("claude", ["setup-token"], {
       stdio: ["inherit", "pipe", "inherit"]
@@ -144,10 +151,144 @@ export async function runSetupToken(): Promise<ClaudeCodeTokenRecord> {
   });
 }
 
+type TokenExchangeResponse = {
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: number;
+};
+
+async function loginClaudeCodeDirect(): Promise<ClaudeCodeTokenRecord> {
+  const codeVerifier = randomBytes(32).toString("base64url");
+  const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
+  const state = randomBytes(32).toString("base64url");
+
+  const params = new URLSearchParams({
+    code: "true",
+    client_id: CLAUDE_CLIENT_ID,
+    response_type: "code",
+    redirect_uri: CLAUDE_REDIRECT_URI,
+    scope: "user:inference",
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256",
+    state
+  });
+
+  const authUrl = `${CLAUDE_AUTHORIZE_URL}?${params.toString()}`;
+
+  process.stdout.write("\nOpen this URL in the browser for the account you want to use:\n\n");
+  process.stdout.write(`  ${authUrl}\n\n`);
+  process.stdout.write("After authorizing, paste the code shown on screen.\n\n");
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  let code: string;
+  try {
+    code = await rl.question("Code: ");
+  } finally {
+    rl.close();
+  }
+
+  const cleaned = code.trim().split("#")[0]?.split("&")[0] ?? code.trim();
+  if (!cleaned) {
+    throw new Error("No code provided.");
+  }
+
+  const response = await fetch(CLAUDE_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json"
+    },
+    body: JSON.stringify({
+      grant_type: "authorization_code",
+      code: cleaned,
+      redirect_uri: CLAUDE_REDIRECT_URI,
+      client_id: CLAUDE_CLIENT_ID,
+      code_verifier: codeVerifier,
+      state,
+      expires_in: CLAUDE_TOKEN_LIFETIME_SECONDS
+    }),
+    signal: AbortSignal.timeout(30_000)
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Token exchange failed (${response.status}): ${text.slice(0, 200)}`);
+  }
+
+  const data = (await response.json()) as TokenExchangeResponse;
+  if (!data.access_token) {
+    throw new Error("Token exchange returned no access token.");
+  }
+
+  const expiresAt =
+    typeof data.expires_in === "number"
+      ? Date.now() + data.expires_in * 1000
+      : Date.now() + CLAUDE_TOKEN_LIFETIME_SECONDS * 1000;
+
+  return {
+    type: "claude-code",
+    accessToken: data.access_token,
+    ...(data.refresh_token ? { refreshToken: data.refresh_token } : {}),
+    expiresAt,
+    source: "direct"
+  };
+}
+
+async function refreshDirectToken(record: ClaudeCodeTokenRecord): Promise<ClaudeCodeTokenRecord> {
+  if (!record.refreshToken) {
+    return record;
+  }
+
+  if (typeof record.expiresAt !== "number" || Date.now() + EXPIRY_WARNING_BUFFER_MS < record.expiresAt) {
+    return record;
+  }
+
+  log.info("Refreshing direct Claude Code token");
+
+  const response = await fetch(CLAUDE_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json"
+    },
+    body: JSON.stringify({
+      grant_type: "refresh_token",
+      client_id: CLAUDE_CLIENT_ID,
+      refresh_token: record.refreshToken
+    }),
+    signal: AbortSignal.timeout(30_000)
+  });
+
+  if (!response.ok) {
+    log.warn({ status: response.status }, "Direct token refresh failed");
+    return record;
+  }
+
+  const data = (await response.json()) as TokenExchangeResponse;
+  if (!data.access_token) {
+    return record;
+  }
+
+  const expiresAt =
+    typeof data.expires_in === "number"
+      ? Date.now() + data.expires_in * 1000
+      : Date.now() + CLAUDE_TOKEN_LIFETIME_SECONDS * 1000;
+
+  log.info({ expiresAt }, "Direct Claude Code token refreshed");
+
+  return {
+    type: "claude-code",
+    accessToken: data.access_token,
+    ...(data.refresh_token ? { refreshToken: data.refresh_token } : { refreshToken: record.refreshToken }),
+    expiresAt,
+    source: "direct"
+  };
+}
+
 export async function loginClaudeCode(): Promise<ClaudeCodeTokenRecord> {
-  const keychainRecord = await readKeychainClaudeToken();
-  const record = keychainRecord ?? (await runSetupToken());
+  const record = await loginClaudeCodeDirect();
   await saveClaudeCodeToken(record);
+  await syncRunningGhostCredentials(record);
   return record;
 }
 
@@ -155,6 +296,10 @@ export async function refreshClaudeCodeToken(record: ClaudeCodeTokenRecord): Pro
   if (record.source === "keychain") {
     const refreshed = await readKeychainClaudeToken();
     return refreshed ?? record;
+  }
+
+  if (record.source === "direct") {
+    return refreshDirectToken(record);
   }
 
   if (typeof record.expiresAt === "number" && Date.now() + EXPIRY_WARNING_BUFFER_MS >= record.expiresAt) {

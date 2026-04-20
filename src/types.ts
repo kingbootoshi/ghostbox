@@ -228,7 +228,7 @@ export interface ClaudeCodeTokenRecord {
   accessToken: string;
   refreshToken?: string;
   expiresAt?: number;
-  source: "keychain" | "setup-token";
+  source: "keychain" | "setup-token" | "direct";
 }
 
 export type AuthTokenStore = Partial<Record<AuthProvider, OAuthTokenRecord>> & {
