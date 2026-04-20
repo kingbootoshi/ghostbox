@@ -10,6 +10,7 @@ struct GhostModel: Identifiable, Hashable {
     var apiValue: String { modelId }
 
     static let all: [GhostModel] = [
+        GhostModel(provider: "anthropic", modelId: "claude-opus-4-7", displayName: "Opus 4.7", defaultReasoning: nil),
         GhostModel(provider: "anthropic", modelId: "claude-sonnet-4-6", displayName: "Sonnet 4.6", defaultReasoning: nil),
         GhostModel(provider: "anthropic", modelId: "claude-opus-4-6", displayName: "Opus 4.6", defaultReasoning: nil),
         GhostModel(provider: "anthropic", modelId: "claude-haiku-4-5", displayName: "Haiku 4.5", defaultReasoning: nil),

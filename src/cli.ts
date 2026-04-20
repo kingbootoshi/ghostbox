@@ -35,7 +35,7 @@ import { commitVault, pushVault } from "./vault";
 const DEFAULT_IMAGE_NAME = "ghostbox-agent";
 const DEFAULT_PROVIDER = "anthropic";
 const DEFAULT_MODEL_BY_PROVIDER: Record<string, string> = {
-  anthropic: "claude-sonnet-4-6",
+  anthropic: "claude-opus-4-7",
   openai: "gpt-5.3-codex"
 };
 const SUPPORTED_PROVIDERS = Object.keys(DEFAULT_MODEL_BY_PROVIDER);
@@ -733,7 +733,7 @@ const ensureTuiDependencies = (): void => {
   }
 
   throw new Error(
-    `TUI dependencies are not installed: ${missing.join(", ")}. Run "bun add ink @inkjs/ui react ink-markdown" first.`
+    `TUI dependencies are not installed: ${missing.join(", ")}. Run "bun add ink @inkjs/ui react" first.`
   );
 };
 
