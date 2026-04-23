@@ -89,9 +89,8 @@ struct HubSettingsView: View {
     let onRetry: () -> Void
     let onSave: () -> Void
 
-    @AppStorage("serverURL") private var serverURL = ""
-    @State private var serverToken = KeychainHelper.loadToken() ?? ""
-    @FocusState private var isServerTokenFocused: Bool
+    @State private var serverURL = ConnectionConfigStore.load()?.url ?? ConnectionConfig.defaultURLString
+    @State private var serverToken = ConnectionConfigStore.load()?.token ?? ""
 
     var body: some View {
         settingsContent
@@ -163,7 +162,6 @@ struct HubSettingsView: View {
 
                 HubFieldLabel("API Token")
                 HubSecureField("Not set", text: $serverToken)
-                    .focused($isServerTokenFocused)
                 Text("Required for remote servers. Get from ghostbox admin token.")
                     .font(Theme.Typography.caption())
                     .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
@@ -227,11 +225,6 @@ struct HubSettingsView: View {
             .buttonStyle(.plain)
             .disabled(isLoadingConfig || isSavingConfig)
         }
-        .onChange(of: isServerTokenFocused) {
-            if !isServerTokenFocused {
-                persistServerToken()
-            }
-        }
     }
 
     private func settingsFeedbackView(_ feedback: HubSettingsFeedback) -> some View {
@@ -253,19 +246,26 @@ struct HubSettingsView: View {
     }
 
     private func saveSettings() {
-        persistServerToken()
+        persistConnectionConfig()
         onSave()
     }
 
-    private func persistServerToken() {
+    private func persistConnectionConfig() {
+        serverURL = Self.sanitizedURL(serverURL)
         let sanitizedToken = Self.sanitizedToken(serverToken)
         serverToken = sanitizedToken
 
-        if sanitizedToken.isEmpty {
-            KeychainHelper.deleteToken()
-        } else {
-            try? KeychainHelper.save(token: sanitizedToken)
+        if serverURL.isEmpty && sanitizedToken.isEmpty {
+            ConnectionConfigStore.clear()
+            return
         }
+
+        guard !serverURL.isEmpty, !sanitizedToken.isEmpty else { return }
+        try? ConnectionConfigStore.save(url: serverURL, token: sanitizedToken)
+    }
+
+    private static func sanitizedURL(_ url: String) -> String {
+        url.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func sanitizedToken(_ token: String) -> String {

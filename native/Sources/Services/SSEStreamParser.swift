@@ -6,6 +6,12 @@ enum GhostStreamEvent {
     case done
 }
 
+struct RawSSEEvent {
+    let id: String?
+    let name: String
+    let data: String
+}
+
 struct SSEStreamParser {
     private static let logger = Logger(subsystem: "com.ghostbox.app", category: "network")
 
@@ -22,9 +28,52 @@ struct SSEStreamParser {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    for try await event in parseRaw(bytes: bytes, ghostName: ghostName) {
+                        switch event.name {
+                        case "done":
+                            continuation.yield(.done)
+                            continuation.finish()
+                            return
+                        case "error":
+                            let errorMessage = sseErrorMessage(from: event.data)
+                            continuation.finish(throwing: GhostboxClientError.requestFailed(statusCode: 0, message: errorMessage))
+                            return
+                        case "message":
+                            guard !event.data.isEmpty else { continue }
+                            let message = try decoder.decode(GhostMessage.self, from: Data(event.data.utf8))
+                            continuation.yield(.message(message))
+                        default:
+                            continue
+                        }
+                    }
+
+                    continuation.finish()
+                } catch is CancellationError {
+                    Self.logger.info("SSE parser task cancelled for ghost \(ghostName, privacy: .public).")
+                    continuation.finish()
+                } catch {
+                    Self.logger.error("SSE parser failed for ghost \(ghostName, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    func parseRaw(
+        bytes: URLSession.AsyncBytes,
+        ghostName: String
+    ) -> AsyncThrowingStream<RawSSEEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
                     var iterator = bytes.makeAsyncIterator()
                     var lineBuffer = Data()
                     var currentEvent: String?
+                    var currentId: String?
                     var dataLines: [String] = []
 
                     while let byte = try await iterator.next() {
@@ -41,6 +90,7 @@ struct SSEStreamParser {
                             if try processSSELine(
                                 line,
                                 currentEvent: &currentEvent,
+                                currentId: &currentId,
                                 dataLines: &dataLines,
                                 continuation: continuation
                             ) {
@@ -56,6 +106,7 @@ struct SSEStreamParser {
                         if try processSSELine(
                             line,
                             currentEvent: &currentEvent,
+                            currentId: &currentId,
                             dataLines: &dataLines,
                             continuation: continuation
                         ) {
@@ -65,6 +116,7 @@ struct SSEStreamParser {
 
                     if try handleSSEEvent(
                         name: currentEvent,
+                        id: currentId,
                         dataLines: dataLines,
                         continuation: continuation
                     ) {
@@ -90,15 +142,14 @@ struct SSEStreamParser {
     private func processSSELine(
         _ line: String,
         currentEvent: inout String?,
+        currentId: inout String?,
         dataLines: inout [String],
-        continuation: AsyncThrowingStream<GhostStreamEvent, Error>.Continuation
+        continuation: AsyncThrowingStream<RawSSEEvent, Error>.Continuation
     ) throws -> Bool {
-        let renderedLine = line.isEmpty ? "<blank>" : line
-        Self.logger.debug("SSE line: \(renderedLine, privacy: .public)")
-
         if line.isEmpty {
             if try handleSSEEvent(
                 name: currentEvent,
+                id: currentId,
                 dataLines: dataLines,
                 continuation: continuation
             ) {
@@ -106,6 +157,7 @@ struct SSEStreamParser {
             }
 
             currentEvent = nil
+            currentId = nil
             dataLines.removeAll(keepingCapacity: true)
             return false
         }
@@ -116,11 +168,10 @@ struct SSEStreamParser {
 
         if let eventName = sseValue(for: "event:", in: line) {
             currentEvent = eventName.trimmingCharacters(in: .whitespacesAndNewlines)
-            let renderedEvent = currentEvent ?? "<none>"
-            Self.logger.debug("SSE event name: \(renderedEvent, privacy: .public)")
+        } else if let eventId = sseValue(for: "id:", in: line) {
+            currentId = eventId.trimmingCharacters(in: .whitespacesAndNewlines)
         } else if let data = sseValue(for: "data:", in: line) {
             dataLines.append(data)
-            Self.logger.debug("SSE data: \(data, privacy: .public)")
         }
 
         return false
@@ -128,42 +179,25 @@ struct SSEStreamParser {
 
     private func handleSSEEvent(
         name: String?,
+        id: String?,
         dataLines: [String],
-        continuation: AsyncThrowingStream<GhostStreamEvent, Error>.Continuation
+        continuation: AsyncThrowingStream<RawSSEEvent, Error>.Continuation
     ) throws -> Bool {
         let eventName = name ?? "message"
-        Self.logger.debug("Handling SSE event '\(eventName, privacy: .public)' with \(dataLines.count) data line(s).")
+
+        let payload = dataLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        if payload.isEmpty && eventName != "done" {
+            return false
+        }
+
+        continuation.yield(RawSSEEvent(id: id, name: eventName, data: payload))
 
         if eventName == "done" {
-            continuation.yield(.done)
             continuation.finish()
             return true
         }
 
-        if eventName == "error" {
-            let payload = dataLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-            let errorMessage = sseErrorMessage(from: payload)
-            continuation.finish(throwing: GhostboxClientError.requestFailed(statusCode: 0, message: errorMessage))
-            return true
-        }
-
-        guard eventName == "message" else {
-            return false
-        }
-
-        let payload = dataLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !payload.isEmpty else {
-            return false
-        }
-
-        do {
-            let message = try decoder.decode(GhostMessage.self, from: Data(payload.utf8))
-            Self.logger.debug("Decoded ghost message of type '\(message.type.rawValue, privacy: .public)'.")
-            continuation.yield(.message(message))
-            return false
-        } catch {
-            throw GhostboxClientError.decodingFailed(error)
-        }
+        return false
     }
 
     private func decodeSSELine(from data: Data) -> String {

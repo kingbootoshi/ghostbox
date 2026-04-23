@@ -69,6 +69,26 @@ enum ChatDisplayItem: Identifiable {
         }
     }
 
+    static func patch(existing: [ChatDisplayItem], from messages: [ChatMessage]) -> [ChatDisplayItem] {
+        let messagesByID = Dictionary(uniqueKeysWithValues: messages.map { ($0.id, $0) })
+
+        return existing.map { item in
+            switch item {
+            case .message(let message, let showsBreakAfter):
+                let updatedMessage = messagesByID[message.id] ?? message
+                return .message(updatedMessage, showsBreakAfter: showsBreakAfter)
+
+            case .toolGroup(let group, let showsBreakAfter):
+                let updatedToolUse = messagesByID[group.toolUse.id] ?? group.toolUse
+                let updatedToolResult = group.toolResult.flatMap { messagesByID[$0.id] } ?? group.toolResult
+                return .toolGroup(
+                    ToolCallGroup(toolUse: updatedToolUse, toolResult: updatedToolResult),
+                    showsBreakAfter: showsBreakAfter
+                )
+            }
+        }
+    }
+
     private static func needsBreak(after current: ChatDisplayItem, before next: ChatDisplayItem) -> Bool {
         current.isUserMessage != next.isUserMessage
     }

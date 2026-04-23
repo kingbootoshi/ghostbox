@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 
 import { app, ensureApiAdminToken, ScheduleManager } from "../../src/api";
+import type { GhostRuntimeMeta } from "../../src/types";
 import { createConfig, createGhostState, createState, createTestHome } from "../support/test-state";
 
 type TestHome = Awaited<ReturnType<typeof createTestHome>>;
@@ -54,6 +56,53 @@ const getWithMailAuth = (path: string, token: string): Promise<Response> => {
   return app.request(path, {
     headers: apiHeaders(token)
   });
+};
+
+const sendJson = (res: ServerResponse, status: number, body: unknown): void => {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+};
+
+const startGhostStub = async (
+  handler: (req: IncomingMessage, res: ServerResponse, requests: string[]) => void | Promise<void>
+): Promise<{
+  port: number;
+  requests: string[];
+  close: () => Promise<void>;
+}> => {
+  const requests: string[] = [];
+  const server = createServer((req, res) => {
+    const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    requests.push(pathname);
+    Promise.resolve(handler(req, res, requests)).catch((error) => {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, () => resolve());
+  });
+
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Failed to start ghost stub");
+  }
+
+  return {
+    port: address.port,
+    requests,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      })
+  };
 };
 
 describe("api route validation", () => {
@@ -185,6 +234,150 @@ describe("api route validation", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ status: "ok" });
+  });
+
+  test("GET /api/ghosts/:name/history rejects invalid pagination query values", async () => {
+    const invalidLimit = await app.request("/api/ghosts/demo/history?limit=abc", {
+      headers: apiHeaders(TEST_ADMIN_TOKEN)
+    });
+    expect(invalidLimit.status).toBe(400);
+    expect(await invalidLimit.json()).toEqual({ error: "Invalid history limit." });
+
+    const invalidCursor = await app.request("/api/ghosts/demo/history?limit=25&before=-1", {
+      headers: apiHeaders(TEST_ADMIN_TOKEN)
+    });
+    expect(invalidCursor.status).toBe(400);
+    expect(await invalidCursor.json()).toEqual({ error: "Invalid history cursor." });
+
+    const invalidSegment = await app.request("/api/ghosts/demo/history?limit=25&segment=future", {
+      headers: apiHeaders(TEST_ADMIN_TOKEN)
+    });
+    expect(invalidSegment.status).toBe(400);
+    expect(await invalidSegment.json()).toEqual({ error: 'Invalid history segment "future".' });
+  });
+
+  test("GET /api/ghosts/:name/runtime/meta proxies adapter runtime meta", async () => {
+    const runtimeMeta: GhostRuntimeMeta = {
+      adapter: "claude-code",
+      runtimeVersion: "node/v22.15.0",
+      imageVersion: "gb-meta1234",
+      supportedCapabilities: ["message", "history", "sessions", "stats", "commands"],
+      supportedCommands: [{ name: "/help", description: "List available slash commands." }],
+      currentModel: "claude-sonnet-4-6",
+      currentSessionId: "session-123"
+    };
+    const stub = await startGhostStub((req, res) => {
+      if (req.method === "GET" && req.url === "/runtime/meta") {
+        sendJson(res, 200, runtimeMeta);
+        return;
+      }
+
+      sendJson(res, 404, { error: "Not found" });
+    });
+
+    try {
+      await testHome.writeState(
+        createState({
+          ghosts: {
+            demo: createGhostState({ portBase: stub.port })
+          }
+        })
+      );
+
+      const response = await app.request("/api/ghosts/demo/runtime/meta", {
+        headers: apiHeaders(TEST_ADMIN_TOKEN)
+      });
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual(runtimeMeta);
+      expect(stub.requests).toEqual(["/runtime/meta"]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  test("POST /api/ghosts/:name/reload fails fast when Claude runtime meta does not support reload", async () => {
+    const stub = await startGhostStub((req, res) => {
+      if (req.method === "GET" && req.url === "/runtime/meta") {
+        sendJson(res, 200, {
+          adapter: "claude-code",
+          runtimeVersion: "node/v22.15.0",
+          imageVersion: "gb-meta1234",
+          supportedCapabilities: ["message", "history", "sessions", "stats", "commands"],
+          supportedCommands: [{ name: "/help", description: "List available slash commands." }],
+          currentModel: "claude-sonnet-4-6",
+          currentSessionId: null
+        } satisfies GhostRuntimeMeta);
+        return;
+      }
+
+      sendJson(res, 500, { error: "reload endpoint should not be called" });
+    });
+
+    try {
+      await testHome.writeState(
+        createState({
+          ghosts: {
+            demo: createGhostState({ portBase: stub.port })
+          }
+        })
+      );
+
+      const response = await app.request("/api/ghosts/demo/reload", {
+        method: "POST",
+        headers: apiHeaders(TEST_ADMIN_TOKEN)
+      });
+
+      expect(response.status).toBe(501);
+      expect(await response.json()).toEqual({
+        error: "Reload is not supported by the claude-code adapter."
+      });
+      expect(stub.requests).toEqual(["/runtime/meta"]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  test("POST /api/ghosts/:name/tasks/:taskId/kill fails fast when Claude runtime meta does not support background task kill", async () => {
+    const stub = await startGhostStub((req, res) => {
+      if (req.method === "GET" && req.url === "/runtime/meta") {
+        sendJson(res, 200, {
+          adapter: "claude-code",
+          runtimeVersion: "node/v22.15.0",
+          imageVersion: "gb-meta1234",
+          supportedCapabilities: ["message", "history", "sessions", "stats", "commands"],
+          supportedCommands: [{ name: "/help", description: "List available slash commands." }],
+          currentModel: "claude-sonnet-4-6",
+          currentSessionId: null
+        } satisfies GhostRuntimeMeta);
+        return;
+      }
+
+      sendJson(res, 500, { error: "task kill endpoint should not be called" });
+    });
+
+    try {
+      await testHome.writeState(
+        createState({
+          ghosts: {
+            demo: createGhostState({ portBase: stub.port })
+          }
+        })
+      );
+
+      const response = await app.request("/api/ghosts/demo/tasks/task-1/kill", {
+        method: "POST",
+        headers: apiHeaders(TEST_ADMIN_TOKEN)
+      });
+
+      expect(response.status).toBe(501);
+      expect(await response.json()).toEqual({
+        error: "Background task killing is not supported by the claude-code adapter."
+      });
+      expect(stub.requests).toEqual(["/runtime/meta"]);
+    } finally {
+      await stub.close();
+    }
   });
 
   test("non-mail API routes require bearer auth", async () => {

@@ -7,7 +7,7 @@ import UserNotifications
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private(set) var client: GhostboxClient = GhostboxClient.fromUserDefaults()
+    private(set) var client: GhostboxClient = GhostboxClient.fromConnectionConfig()
 
     private lazy var appState = AppState(client: client)
     private var hubPanelController: HubPanelController?
@@ -23,9 +23,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var baseMenuBarIcon: NSImage?
     private var unreadObservation: AnyCancellable?
     private var lastRenderedBadgeCount: Int?
+    private var realtimeTask: Task<Void, Never>?
+
+    private let realtimeCursorKey = "ghostbox.realtime.lastEventId"
 
     private var hasConnection: Bool {
-        GhostboxClient.fromUserDefaults().token != nil
+        ConnectionConfigStore.load() != nil
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -41,7 +44,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenuBar()
         setupNotifications()
         setupHotkey()
-        migrateLegacyServerTokenIfNeeded()
 
         if hasConnection {
             launchHub()
@@ -53,8 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func showConnectionWindow() {
         let connectionView = ConnectionView { [weak self] url, token in
             guard let self else { return }
-            UserDefaults.standard.set(url, forKey: "serverURL")
-            try? KeychainHelper.save(token: token)
+            try? ConnectionConfigStore.save(url: url, token: token)
 
             self.client = GhostboxClient(baseURL: URL(string: url), token: token)
             self.appState = AppState(client: self.client)
@@ -107,19 +108,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
     }
 
-    private func migrateLegacyServerTokenIfNeeded() {
-        let defaults = UserDefaults.standard
-        guard let legacyToken = defaults.string(forKey: "serverToken"), !legacyToken.isEmpty else {
-            return
-        }
-
-        if KeychainHelper.loadToken() == nil {
-            try? KeychainHelper.save(token: legacyToken)
-        }
-
-        defaults.removeObject(forKey: "serverToken")
-    }
-
     private func launchHub() {
         hubPanelController = HubPanelController(client: client, appState: appState)
         hubPanelController?.createPanelHidden()
@@ -134,11 +122,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await ensureServerRunning()
             appState.isStartingServer = false
             appState.serverStatus = nil
-            _ = try? await client.listGhosts()
+            await appState.refreshGhosts()
+            startRealtimeEvents()
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        stopRealtimeEvents()
         closeChatAll()
         if let process = serverProcess, process.isRunning {
             process.terminate()
@@ -276,8 +266,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func closeChat(ghostName: String) {
-        guard let controller = chatPanelControllers[ghostName] else { return }
-        controller.hide()
+        guard let controller = chatPanelControllers.removeValue(forKey: ghostName) else { return }
+        controller.close {
+            _ = controller
+        }
     }
 
     func closeChatAll() {
@@ -485,8 +477,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func disconnectMenuAction() {
-        UserDefaults.standard.removeObject(forKey: "serverURL")
-        KeychainHelper.deleteToken()
+        stopRealtimeEvents()
+        ConnectionConfigStore.clear()
         closeChatAll()
         hubPanelController?.hide()
         hubPanelController = nil
@@ -503,6 +495,121 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func handleCloseGhostChat(_ notification: Notification) {
         guard let ghostName = notification.userInfo?["ghostName"] as? String else { return }
         closeChat(ghostName: ghostName)
+    }
+
+    private func startRealtimeEvents() {
+        stopRealtimeEvents()
+        realtimeTask = Task { [weak self] in
+            await self?.runRealtimeEventsLoop()
+        }
+    }
+
+    private func stopRealtimeEvents() {
+        realtimeTask?.cancel()
+        realtimeTask = nil
+    }
+
+    private func runRealtimeEventsLoop() async {
+        var attempt = 0
+
+        while !Task.isCancelled {
+            do {
+                try await consumeRealtimeEvents()
+                attempt = 0
+            } catch is CancellationError {
+                return
+            } catch {
+                attempt += 1
+                let delay = min(pow(2.0, Double(max(0, attempt - 1))), 30)
+                try? await Task.sleep(for: .seconds(delay))
+            }
+        }
+    }
+
+    private func consumeRealtimeEvents() async throws {
+        let cursor = appState.lastRealtimeEventId ?? UserDefaults.standard.string(forKey: realtimeCursorKey)
+
+        for try await event in client.streamEvents(lastEventId: cursor) {
+            guard !Task.isCancelled else {
+                throw CancellationError()
+            }
+
+            switch event {
+            case .snapshot(let id, let ghosts):
+                appState.replaceGhosts(ghosts)
+                storeRealtimeCursor(id)
+            case .ghostUpsert(let id, let ghost):
+                appState.upsertGhost(ghost)
+                storeRealtimeCursor(id)
+                NotificationCenter.default.post(
+                    name: .ghostRealtimeEvent,
+                    object: nil,
+                    userInfo: [
+                        "ghostName": ghost.name,
+                        "type": "ghost.upsert",
+                        "ghost": ghost,
+                    ]
+                )
+            case .ghostRemove(let id, let ghostName):
+                closeChat(ghostName: ghostName)
+                appState.removeGhost(ghostName)
+                storeRealtimeCursor(id)
+                NotificationCenter.default.post(
+                    name: .ghostRealtimeEvent,
+                    object: nil,
+                    userInfo: [
+                        "ghostName": ghostName,
+                        "type": "ghost.remove",
+                    ]
+                )
+            case .messageCompleted(let id, let ghostName, let sessionId, let preview):
+                storeRealtimeCursor(id)
+
+                if !isGhostPanelVisible(ghostName: ghostName) && !preview.isEmpty {
+                    appState.markUnread(ghostName)
+                    deliverGhostNotification(ghostName: ghostName, preview: preview)
+                }
+
+                NotificationCenter.default.post(
+                    name: .ghostRealtimeEvent,
+                    object: nil,
+                    userInfo: [
+                        "ghostName": ghostName,
+                        "type": "message.completed",
+                        "sessionId": sessionId,
+                        "preview": preview,
+                    ]
+                )
+            }
+        }
+    }
+
+    private func storeRealtimeCursor(_ eventId: String) {
+        appState.lastRealtimeEventId = eventId
+        UserDefaults.standard.set(eventId, forKey: realtimeCursorKey)
+    }
+
+    private func isGhostPanelVisible(ghostName: String) -> Bool {
+        NSApp.windows.contains { window in
+            window.isVisible && window.title == ghostName
+        }
+    }
+
+    private func deliverGhostNotification(ghostName: String, preview: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Ghostbox - \(ghostName)"
+        content.body = String(preview.prefix(100))
+        content.sound = .none
+        content.categoryIdentifier = "GHOST_MESSAGE"
+        content.userInfo = ["ghostName": ghostName]
+
+        let request = UNNotificationRequest(
+            identifier: "ghost-realtime-\(ghostName)-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+
+        UNUserNotificationCenter.current().add(request)
     }
 }
 

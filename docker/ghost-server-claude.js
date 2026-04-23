@@ -23,6 +23,7 @@ var GHOSTBOX_SKILL_PATH = "/opt/ghostbox/skills/ghostbox-api/SKILL.md";
 var GHOSTBOX_API_PORT = process.env.GHOSTBOX_API_PORT || "8008";
 var GHOSTBOX_HOST_BASE = `http://host.docker.internal:${GHOSTBOX_API_PORT}`;
 var GHOSTBOX_GHOST_NAME = process.env.GHOSTBOX_GHOST_NAME || "";
+var GHOSTBOX_IMAGE_VERSION = process.env.GHOSTBOX_IMAGE_VERSION?.trim() || null;
 var MEMORY_PATH = "/vault/MEMORY.md";
 var USER_PATH = "/vault/USER.md";
 var HEARTBEAT_INTERVAL_MS = 30000;
@@ -35,6 +36,20 @@ var SUPPORTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "im
 var defaultSystemPrompt = 'You are a ghost agent. Your vault at /vault is your persistent memory. Use memory_write to save facts (target "memory" for notes, target "user" for user profile). Use memory_show to check your current memory. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
 var memoryCharLimit = 4000;
 var userCharLimit = 2000;
+var runtimeVersion = `node/${process.version}`;
+var CLAUDE_SUPPORTED_CAPABILITIES = [
+  "message",
+  "steer",
+  "queue",
+  "history",
+  "sessions",
+  "stats",
+  "commands",
+  "compact",
+  "newSession",
+  "abort",
+  "schedules"
+];
 
 class NudgeRegistry {
   #handlers = new Map;
@@ -461,22 +476,98 @@ var parseHistoryMessage = (line) => {
   }
   return null;
 };
-var parseCompactions = (lines) => {
-  return lines.filter((line) => line.isReplay === true && getString(line.type) === "local-command-stdout").map((line) => ({
-    timestamp: readSessionTimestamp(line, new Date),
-    summary: extractText(line.message ?? line.content ?? line.text) || "Session compacted.",
-    tokensBefore: 0
-  })).filter((entry) => entry.summary.toLowerCase().includes("compact"));
+var collectCompactionInfo = (lines) => {
+  let lastCompactionIndex = -1;
+  const compactions = [];
+  lines.forEach((line, index) => {
+    if (!(line.isReplay === true && getString(line.type) === "local-command-stdout")) {
+      return;
+    }
+    const summary = extractText(line.message ?? line.content ?? line.text) || "Session compacted.";
+    if (!summary.toLowerCase().includes("compact")) {
+      return;
+    }
+    lastCompactionIndex = index;
+    compactions.push({
+      timestamp: readSessionTimestamp(line, new Date),
+      summary,
+      tokensBefore: 0
+    });
+  });
+  return { lastCompactionIndex, compactions };
+};
+var paginateHistoryMessages = (messages, before, limit) => {
+  const totalCount = messages.length;
+  const boundedBefore = before === undefined ? totalCount : Math.max(0, Math.min(before, totalCount));
+  const boundedLimit = Math.max(1, Math.min(limit, 200));
+  const startIndex = Math.max(0, boundedBefore - boundedLimit);
+  return {
+    messages: messages.slice(startIndex, boundedBefore),
+    totalCount,
+    nextBefore: startIndex > 0 ? startIndex : null
+  };
+};
+var parseHistoryRequest = (req) => {
+  const url = new URL(req.url ?? "/history", "http://localhost");
+  const limitValue = url.searchParams.get("limit");
+  const beforeValue = url.searchParams.get("before");
+  const segmentValue = url.searchParams.get("segment");
+  if (limitValue === null && beforeValue === null && segmentValue === null) {
+    return { paginated: false };
+  }
+  const segment = segmentValue === "pre" ? "pre" : "post";
+  const limit = Number(limitValue ?? "50");
+  const before = beforeValue === null ? undefined : Number(beforeValue);
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error("Invalid history limit");
+  }
+  if (before !== undefined && (!Number.isSafeInteger(before) || before < 0)) {
+    throw new Error("Invalid history cursor");
+  }
+  return {
+    paginated: true,
+    segment,
+    before,
+    limit
+  };
 };
 var loadHistoryResponse = async (sessionId) => {
   if (!sessionId || !await sessionFileExists(sessionId)) {
     return { messages: [], preCompactionMessages: [], compactions: [] };
   }
   const lines = await readJsonLines(getSessionFilePath(sessionId));
+  const { lastCompactionIndex, compactions } = collectCompactionInfo(lines);
+  const preCompactionMessages = [];
+  const messages = [];
+  lines.forEach((line, index) => {
+    const message = parseHistoryMessage(line);
+    if (message === null) {
+      return;
+    }
+    if (lastCompactionIndex >= 0 && index < lastCompactionIndex) {
+      preCompactionMessages.push(message);
+      return;
+    }
+    messages.push(message);
+  });
   return {
-    messages: lines.map(parseHistoryMessage).filter((message) => message !== null),
-    preCompactionMessages: [],
-    compactions: parseCompactions(lines)
+    messages,
+    preCompactionMessages,
+    compactions
+  };
+};
+var loadHistoryPageResponse = async (sessionId, segment, limit, before) => {
+  const history = await loadHistoryResponse(sessionId);
+  const segmentMessages = segment === "pre" ? history.preCompactionMessages : history.messages;
+  const page = paginateHistoryMessages(segmentMessages, before, limit);
+  return {
+    segment,
+    messages: page.messages,
+    totalCount: page.totalCount,
+    nextBefore: page.nextBefore,
+    compactions: history.compactions,
+    preCompactionCount: history.preCompactionMessages.length,
+    postCompactionCount: history.messages.length
   };
 };
 var loadSessions = async () => {
@@ -1162,9 +1253,17 @@ var listSupportedCommands = () => [
   { name: "/model", description: "Show or switch model: /model <provider/id>" },
   { name: "/compact", description: "Compact the current session and reduce context." },
   { name: "/new", description: "Start a fresh Claude Code session." },
-  { name: "/reload", description: "No-op for Claude Code compatibility." },
   { name: "/help", description: "List available slash commands." }
 ];
+var getRuntimeMeta = () => ({
+  adapter: "claude-code",
+  runtimeVersion,
+  imageVersion: GHOSTBOX_IMAGE_VERSION,
+  supportedCapabilities: [...CLAUDE_SUPPORTED_CAPABILITIES],
+  supportedCommands: listSupportedCommands(),
+  currentModel,
+  currentSessionId: currentSessionId ?? null
+});
 var handleSlashCommand = async (res, prompt) => {
   const slash = parseSlashPrompt(prompt);
   if (!slash) {
@@ -1187,7 +1286,7 @@ var handleSlashCommand = async (res, prompt) => {
     return true;
   }
   if (slash.command === "reload") {
-    sendAssistantResult(res, "Claude Code reload is not needed.", currentSessionId ?? "");
+    sendAssistantResult(res, "Reload is not supported by the claude-code adapter.", currentSessionId ?? "");
     return true;
   }
   if (slash.command === "new") {
@@ -1333,8 +1432,13 @@ var handleClearQueue = (res) => {
   queue.messages = [];
   sendJson(res, 200, response);
 };
-var handleHistory = async (res) => {
-  sendJson(res, 200, await loadHistoryResponse(currentSessionId));
+var handleHistory = async (req, res) => {
+  const historyRequest = parseHistoryRequest(req);
+  if (!historyRequest.paginated) {
+    sendJson(res, 200, await loadHistoryResponse(currentSessionId));
+    return;
+  }
+  sendJson(res, 200, await loadHistoryPageResponse(currentSessionId, historyRequest.segment, historyRequest.limit, historyRequest.before));
 };
 var handleSessions = async (res) => {
   sendJson(res, 200, await loadSessions());
@@ -1380,7 +1484,7 @@ var handleTaskKill = (res) => {
   sendJson(res, 501, { error: "Background task killing is not supported by the claude-code adapter." });
 };
 var handleReload = (res) => {
-  sendJson(res, 200, { status: "reloaded", warning: "No-op for claude-code adapter." });
+  sendJson(res, 501, { error: "Reload is not supported by the claude-code adapter." });
 };
 var handleSwitchSession = async (req, res) => {
   const body = await parseJsonBodyOrRespond(req, res);
@@ -1514,13 +1618,16 @@ var handleSchedules = async (req, res) => {
   sendJsonError(res, 405, "Method not allowed");
 };
 var handleNudgeStatus = (res) => {
-  sendJson(res, 200, { supported: false, status: "unsupported" });
+  sendJson(res, 501, { error: "Nudge status is not supported by the claude-code adapter." });
 };
 var handleNudge = (res) => {
-  sendJson(res, 200, { ok: true, warning: "Nudges are not supported by the claude-code adapter." });
+  sendJson(res, 501, { error: "Nudges are not supported by the claude-code adapter." });
 };
 var handleCommands = (res) => {
-  sendJson(res, 200, listSupportedCommands());
+  sendJson(res, 200, getRuntimeMeta().supportedCommands);
+};
+var handleRuntimeMeta = (res) => {
+  sendJson(res, 200, getRuntimeMeta());
 };
 var authenticateRequest = (req, res) => {
   if (configuredApiKeys.length === 0) {
@@ -1559,8 +1666,8 @@ var handleRequest = async (req, res) => {
     handleClearQueue(res);
     return;
   }
-  if (req.method === "GET" && req.url === "/history") {
-    await handleHistory(res);
+  if (req.method === "GET" && req.url?.startsWith("/history")) {
+    await handleHistory(req, res);
     return;
   }
   if (req.method === "GET" && req.url === "/sessions") {
@@ -1617,6 +1724,10 @@ var handleRequest = async (req, res) => {
   }
   if (req.method === "GET" && req.url === "/commands") {
     handleCommands(res);
+    return;
+  }
+  if (req.method === "GET" && req.url === "/runtime/meta") {
+    handleRuntimeMeta(res);
     return;
   }
   sendJsonError(res, 404, "Not found");

@@ -88,16 +88,20 @@ describe("orchestrator helpers", () => {
     const dockerDir = join(testHome.homeDir, "docker");
     const dockerFiles = [
       "ghost-server.js",
+      "ghost-server-claude.js",
+      "ghostbox-mcp-server.js",
       "Dockerfile",
       "entrypoint.sh",
       "ghost-changelog",
       "ghost-nudge",
       "qmd",
       "ghost-save",
-      "exa-search"
+      "exa-search",
+      "skills/ghostbox-api/SKILL.md"
     ];
 
     await mkdir(dockerDir, { recursive: true });
+    await mkdir(join(dockerDir, "skills/ghostbox-api"), { recursive: true });
     for (const file of dockerFiles) {
       await writeFile(join(dockerDir, file), `${file}-v1\n`, "utf8");
     }

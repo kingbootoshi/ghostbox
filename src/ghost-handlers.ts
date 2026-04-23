@@ -3,10 +3,12 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { basename } from "node:path";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
+import type { NudgeEvent } from "./ghost-memory";
 import type {
   CompactionInfo,
   GhostImage,
   GhostQueueState,
+  GhostRuntimeMeta,
   GhostSchedule,
   GhostStreamingBehavior,
   HistoryMessage,
@@ -36,6 +38,14 @@ type PiAgentMessage = {
   toolName?: string;
 };
 
+type SessionHistoryEntry = {
+  type: string;
+  message?: PiAgentMessage;
+  timestamp?: string;
+  summary?: string;
+  tokensBefore?: number;
+};
+
 type PiPromptImage = {
   type: "image";
   mimeType: string;
@@ -59,8 +69,16 @@ type SessionManagerEntry = {
   modified?: string | Date;
 };
 
+type HistorySegment = "post" | "pre";
+
+type HistoryPageResult = {
+  messages: HistoryMessage[];
+  totalCount: number;
+  nextBefore: number | null;
+};
+
 type NudgeController = {
-  emit: (...args: any[]) => Promise<void>;
+  emit: (event: NudgeEvent, reason: string) => Promise<void>;
   resetCounters: () => void;
   status: () => unknown;
 };
@@ -86,8 +104,9 @@ type GhostHandlersDependencies = {
   setSessionManager: (sessionManager: SessionManager) => void;
   createManagedSession: (nextSessionManager: SessionManager) => Promise<AgentSession>;
   getCurrentModelValue: () => string;
+  getRuntimeMeta: () => GhostRuntimeMeta;
   nudges: NudgeController;
-  nudgeEvents: readonly string[];
+  nudgeEvents: readonly NudgeEvent[];
   listScheduleOperation: () => Promise<{ data: GhostSchedule[]; text: string }>;
   createScheduleOperation: (
     input: { cron?: string; prompt?: string; once?: boolean; timezone?: string },
@@ -111,6 +130,150 @@ const sendJson = (res: ServerResponse, status: number, body: unknown): void => {
 
 const sendJsonError = (res: ServerResponse, status: number, message: string): void => {
   sendJson(res, status, { error: message });
+};
+
+const isNudgeEvent = (value: string, nudgeEvents: readonly NudgeEvent[]): value is NudgeEvent =>
+  nudgeEvents.some((event) => event === value);
+
+const getSessionEntries = (sessionManager: SessionManager): SessionHistoryEntry[] =>
+  (
+    sessionManager as SessionManager & {
+      getEntries: () => SessionHistoryEntry[];
+    }
+  ).getEntries();
+
+const historyMessagesForMessage = (
+  message: PiAgentMessage,
+  getHistoryMessages: (messages: PiAgentMessage[]) => HistoryMessage[]
+): HistoryMessage[] => getHistoryMessages([message]);
+
+const countHistoryMessages = (
+  messages: PiAgentMessage[],
+  getHistoryMessages: (messages: PiAgentMessage[]) => HistoryMessage[]
+): number =>
+  messages.reduce((total, message) => total + historyMessagesForMessage(message, getHistoryMessages).length, 0);
+
+const paginateHistoryMessages = (
+  messages: PiAgentMessage[],
+  getHistoryMessages: (messages: PiAgentMessage[]) => HistoryMessage[],
+  before: number | undefined,
+  limit: number
+): HistoryPageResult => {
+  const totalCount = countHistoryMessages(messages, getHistoryMessages);
+  const boundedBefore = before === undefined ? totalCount : Math.max(0, Math.min(before, totalCount));
+  const boundedLimit = Math.max(1, Math.min(limit, 200));
+  const startIndex = Math.max(0, boundedBefore - boundedLimit);
+  const page: HistoryMessage[] = [];
+
+  let seen = 0;
+  for (const message of messages) {
+    if (seen >= boundedBefore) {
+      break;
+    }
+
+    const chunk = historyMessagesForMessage(message, getHistoryMessages);
+    if (chunk.length === 0) {
+      continue;
+    }
+
+    const chunkStart = seen;
+    const chunkEnd = seen + chunk.length;
+
+    if (chunkEnd > startIndex && chunkStart < boundedBefore) {
+      const localStart = Math.max(0, startIndex - chunkStart);
+      const localEnd = Math.min(chunk.length, boundedBefore - chunkStart);
+      page.push(...chunk.slice(localStart, localEnd));
+    }
+
+    seen = chunkEnd;
+  }
+
+  return {
+    messages: page,
+    totalCount,
+    nextBefore: startIndex > 0 ? startIndex : null
+  };
+};
+
+const collectCompactionInfo = (
+  entries: SessionHistoryEntry[]
+): { lastCompactionIndex: number; compactions: CompactionInfo[] } => {
+  let lastCompactionIndex = -1;
+  const compactions: CompactionInfo[] = [];
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry.type === "compaction") {
+      lastCompactionIndex = i;
+      compactions.push({
+        timestamp: entry.timestamp ?? "",
+        summary: entry.summary ?? "",
+        tokensBefore: entry.tokensBefore ?? 0
+      });
+    }
+  }
+
+  return { lastCompactionIndex, compactions };
+};
+
+const splitMessagesAroundLastCompaction = (
+  entries: SessionHistoryEntry[],
+  lastCompactionIndex: number
+): { pre: PiAgentMessage[]; post: PiAgentMessage[] } => {
+  const pre: PiAgentMessage[] = [];
+  const post: PiAgentMessage[] = [];
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry.type !== "message") {
+      continue;
+    }
+
+    const message = entry.message;
+    if (!message) {
+      continue;
+    }
+
+    if (lastCompactionIndex >= 0 && i < lastCompactionIndex) {
+      pre.push(message);
+    } else {
+      post.push(message);
+    }
+  }
+
+  return { pre, post };
+};
+
+const parseHistoryRequest = (
+  req: IncomingMessage
+): { paginated: false } | { paginated: true; segment: HistorySegment; before: number | undefined; limit: number } => {
+  const url = new URL(req.url ?? "/history", "http://localhost");
+  const limitValue = url.searchParams.get("limit");
+  const beforeValue = url.searchParams.get("before");
+  const segmentValue = url.searchParams.get("segment");
+
+  if (limitValue === null && beforeValue === null && segmentValue === null) {
+    return { paginated: false };
+  }
+
+  const segment: HistorySegment = segmentValue === "pre" ? "pre" : "post";
+  const limit = Number(limitValue ?? "50");
+  const before = beforeValue === null ? undefined : Number(beforeValue);
+
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error("Invalid history limit");
+  }
+
+  if (before !== undefined && (!Number.isSafeInteger(before) || before < 0)) {
+    throw new Error("Invalid history cursor");
+  }
+
+  return {
+    paginated: true,
+    segment,
+    before,
+    limit
+  };
 };
 
 const withJsonResponse = async (
@@ -234,6 +397,7 @@ export const createGhostHandlers = ({
   setSessionManager,
   createManagedSession,
   getCurrentModelValue,
+  getRuntimeMeta,
   nudges,
   nudgeEvents,
   listScheduleOperation,
@@ -246,7 +410,8 @@ export const createGhostHandlers = ({
       return;
     }
 
-    const requestBody = typeof body === "object" && body !== null ? (body as { prompt?: unknown; images?: unknown }) : {};
+    const requestBody =
+      typeof body === "object" && body !== null ? (body as { prompt?: unknown; images?: unknown }) : {};
 
     if (typeof requestBody.prompt !== "string") {
       sendJsonError(res, 400, "Missing prompt");
@@ -353,7 +518,15 @@ export const createGhostHandlers = ({
       const handler = slashCommands.get(slashCommand.command);
       if (handler) {
         await runQueued(() =>
-          streamSlashCommand(res, handler, slashCommand.args, startNdjsonResponse, sendAssistantResult, log, serializeError)
+          streamSlashCommand(
+            res,
+            handler,
+            slashCommand.args,
+            startNdjsonResponse,
+            sendAssistantResult,
+            log,
+            serializeError
+          )
         );
         return;
       }
@@ -534,66 +707,40 @@ export const createGhostHandlers = ({
     );
   };
 
-  const handleHistory = async (res: ServerResponse): Promise<void> => {
+  const handleHistory = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     await withJsonResponse(
       res,
       log,
       serializeError,
       "Pi history failed",
       () => {
+        const request = parseHistoryRequest(req);
         const sessionManager = getSessionManager();
-        const entries = (
-          sessionManager as SessionManager & {
-            getEntries: () => Array<{
-              type: string;
-              message?: PiAgentMessage;
-              timestamp?: string;
-              summary?: string;
-              tokensBefore?: number;
-            }>;
-          }
-        ).getEntries();
+        const entries = getSessionEntries(sessionManager);
+        const { lastCompactionIndex, compactions } = collectCompactionInfo(entries);
+        const { pre, post } = splitMessagesAroundLastCompaction(entries, lastCompactionIndex);
 
-        let lastCompactionIndex = -1;
-        const compactions: CompactionInfo[] = [];
+        if (request.paginated) {
+          const sourceMessages = request.segment === "pre" ? pre : post;
+          const page = paginateHistoryMessages(sourceMessages, getHistoryMessages, request.before, request.limit);
 
-        for (let i = 0; i < entries.length; i++) {
-          const entry = entries[i];
-          if (entry.type === "compaction") {
-            lastCompactionIndex = i;
-            compactions.push({
-              timestamp: entry.timestamp ?? "",
-              summary: entry.summary ?? "",
-              tokensBefore: entry.tokensBefore ?? 0
-            });
-          }
-        }
-
-        const preCompactionPiMessages: PiAgentMessage[] = [];
-        const postCompactionPiMessages: PiAgentMessage[] = [];
-
-        for (let i = 0; i < entries.length; i++) {
-          const entry = entries[i];
-          if (entry.type !== "message") {
-            continue;
-          }
-
-          const message = entry.message;
-          if (!message) {
-            continue;
-          }
-
-          if (lastCompactionIndex >= 0 && i < lastCompactionIndex) {
-            preCompactionPiMessages.push(message);
-          } else {
-            postCompactionPiMessages.push(message);
-          }
+          return {
+            body: {
+              segment: request.segment,
+              messages: page.messages,
+              totalCount: page.totalCount,
+              nextBefore: page.nextBefore,
+              compactions,
+              preCompactionCount: countHistoryMessages(pre, getHistoryMessages),
+              postCompactionCount: countHistoryMessages(post, getHistoryMessages)
+            }
+          };
         }
 
         return {
           body: {
-            messages: getHistoryMessages(postCompactionPiMessages),
-            preCompactionMessages: getHistoryMessages(preCompactionPiMessages),
+            messages: getHistoryMessages(post),
+            preCompactionMessages: getHistoryMessages(pre),
             compactions
           }
         };
@@ -655,6 +802,31 @@ export const createGhostHandlers = ({
     );
   };
 
+  const handleScheduleGet = async (): Promise<JsonHandlerResult> => {
+    const result = await listScheduleOperation();
+    return { body: result.data };
+  };
+
+  const handleSchedulePost = async (req: IncomingMessage): Promise<JsonHandlerResult> => {
+    const body = await parseJsonRequestBody<unknown>(req);
+    const input =
+      typeof body === "object" && body !== null
+        ? (body as { cron?: string; prompt?: string; once?: boolean; timezone?: string })
+        : {};
+    const result = await createScheduleOperation(input, { validate: false });
+    return { status: 201, body: result.data };
+  };
+
+  const handleScheduleDelete = async (req: IncomingMessage): Promise<JsonHandlerResult> => {
+    const scheduleId = req.url?.replace("/schedules/", "").trim() ?? "";
+    if (!scheduleId) {
+      return { status: 400, body: { error: "Missing schedule id" } };
+    }
+
+    const result = await deleteScheduleOperation(scheduleId);
+    return { body: result.data };
+  };
+
   const handleSchedules = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     await withJsonResponse(
       res,
@@ -662,29 +834,16 @@ export const createGhostHandlers = ({
       serializeError,
       "Pi schedules failed",
       async () => {
-        if (req.method === "GET") {
-          const result = await listScheduleOperation();
-          return { body: result.data };
+        switch (req.method) {
+          case "GET":
+            return handleScheduleGet();
+          case "POST":
+            return handleSchedulePost(req);
+          case "DELETE":
+            return handleScheduleDelete(req);
+          default:
+            return { status: 405, body: { error: "Method not allowed" } };
         }
-
-        if (req.method === "POST") {
-          const body = await parseJsonRequestBody<unknown>(req);
-          const input = typeof body === "object" && body !== null ? (body as { cron?: string; prompt?: string; once?: boolean; timezone?: string }) : {};
-          const result = await createScheduleOperation(input, { validate: false });
-          return { status: 201, body: result.data };
-        }
-
-        if (req.method === "DELETE") {
-          const scheduleId = req.url?.replace("/schedules/", "").trim() ?? "";
-          if (!scheduleId) {
-            return { status: 400, body: { error: "Missing schedule id" } };
-          }
-
-          const result = await deleteScheduleOperation(scheduleId);
-          return { body: result.data };
-        }
-
-        return { status: 405, body: { error: "Method not allowed" } };
       },
       "Schedules failed"
     );
@@ -696,13 +855,19 @@ export const createGhostHandlers = ({
       log,
       serializeError,
       "Pi commands failed",
-      () => ({
-        body: Array.from(slashCommands.values()).map(({ name, description }) => ({
-          name,
-          description
-        }))
-      }),
+      () => ({ body: getRuntimeMeta().supportedCommands }),
       "Commands failed"
+    );
+  };
+
+  const handleRuntimeMeta = async (res: ServerResponse): Promise<void> => {
+    await withJsonResponse(
+      res,
+      log,
+      serializeError,
+      "Pi runtime meta failed",
+      () => ({ body: getRuntimeMeta() }),
+      "Runtime meta failed"
     );
   };
 
@@ -724,7 +889,7 @@ export const createGhostHandlers = ({
       const event = parsed.event ?? "self";
       const reason = parsed.reason ?? "api-trigger";
 
-      if (!nudgeEvents.includes(event)) {
+      if (!isNudgeEvent(event, nudgeEvents)) {
         sendJson(res, 400, { error: `Invalid event: ${event}`, valid: nudgeEvents });
         return;
       }
@@ -822,6 +987,7 @@ export const createGhostHandlers = ({
     handleStats,
     handleSchedules,
     handleCommands,
+    handleRuntimeMeta,
     handleNudgeStatus,
     handleNudge,
     handleAbort,

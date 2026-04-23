@@ -19,6 +19,8 @@ import type {
   GhostMessage,
   GhostQueueClearResponse,
   GhostQueueState,
+  GhostRuntimeCapability,
+  GhostRuntimeMeta,
   GhostSchedule,
   GhostStats,
   HistoryMessage,
@@ -36,6 +38,7 @@ const GHOSTBOX_SKILL_PATH = "/opt/ghostbox/skills/ghostbox-api/SKILL.md";
 const GHOSTBOX_API_PORT = process.env.GHOSTBOX_API_PORT || "8008";
 const GHOSTBOX_HOST_BASE = `http://host.docker.internal:${GHOSTBOX_API_PORT}`;
 const GHOSTBOX_GHOST_NAME = process.env.GHOSTBOX_GHOST_NAME || "";
+const GHOSTBOX_IMAGE_VERSION = process.env.GHOSTBOX_IMAGE_VERSION?.trim() || null;
 const MEMORY_PATH = "/vault/MEMORY.md";
 const USER_PATH = "/vault/USER.md";
 const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -50,6 +53,20 @@ const defaultSystemPrompt =
   'You are a ghost agent. Your vault at /vault is your persistent memory. Use memory_write to save facts (target "memory" for notes, target "user" for user profile). Use memory_show to check your current memory. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
 const memoryCharLimit = 4000;
 const userCharLimit = 2000;
+const runtimeVersion = `node/${process.version}`;
+const CLAUDE_SUPPORTED_CAPABILITIES: GhostRuntimeCapability[] = [
+  "message",
+  "steer",
+  "queue",
+  "history",
+  "sessions",
+  "stats",
+  "commands",
+  "compact",
+  "newSession",
+  "abort",
+  "schedules"
+];
 
 type UserTurn = {
   text: string;
@@ -119,6 +136,18 @@ type RequestBodySessionSwitch = {
 type RequestBodySessionRename = {
   sessionId?: unknown;
   name?: unknown;
+};
+
+type HistorySegment = "post" | "pre";
+
+type HistoryPageResponse = {
+  segment: HistorySegment;
+  messages: HistoryMessage[];
+  totalCount: number;
+  nextBefore: number | null;
+  compactions: CompactionInfo[];
+  preCompactionCount: number;
+  postCompactionCount: number;
 };
 
 type ScheduleBody = {
@@ -678,16 +707,131 @@ const parseCompactions = (lines: JsonRecord[]): CompactionInfo[] => {
     .filter((entry) => entry.summary.toLowerCase().includes("compact"));
 };
 
+const collectCompactionInfo = (
+  lines: JsonRecord[]
+): { lastCompactionIndex: number; compactions: CompactionInfo[] } => {
+  let lastCompactionIndex = -1;
+  const compactions: CompactionInfo[] = [];
+
+  lines.forEach((line, index) => {
+    if (!(line.isReplay === true && getString(line.type) === "local-command-stdout")) {
+      return;
+    }
+
+    const summary = extractText(line.message ?? line.content ?? line.text) || "Session compacted.";
+    if (!summary.toLowerCase().includes("compact")) {
+      return;
+    }
+
+    lastCompactionIndex = index;
+    compactions.push({
+      timestamp: readSessionTimestamp(line, new Date()),
+      summary,
+      tokensBefore: 0
+    });
+  });
+
+  return { lastCompactionIndex, compactions };
+};
+
+const paginateHistoryMessages = (
+  messages: HistoryMessage[],
+  before: number | undefined,
+  limit: number
+): { messages: HistoryMessage[]; totalCount: number; nextBefore: number | null } => {
+  const totalCount = messages.length;
+  const boundedBefore = before === undefined ? totalCount : Math.max(0, Math.min(before, totalCount));
+  const boundedLimit = Math.max(1, Math.min(limit, 200));
+  const startIndex = Math.max(0, boundedBefore - boundedLimit);
+
+  return {
+    messages: messages.slice(startIndex, boundedBefore),
+    totalCount,
+    nextBefore: startIndex > 0 ? startIndex : null
+  };
+};
+
+const parseHistoryRequest = (
+  req: IncomingMessage
+): { paginated: false } | { paginated: true; segment: HistorySegment; before: number | undefined; limit: number } => {
+  const url = new URL(req.url ?? "/history", "http://localhost");
+  const limitValue = url.searchParams.get("limit");
+  const beforeValue = url.searchParams.get("before");
+  const segmentValue = url.searchParams.get("segment");
+
+  if (limitValue === null && beforeValue === null && segmentValue === null) {
+    return { paginated: false };
+  }
+
+  const segment: HistorySegment = segmentValue === "pre" ? "pre" : "post";
+  const limit = Number(limitValue ?? "50");
+  const before = beforeValue === null ? undefined : Number(beforeValue);
+
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error("Invalid history limit");
+  }
+
+  if (before !== undefined && (!Number.isSafeInteger(before) || before < 0)) {
+    throw new Error("Invalid history cursor");
+  }
+
+  return {
+    paginated: true,
+    segment,
+    before,
+    limit
+  };
+};
+
 const loadHistoryResponse = async (sessionId: string | null): Promise<HistoryResponse> => {
   if (!sessionId || !(await sessionFileExists(sessionId))) {
     return { messages: [], preCompactionMessages: [], compactions: [] };
   }
 
   const lines = await readJsonLines(getSessionFilePath(sessionId));
+  const { lastCompactionIndex, compactions } = collectCompactionInfo(lines);
+  const preCompactionMessages: HistoryMessage[] = [];
+  const messages: HistoryMessage[] = [];
+
+  lines.forEach((line, index) => {
+    const message = parseHistoryMessage(line);
+    if (message === null) {
+      return;
+    }
+
+    if (lastCompactionIndex >= 0 && index < lastCompactionIndex) {
+      preCompactionMessages.push(message);
+      return;
+    }
+
+    messages.push(message);
+  });
+
   return {
-    messages: lines.map(parseHistoryMessage).filter((message): message is HistoryMessage => message !== null),
-    preCompactionMessages: [],
-    compactions: parseCompactions(lines)
+    messages,
+    preCompactionMessages,
+    compactions
+  };
+};
+
+const loadHistoryPageResponse = async (
+  sessionId: string | null,
+  segment: HistorySegment,
+  limit: number,
+  before: number | undefined
+): Promise<HistoryPageResponse> => {
+  const history = await loadHistoryResponse(sessionId);
+  const segmentMessages = segment === "pre" ? history.preCompactionMessages : history.messages;
+  const page = paginateHistoryMessages(segmentMessages, before, limit);
+
+  return {
+    segment,
+    messages: page.messages,
+    totalCount: page.totalCount,
+    nextBefore: page.nextBefore,
+    compactions: history.compactions,
+    preCompactionCount: history.preCompactionMessages.length,
+    postCompactionCount: history.messages.length
   };
 };
 
@@ -1497,13 +1641,22 @@ const runCompactCommand = async (): Promise<string> => {
   });
 };
 
-const listSupportedCommands = (): Array<{ name: string; description: string }> => [
+const listSupportedCommands = (): GhostRuntimeMeta["supportedCommands"] => [
   { name: "/model", description: "Show or switch model: /model <provider/id>" },
   { name: "/compact", description: "Compact the current session and reduce context." },
   { name: "/new", description: "Start a fresh Claude Code session." },
-  { name: "/reload", description: "No-op for Claude Code compatibility." },
   { name: "/help", description: "List available slash commands." }
 ];
+
+const getRuntimeMeta = (): GhostRuntimeMeta => ({
+  adapter: "claude-code",
+  runtimeVersion,
+  imageVersion: GHOSTBOX_IMAGE_VERSION,
+  supportedCapabilities: [...CLAUDE_SUPPORTED_CAPABILITIES],
+  supportedCommands: listSupportedCommands(),
+  currentModel,
+  currentSessionId: currentSessionId ?? null
+});
 
 const handleSlashCommand = async (
   res: ServerResponse,
@@ -1539,7 +1692,7 @@ const handleSlashCommand = async (
   }
 
   if (slash.command === "reload") {
-    sendAssistantResult(res, "Claude Code reload is not needed.", currentSessionId ?? "");
+    sendAssistantResult(res, "Reload is not supported by the claude-code adapter.", currentSessionId ?? "");
     return true;
   }
 
@@ -1710,8 +1863,24 @@ const handleClearQueue = (res: ServerResponse): void => {
   sendJson(res, 200, response);
 };
 
-const handleHistory = async (res: ServerResponse): Promise<void> => {
-  sendJson(res, 200, await loadHistoryResponse(currentSessionId));
+const handleHistory = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const historyRequest = parseHistoryRequest(req);
+
+  if (!historyRequest.paginated) {
+    sendJson(res, 200, await loadHistoryResponse(currentSessionId));
+    return;
+  }
+
+  sendJson(
+    res,
+    200,
+    await loadHistoryPageResponse(
+      currentSessionId,
+      historyRequest.segment,
+      historyRequest.limit,
+      historyRequest.before
+    )
+  );
 };
 
 const handleSessions = async (res: ServerResponse): Promise<void> => {
@@ -1767,7 +1936,7 @@ const handleTaskKill = (res: ServerResponse): void => {
 };
 
 const handleReload = (res: ServerResponse): void => {
-  sendJson(res, 200, { status: "reloaded", warning: "No-op for claude-code adapter." });
+  sendJson(res, 501, { error: "Reload is not supported by the claude-code adapter." });
 };
 
 const handleSwitchSession = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -1936,15 +2105,19 @@ const handleSchedules = async (req: IncomingMessage, res: ServerResponse): Promi
 };
 
 const handleNudgeStatus = (res: ServerResponse): void => {
-  sendJson(res, 200, { supported: false, status: "unsupported" });
+  sendJson(res, 501, { error: "Nudge status is not supported by the claude-code adapter." });
 };
 
 const handleNudge = (res: ServerResponse): void => {
-  sendJson(res, 200, { ok: true, warning: "Nudges are not supported by the claude-code adapter." });
+  sendJson(res, 501, { error: "Nudges are not supported by the claude-code adapter." });
 };
 
 const handleCommands = (res: ServerResponse): void => {
-  sendJson(res, 200, listSupportedCommands());
+  sendJson(res, 200, getRuntimeMeta().supportedCommands);
+};
+
+const handleRuntimeMeta = (res: ServerResponse): void => {
+  sendJson(res, 200, getRuntimeMeta());
 };
 
 const authenticateRequest = (req: IncomingMessage, res: ServerResponse): boolean => {
@@ -1998,8 +2171,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
-  if (req.method === "GET" && req.url === "/history") {
-    await handleHistory(res);
+  if (req.method === "GET" && req.url?.startsWith("/history")) {
+    await handleHistory(req, res);
     return;
   }
 
@@ -2074,6 +2247,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
 
   if (req.method === "GET" && req.url === "/commands") {
     handleCommands(res);
+    return;
+  }
+
+  if (req.method === "GET" && req.url === "/runtime/meta") {
+    handleRuntimeMeta(res);
     return;
   }
 

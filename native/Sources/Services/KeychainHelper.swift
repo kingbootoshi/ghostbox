@@ -1,65 +1,149 @@
 import Foundation
 import Security
 
-// Local-file token store. Keychain was abandoned because macOS rebinds the
-// keychain item's partition_list to the caller's cdhash on every SecItemAdd,
-// so unsigned Debug rebuilds prompt on every launch. Apple DTS confirms there
-// is no supported API to produce a partition-list-free item for unsigned
-// binaries. File storage at ~/.ghostbox/app-token (mode 0600) matches every
-// other credential in the ghostbox stack (auth.json, state.json) and every
-// similar dev tool (~/.aws/credentials, ~/.kube/config, ~/.claude.json).
-enum KeychainHelper {
+struct ConnectionConfig: Codable {
+    static let defaultURLString = "http://localhost:8008"
+
+    let url: String
+    let token: String
+}
+
+// One canonical client connection file shared by the CLI and native app.
+// Legacy native locations are migrated once into ~/.ghostbox/connection.json
+// and then removed so there is only one steady-state source of truth.
+enum ConnectionConfigStore {
     private static let legacyService = "com.ghostbox.app"
     private static let legacyAccount = "serverToken"
-    private static let fileName = "app-token"
+    private static let legacyTokenFileName = "app-token"
+    private static let legacyRemoteConfigFileName = "remote.json"
+    private static let connectionFileName = "connection.json"
 
-    private static var storeURL: URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent(".ghostbox").appendingPathComponent(fileName)
+    private static var directoryURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ghostbox")
     }
 
-    static func save(token: String) throws {
-        let directory = storeURL.deletingLastPathComponent()
+    private static var storeURL: URL {
+        directoryURL.appendingPathComponent(connectionFileName)
+    }
+
+    private static var legacyTokenURL: URL {
+        directoryURL.appendingPathComponent(legacyTokenFileName)
+    }
+
+    private static var legacyRemoteConfigURL: URL {
+        directoryURL.appendingPathComponent(legacyRemoteConfigFileName)
+    }
+
+    static func load() -> ConnectionConfig? {
+        if let config = loadStoredConfig() {
+            return config
+        }
+
+        return migrateLegacySourcesIfNeeded()
+    }
+
+    static func save(url: String, token: String) throws {
+        let config = ConnectionConfig(
+            url: sanitizeURL(url) ?? ConnectionConfig.defaultURLString,
+            token: sanitizeToken(token)
+        )
+
+        guard !config.token.isEmpty else {
+            throw CocoaError(.validationStringTooShort)
+        }
+
         try FileManager.default.createDirectory(
-            at: directory,
+            at: directoryURL,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
 
-        let data = Data(token.utf8)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(config)
         try data.write(to: storeURL, options: [.atomic])
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o600],
             ofItemAtPath: storeURL.path
         )
 
-        removeLegacyKeychainItem()
+        clearLegacySources()
     }
 
-    static func loadToken() -> String? {
-        if let data = try? Data(contentsOf: storeURL),
-           let token = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !token.isEmpty {
-            return token
-        }
-
-        if let migrated = migrateLegacyKeychainItem() {
-            return migrated
-        }
-
-        return nil
-    }
-
-    static func deleteToken() {
+    static func clear() {
         try? FileManager.default.removeItem(at: storeURL)
-        removeLegacyKeychainItem()
+        clearLegacySources()
     }
 
-    // Reads the old keychain item (if any), writes it to file, then removes it
-    // from the keychain. This may prompt once if the old partition_list blocks
-    // the current binary; after success the keychain entry is gone and no
-    // further prompts can occur.
-    private static func migrateLegacyKeychainItem() -> String? {
+    private static func loadStoredConfig() -> ConnectionConfig? {
+        guard let data = try? Data(contentsOf: storeURL),
+              let config = try? JSONDecoder().decode(ConnectionConfig.self, from: data),
+              let sanitizedURL = sanitizeURL(config.url) else {
+            return nil
+        }
+
+        let sanitizedToken = sanitizeToken(config.token)
+        guard !sanitizedToken.isEmpty else {
+            return nil
+        }
+
+        return ConnectionConfig(url: sanitizedURL, token: sanitizedToken)
+    }
+
+    private static func migrateLegacySourcesIfNeeded() -> ConnectionConfig? {
+        if let remoteConfig = loadLegacyRemoteConfig() {
+            try? save(url: remoteConfig.url, token: remoteConfig.token)
+            return remoteConfig
+        }
+
+        let defaults = UserDefaults.standard
+        let legacyURL = sanitizeURL(defaults.string(forKey: "serverURL"))
+        let legacyDefaultToken = sanitizeToken(defaults.string(forKey: "serverToken"))
+        let legacyToken = loadLegacyToken() ?? (legacyDefaultToken.isEmpty ? nil : legacyDefaultToken)
+
+        guard let token = legacyToken else {
+            return nil
+        }
+
+        let config = ConnectionConfig(
+            url: legacyURL ?? ConnectionConfig.defaultURLString,
+            token: token
+        )
+
+        try? save(url: config.url, token: config.token)
+        defaults.removeObject(forKey: "serverURL")
+        defaults.removeObject(forKey: "serverToken")
+        return config
+    }
+
+    private static func loadLegacyRemoteConfig() -> ConnectionConfig? {
+        guard let data = try? Data(contentsOf: legacyRemoteConfigURL),
+              let config = try? JSONDecoder().decode(ConnectionConfig.self, from: data),
+              let sanitizedURL = sanitizeURL(config.url) else {
+            return nil
+        }
+
+        let sanitizedToken = sanitizeToken(config.token)
+        guard !sanitizedToken.isEmpty else {
+            return nil
+        }
+
+        return ConnectionConfig(url: sanitizedURL, token: sanitizedToken)
+    }
+
+    private static func loadLegacyToken() -> String? {
+        if let data = try? Data(contentsOf: legacyTokenURL),
+           let token = String(data: data, encoding: .utf8) {
+            let sanitizedToken = sanitizeToken(token)
+            if !sanitizedToken.isEmpty {
+                return sanitizedToken
+            }
+        }
+
+        return loadLegacyKeychainToken()
+    }
+
+    private static func loadLegacyKeychainToken() -> String? {
         var query = legacyBaseQuery
         query[kSecReturnData] = kCFBooleanTrue
         query[kSecMatchLimit] = kSecMatchLimitOne
@@ -68,13 +152,37 @@ enum KeychainHelper {
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         guard status == errSecSuccess,
               let data = item as? Data,
-              let token = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !token.isEmpty else {
+              let token = String(data: data, encoding: .utf8) else {
             return nil
         }
 
-        try? save(token: token)
-        return token
+        let sanitizedToken = sanitizeToken(token)
+        return sanitizedToken.isEmpty ? nil : sanitizedToken
+    }
+
+    private static func clearLegacySources() {
+        try? FileManager.default.removeItem(at: legacyTokenURL)
+        try? FileManager.default.removeItem(at: legacyRemoteConfigURL)
+        UserDefaults.standard.removeObject(forKey: "serverURL")
+        UserDefaults.standard.removeObject(forKey: "serverToken")
+        removeLegacyKeychainItem()
+    }
+
+    private static func sanitizeURL(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+
+        return trimmed
+    }
+
+    private static func sanitizeToken(_ value: String?) -> String {
+        guard let value else {
+            return ""
+        }
+
+        return value.filter { !$0.isWhitespace && !$0.isNewline }
     }
 
     private static func removeLegacyKeychainItem() {

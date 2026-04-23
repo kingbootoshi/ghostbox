@@ -25,6 +25,7 @@ final class AgentChatViewModel {
     private(set) var queuedMessages: [QueuedChatMessage] = []
     private(set) var queueBrowseIndex: Int?
     var isStreaming = false
+    private(set) var showsTypingIndicator = false
     private(set) var isWakingGhost = false
     private(set) var activeBackgroundTasks: [ActiveBackgroundTask] = []
 
@@ -35,6 +36,7 @@ final class AgentChatViewModel {
     @ObservationIgnored private var savedInputBeforeQueueBrowse = ""
     @ObservationIgnored private var hasLoadedInitialState = false
     @ObservationIgnored private var isPreparingForOpening = false
+    @ObservationIgnored private var realtimeObserver: NSObjectProtocol?
 
     init(ghostName: String, client: GhostboxClient, initialGhost: Ghost? = nil) {
         self.ghostName = ghostName
@@ -57,6 +59,16 @@ final class AgentChatViewModel {
             self?.rebuildActiveBackgroundTasks()
         }
 
+        realtimeObserver = NotificationCenter.default.addObserver(
+            forName: .ghostRealtimeEvent,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            Task { @MainActor [weak self] in
+                await self?.handleRealtimeEvent(notification)
+            }
+        }
+
         Task { [weak self] in
             await self?.prepareForOpeningTask(ghostHint: initialGhost)
         }
@@ -64,6 +76,9 @@ final class AgentChatViewModel {
 
     deinit {
         streamTask?.cancel()
+        if let realtimeObserver {
+            NotificationCenter.default.removeObserver(realtimeObserver)
+        }
     }
 
     var ghostboxClient: GhostboxClient {
@@ -208,24 +223,20 @@ final class AgentChatViewModel {
                     }
                 }
 
-                let fallbackGhost = locallyUpdatedGhost(for: model)
-
                 do {
                     store.ghost = try await client.updateGhost(
                         name: ghostName,
                         provider: model.provider,
                         model: model.modelId
                     )
-                } catch GhostboxClientError.requestFailed(let statusCode, _) where statusCode == 404 || statusCode == 405 {
-                    store.ghost = fallbackGhost
                 } catch {
-                    store.ghost = fallbackGhost
                     store.messages.append(
                         ChatMessage(
                             role: .system,
-                            content: "Model switched, but saving it failed: \(error.localizedDescription)"
+                            content: "Model switch finished, but persisted state could not be confirmed: \(error.localizedDescription)"
                         )
                     )
+                    await loadGhost()
                 }
             } catch {
                 store.messages.append(ChatMessage(role: .system, content: "Model switch failed: \(error.localizedDescription)"))
@@ -345,21 +356,6 @@ final class AgentChatViewModel {
         store.deleteSession(sessionId: sessionId)
     }
 
-    private func locallyUpdatedGhost(for model: GhostModel) -> Ghost? {
-        guard let current = store.ghost else { return nil }
-
-        return Ghost(
-            name: current.name,
-            status: current.status,
-            provider: model.provider,
-            model: model.modelId,
-            portBase: current.portBase,
-            containerId: current.containerId,
-            createdAt: current.createdAt,
-            systemPrompt: current.systemPrompt
-        )
-    }
-
     private func saveCurrentQueueEdit() {
         guard let current = queueBrowseIndex, current < queuedMessages.count else { return }
         let trimmed = input.inputText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -432,9 +428,12 @@ final class AgentChatViewModel {
         streamingBehavior: String?,
         streamID: UUID
     ) async {
-        var currentAssistantText = ""
+        showsTypingIndicator = true
+        var currentAssistantText = ""      // running target (everything the server has sent)
+        var visibleAssistantText = ""      // what the UI has painted so far (typewriter drain)
         var currentAssistantIndex: Int?
-        var lastAssistantFlushTime: Date?
+        var drainTask: Task<Void, Never>?
+        var streamFinished = false
         let isCompactCommand = Self.isCompactCommand(prompt)
         var compactResponseMessageID: UUID?
         var shouldProcessQueuedAfterStream = false
@@ -443,25 +442,19 @@ final class AgentChatViewModel {
             store.isCompacting = true
         }
 
-        func flushAssistantMessage(force: Bool = false) {
-            guard !currentAssistantText.isEmpty else { return }
-
-            let now = Date()
-            if !force,
-               let lastAssistantFlushTime,
-               now.timeIntervalSince(lastAssistantFlushTime) <= 0.05 {
-                return
-            }
+        func renderVisible() {
+            guard !visibleAssistantText.isEmpty else { return }
+            showsTypingIndicator = false
 
             if let index = currentAssistantIndex, store.messages.indices.contains(index) {
-                let existingMessage = store.messages[index]
-                let updatedMessage = existingMessage.updatingContent(currentAssistantText)
-                store.updateMessage(at: index, with: updatedMessage)
+                let existing = store.messages[index]
+                let updated = existing.updatingContent(visibleAssistantText)
+                store.updateMessage(at: index, with: updated)
                 if isCompactCommand {
-                    compactResponseMessageID = updatedMessage.id
+                    compactResponseMessageID = updated.id
                 }
             } else {
-                let assistantMessage = ChatMessage(role: .ghost, content: currentAssistantText)
+                let assistantMessage = ChatMessage(role: .ghost, content: visibleAssistantText)
                 store.messages.append(assistantMessage)
                 currentAssistantIndex = store.messages.count - 1
                 SoundManager.shared.play(.messageReceived)
@@ -469,8 +462,71 @@ final class AgentChatViewModel {
                     compactResponseMessageID = assistantMessage.id
                 }
             }
+        }
 
-            lastAssistantFlushTime = now
+        func startDrainIfNeeded() {
+            guard drainTask == nil else { return }
+            drainTask = Task { @MainActor in
+                let baseCharsPerSecond: Double = 90
+                let hz: Double = 30
+                let tickNanos = UInt64((1.0 / hz) * 1_000_000_000)
+                var accumulator: Double = 0
+                while !Task.isCancelled {
+                    let targetLen = currentAssistantText.count
+                    let visibleLen = visibleAssistantText.count
+                    let remaining = targetLen - visibleLen
+
+                    if remaining <= 0 {
+                        if streamFinished { break }
+                        try? await Task.sleep(nanoseconds: tickNanos)
+                        continue
+                    }
+
+                    var delta = baseCharsPerSecond / hz
+                    if remaining > 200 {
+                        delta *= 1 + min(Double(remaining) / 400, 4)
+                    }
+                    if streamFinished {
+                        delta *= 3
+                    }
+                    accumulator += delta
+                    var take = Int(accumulator)
+                    accumulator -= Double(take)
+                    take = max(1, min(take, remaining))
+
+                    let idx = currentAssistantText.index(currentAssistantText.startIndex, offsetBy: visibleLen + take)
+                    visibleAssistantText = String(currentAssistantText[..<idx])
+                    renderVisible()
+                    try? await Task.sleep(nanoseconds: tickNanos)
+                }
+                drainTask = nil
+            }
+        }
+
+        func cancelDrain() {
+            drainTask?.cancel()
+            drainTask = nil
+        }
+
+        func flushAssistantMessage(force: Bool = false) {
+            guard !currentAssistantText.isEmpty else { return }
+            if force {
+                cancelDrain()
+                visibleAssistantText = currentAssistantText
+                renderVisible()
+                return
+            }
+            if visibleAssistantText.isEmpty {
+                renderVisible()
+            }
+        }
+
+        func resetAssistantAccumulators() {
+            cancelDrain()
+            currentAssistantText = ""
+            visibleAssistantText = ""
+            currentAssistantIndex = nil
+            showsTypingIndicator = isStreaming
         }
 
         defer {
@@ -480,6 +536,7 @@ final class AgentChatViewModel {
                 streamTask = nil
                 isStreaming = false
             }
+            showsTypingIndicator = false
             if isCompactCommand {
                 store.isCompacting = false
             }
@@ -514,13 +571,14 @@ final class AgentChatViewModel {
                     guard !chunk.isEmpty else { continue }
 
                     currentAssistantText += chunk
-                    flushAssistantMessage()
+                    startDrainIfNeeded()
 
                 case .thinking:
                     let chunk = event.text ?? ""
                     guard !chunk.isEmpty else { continue }
 
                     flushAssistantMessage(force: true)
+                    resetAssistantAccumulators()
 
                     if let last = store.messages.last, last.role == .thinking {
                         let index = store.messages.count - 1
@@ -531,29 +589,26 @@ final class AgentChatViewModel {
 
                 case .tool_use:
                     flushAssistantMessage(force: true)
+                    resetAssistantAccumulators()
 
                     let toolName = event.tool ?? "Tool"
                     let content = event.input?.stringValue ?? "Running \(toolName)"
                     store.messages.append(ChatMessage(role: .toolUse, content: content, toolName: toolName))
-                    currentAssistantText = ""
-                    currentAssistantIndex = nil
-                    lastAssistantFlushTime = nil
 
                 case .tool_result:
                     flushAssistantMessage(force: true)
+                    resetAssistantAccumulators()
 
                     let content = event.output?.stringValue ?? "Tool finished."
                     store.messages.append(ChatMessage(role: .toolResult, content: content, toolName: "Result"))
                     rebuildActiveBackgroundTasks()
-                    currentAssistantText = ""
-                    currentAssistantIndex = nil
-                    lastAssistantFlushTime = nil
 
                 case .result:
                     if let text = event.text, !text.isEmpty, currentAssistantText.isEmpty {
                         currentAssistantText = text
                     }
 
+                    streamFinished = true
                     flushAssistantMessage(force: true)
                 }
             }
@@ -631,7 +686,6 @@ final class AgentChatViewModel {
     }
 
     private func handleCompaction(compactResponseMessageID _: UUID?) async {
-        store.showingPreCompactionMessages = false
         hasLoadedInitialState = await store.reloadConversationState()
     }
 
@@ -641,6 +695,44 @@ final class AgentChatViewModel {
         } catch {
             notifications.showError(error.localizedDescription)
         }
+    }
+
+    private func handleRealtimeEvent(_ notification: Notification) async {
+        guard let eventGhostName = notification.userInfo?["ghostName"] as? String,
+              eventGhostName == ghostName else {
+            return
+        }
+
+        let eventType = notification.userInfo?["type"] as? String
+        let eventSessionId = notification.userInfo?["sessionId"] as? String
+        let ghost = notification.userInfo?["ghost"] as? Ghost
+
+        guard !isStreaming, !isWakingGhost, !store.isCreatingSession, !store.isCompacting else { return }
+
+        if eventType == "ghost.remove" {
+            store.ghost = nil
+            return
+        }
+
+        if let ghost {
+            store.ghost = ghost
+            if eventType == "ghost.upsert" {
+                return
+            }
+        }
+
+        if let currentSession = store.sessions?.current,
+           let eventSessionId,
+           currentSession != eventSessionId {
+            _ = await store.loadSessions()
+            await store.loadStats()
+            await loadGhost()
+            return
+        }
+
+        hasLoadedInitialState = await store.reloadConversationState()
+        await loadGhost()
+        await store.loadStats()
     }
 
     private func wakeGhostAndLoadHistory() async {

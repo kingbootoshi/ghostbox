@@ -21,9 +21,12 @@ struct CompactionInfo: Decodable {
     let tokensBefore: Int
 }
 
-struct HistoryData {
+struct HistoryPageData {
     let messages: [HistoryMessage]
-    let preCompactionMessages: [HistoryMessage]
+    let totalCount: Int
+    let nextBefore: Int?
+    let preCompactionCount: Int
+    let postCompactionCount: Int
     let compactions: [CompactionInfo]
 }
 
@@ -128,6 +131,34 @@ struct ClearQueueResponse: Decodable {
     }
 }
 
+private struct GhostboxRealtimeEnvelope: Decodable {
+    let id: String
+    let at: String
+    let type: String
+    let ghosts: [String: Ghost]?
+    let ghostName: String?
+    let ghost: Ghost?
+    let sessionId: String?
+    let preview: String?
+}
+
+enum GhostboxRealtimeEvent {
+    case snapshot(id: String, ghosts: [Ghost])
+    case ghostUpsert(id: String, ghost: Ghost)
+    case ghostRemove(id: String, ghostName: String)
+    case messageCompleted(id: String, ghostName: String, sessionId: String, preview: String)
+
+    var id: String {
+        switch self {
+        case .snapshot(let id, _),
+             .ghostUpsert(let id, _),
+             .ghostRemove(let id, _),
+             .messageCompleted(let id, _, _, _):
+            return id
+        }
+    }
+}
+
 final class GhostboxClient {
     private static let logger = Logger(subsystem: "com.ghostbox.app", category: "network")
 
@@ -166,16 +197,15 @@ final class GhostboxClient {
             // SSE streams where the agent may be silent for minutes during
             // tool calls or large file reads before the next event arrives.
             sseConfiguration.timeoutIntervalForRequest = 0
+            sseConfiguration.shouldUseExtendedBackgroundIdleMode = true
             self.sseSession = URLSession(configuration: sseConfiguration)
         }
     }
 
-    static func fromUserDefaults() -> GhostboxClient {
-        let defaults = UserDefaults.standard
-        let urlString = defaults.string(forKey: "serverURL") ?? ""
-        let token = KeychainHelper.loadToken() ?? ""
-        let url = urlString.isEmpty ? nil : URL(string: urlString)
-        return GhostboxClient(baseURL: url, token: token.isEmpty ? nil : token)
+    static func fromConnectionConfig() -> GhostboxClient {
+        let config = ConnectionConfigStore.load()
+        let url = config.flatMap { URL(string: $0.url) }
+        return GhostboxClient(baseURL: url, token: config?.token)
     }
 
     func listGhosts() async throws -> [Ghost] {
@@ -244,12 +274,32 @@ final class GhostboxClient {
         return Ghost(name: name, status: ghost.status, provider: ghost.provider, model: ghost.model, portBase: ghost.portBase, containerId: ghost.containerId, createdAt: ghost.createdAt, systemPrompt: ghost.systemPrompt)
     }
 
-    func getHistory(ghostName: String) async throws -> HistoryData {
-        let request = makeRequest(path: ["api", "ghosts", ghostName, "history"])
-        let response = try await decodeResponse(for: request, as: HistoryResponse.self)
-        return HistoryData(
+    func getHistoryPage(
+        ghostName: String,
+        segment: String = "post",
+        limit: Int,
+        before: Int? = nil
+    ) async throws -> HistoryPageData {
+        var queryItems = [
+            URLQueryItem(name: "segment", value: segment),
+            URLQueryItem(name: "limit", value: String(limit))
+        ]
+
+        if let before {
+            queryItems.append(URLQueryItem(name: "before", value: String(before)))
+        }
+
+        let request = makeRequest(
+            path: ["api", "ghosts", ghostName, "history"],
+            queryItems: queryItems
+        )
+        let response = try await decodeResponse(for: request, as: HistoryPageResponse.self)
+        return HistoryPageData(
             messages: response.messages,
-            preCompactionMessages: response.preCompactionMessages ?? [],
+            totalCount: response.totalCount,
+            nextBefore: response.nextBefore,
+            preCompactionCount: response.preCompactionCount,
+            postCompactionCount: response.postCompactionCount,
             compactions: response.compactions ?? []
         )
     }
@@ -493,6 +543,54 @@ final class GhostboxClient {
         }
     }
 
+    func streamEvents(lastEventId: String? = nil) -> AsyncThrowingStream<GhostboxRealtimeEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    var request = makeRequest(path: ["api", "events"])
+                    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    if let lastEventId, !lastEventId.isEmpty {
+                        request.setValue(lastEventId, forHTTPHeaderField: "Last-Event-ID")
+                    }
+
+                    let (bytes, response) = try await sseSession.bytes(for: request)
+                    try validate(response: response)
+                    Self.logger.info("Realtime SSE connected.")
+
+                    let parser = SSEStreamParser(decoder: decoder)
+                    for try await event in parser.parseRaw(bytes: bytes, ghostName: "app") {
+                        if Task.isCancelled {
+                            continuation.finish()
+                            return
+                        }
+
+                        switch event.name {
+                        case "heartbeat":
+                            continue
+                        case "error":
+                            throw GhostboxClientError.requestFailed(statusCode: 0, message: event.data)
+                        default:
+                            if let decodedEvent = try decodeRealtimeEvent(from: event.data) {
+                                continuation.yield(decodedEvent)
+                            }
+                        }
+                    }
+
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch {
+                    Self.logger.error("Realtime SSE failed: \(error.localizedDescription, privacy: .public)")
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
     func healthCheck() async -> Bool {
         do {
             let request = makeRequest(path: ["api", "health"])
@@ -558,11 +656,70 @@ final class GhostboxClient {
             throw GhostboxClientError.requestFailed(statusCode: httpResponse.statusCode, message: message)
         }
     }
+
+    private func decodeRealtimeEvent(from payload: String) throws -> GhostboxRealtimeEvent? {
+        let envelope = try decoder.decode(GhostboxRealtimeEnvelope.self, from: Data(payload.utf8))
+
+        switch envelope.type {
+        case "snapshot":
+            let ghosts = (envelope.ghosts ?? [:]).map { name, ghost in
+                Ghost(
+                    name: name,
+                    status: ghost.status,
+                    provider: ghost.provider,
+                    model: ghost.model,
+                    portBase: ghost.portBase,
+                    containerId: ghost.containerId,
+                    createdAt: ghost.createdAt,
+                    systemPrompt: ghost.systemPrompt
+                )
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            return .snapshot(id: envelope.id, ghosts: ghosts)
+        case "ghost.upsert":
+            guard let ghostName = envelope.ghostName, let ghost = envelope.ghost else {
+                return nil
+            }
+            let resolvedGhost = Ghost(
+                name: ghostName,
+                status: ghost.status,
+                provider: ghost.provider,
+                model: ghost.model,
+                portBase: ghost.portBase,
+                containerId: ghost.containerId,
+                createdAt: ghost.createdAt,
+                systemPrompt: ghost.systemPrompt
+            )
+            return .ghostUpsert(id: envelope.id, ghost: resolvedGhost)
+        case "ghost.remove":
+            guard let ghostName = envelope.ghostName else {
+                return nil
+            }
+            return .ghostRemove(id: envelope.id, ghostName: ghostName)
+        case "message.completed":
+            guard let ghostName = envelope.ghostName,
+                  let sessionId = envelope.sessionId else {
+                return nil
+            }
+            return .messageCompleted(
+                id: envelope.id,
+                ghostName: ghostName,
+                sessionId: sessionId,
+                preview: envelope.preview ?? ""
+            )
+        default:
+            return nil
+        }
+    }
 }
 
-private struct HistoryResponse: Decodable {
+private struct HistoryPageResponse: Decodable {
+    let segment: String?
     let messages: [HistoryMessage]
-    let preCompactionMessages: [HistoryMessage]?
+    let totalCount: Int
+    let nextBefore: Int?
+    let preCompactionCount: Int
+    let postCompactionCount: Int
     let compactions: [CompactionInfo]?
 }
 

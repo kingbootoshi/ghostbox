@@ -2,7 +2,6 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { startClaudeTokenRefresher } from "./claude-auth";
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
@@ -21,6 +20,7 @@ import {
   sendMail,
   updateStoredConfig
 } from "./auth-config";
+import { startClaudeTokenRefresher } from "./claude-auth";
 import { createLogger } from "./logger";
 import { getAuthStatus } from "./oauth";
 import {
@@ -33,6 +33,7 @@ import {
   getGhostHealth,
   getGhostHistory,
   getGhostQueue,
+  getGhostRuntimeMeta,
   getGhostSessions,
   getGhostStats,
   killBackgroundTask,
@@ -54,8 +55,9 @@ import {
   updateGhost,
   wakeGhost
 } from "./orchestrator";
+import { createRealtimeSubscription } from "./realtime-events";
 import { scheduleManager } from "./schedule-manager";
-import type { GhostboxConfig, GhostboxConfigUpdate } from "./types";
+import type { GhostboxConfig, GhostboxConfigUpdate, GhostState, RealtimeEvent } from "./types";
 import { commitVault } from "./vault";
 import { deleteVaultFile, listVaultDirectory, readVaultFile, writeVaultFile } from "./vault-routes";
 
@@ -69,7 +71,7 @@ const app = new Hono<{
   };
 }>();
 
-type ApiStatusCode = 400 | 401 | 403 | 404 | 409 | 429 | 500;
+type ApiStatusCode = 400 | 401 | 403 | 404 | 409 | 429 | 500 | 501;
 
 class ApiError extends Error {
   status: ApiStatusCode;
@@ -121,6 +123,8 @@ type VaultWriteBody = {
 type VaultDeleteBody = {
   path?: unknown;
 };
+
+type HistorySegment = "post" | "pre";
 
 type SessionSwitchBody = {
   sessionId?: unknown;
@@ -177,7 +181,16 @@ const getApiErrorStatus = (error: unknown): ApiStatusCode | null => {
 
   if (typeof error === "object" && error !== null && "status" in error) {
     const status = (error as { status?: unknown }).status;
-    if (status === 400 || status === 401 || status === 403 || status === 404 || status === 409 || status === 429 || status === 500) {
+    if (
+      status === 400 ||
+      status === 401 ||
+      status === 403 ||
+      status === 404 ||
+      status === 409 ||
+      status === 429 ||
+      status === 500 ||
+      status === 501
+    ) {
       return status;
     }
   }
@@ -210,6 +223,10 @@ const getErrorStatus = (error: unknown): ApiStatusCode => {
     return 409;
   }
 
+  if (message.includes("not supported") || message.includes("Not supported")) {
+    return 501;
+  }
+
   if (
     message.includes("Invalid") ||
     message.includes("Missing") ||
@@ -223,12 +240,75 @@ const getErrorStatus = (error: unknown): ApiStatusCode => {
   return 500;
 };
 
+const parseHistorySegment = (value: string | undefined): HistorySegment => {
+  if (value === undefined || value === "post") {
+    return "post";
+  }
+
+  if (value === "pre") {
+    return "pre";
+  }
+
+  throw new ApiError(400, `Invalid history segment "${value}".`);
+};
+
+const parsePositiveInteger = (value: string | undefined, field: string): number | undefined => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!/^\d+$/.test(value)) {
+    throw new ApiError(400, `Invalid ${field}.`);
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new ApiError(400, `Invalid ${field}.`);
+  }
+
+  return parsed;
+};
+
+const parseNonNegativeInteger = (value: string | undefined, field: string): number | undefined => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!/^\d+$/.test(value)) {
+    throw new ApiError(400, `Invalid ${field}.`);
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new ApiError(400, `Invalid ${field}.`);
+  }
+
+  return parsed;
+};
+
 const getErrorMessage = (error: unknown): string => {
   if (error instanceof Error) {
     return error.message;
   }
 
   return "Internal server error";
+};
+
+const filterGhostsForAuth = (ghosts: Record<string, GhostState>, auth: ApiAuthContext): Record<string, GhostState> => {
+  if (auth.ghostName === null) {
+    return ghosts;
+  }
+
+  const ghost = ghosts[auth.ghostName];
+  return ghost ? { [auth.ghostName]: ghost } : {};
+};
+
+const eventMatchesAuth = (event: RealtimeEvent, auth: ApiAuthContext): boolean => {
+  if (auth.ghostName === null || event.type === "snapshot") {
+    return true;
+  }
+
+  return "ghostName" in event && event.ghostName === auth.ghostName;
 };
 
 const parseJsonBody = async <T>(c: Context): Promise<T> => {
@@ -278,7 +358,7 @@ const handleRoute = async (c: Context, handler: () => Promise<Response>): Promis
   }
 };
 
-const enforceGhostScope = async (c: Context, next: () => Promise<void>): Promise<Response | void> => {
+const enforceGhostScope = async (c: Context, next: () => Promise<void>): Promise<Response | undefined> => {
   const auth = c.var.apiAuth;
 
   if (auth.ghostName === null) {
@@ -353,6 +433,74 @@ app.use("/api/*", async (c, next) => {
 
 app.use("/api/ghosts/:name", enforceGhostScope);
 app.use("/api/ghosts/:name/*", enforceGhostScope);
+
+app.get("/api/events", async (c) => {
+  try {
+    const auth = c.var.apiAuth;
+    const subscription = createRealtimeSubscription({}, c.req.header("last-event-id") ?? c.req.query("since"));
+    const ghosts = filterGhostsForAuth(await listGhosts(), auth);
+
+    if (subscription.seed.kind === "snapshot") {
+      subscription.seed.event.ghosts = ghosts;
+    }
+
+    return streamSSE(
+      c,
+      async (stream) => {
+        const writeRealtimeEvent = async (event: RealtimeEvent): Promise<void> => {
+          await stream.writeSSE({
+            id: event.id,
+            event: event.type,
+            data: JSON.stringify(event)
+          });
+        };
+
+        try {
+          if (subscription.seed.kind === "snapshot") {
+            await writeRealtimeEvent(subscription.seed.event);
+          } else {
+            for (const event of subscription.seed.events) {
+              if (eventMatchesAuth(event, auth)) {
+                await writeRealtimeEvent(event);
+              }
+            }
+          }
+
+          while (true) {
+            const event = await subscription.next(15_000);
+
+            if (!event) {
+              await stream.writeSSE({
+                event: "heartbeat",
+                data: JSON.stringify({ at: new Date().toISOString() })
+              });
+              continue;
+            }
+
+            if (!eventMatchesAuth(event, auth)) {
+              continue;
+            }
+
+            await writeRealtimeEvent(event);
+          }
+        } finally {
+          subscription.close();
+        }
+      },
+      async (error) => {
+        subscription.close();
+        log.error({ err: error, method: c.req.method, path: c.req.path }, "Realtime SSE stream aborted");
+      }
+    );
+  } catch (error) {
+    const status = getErrorStatus(error);
+    const message = getErrorMessage(error);
+
+    log.error({ err: error, method: c.req.method, path: c.req.path, status }, "Realtime SSE request failed");
+
+    return c.json({ error: message }, { status });
+  }
+});
 
 app.get("/api/ghosts", (c) =>
   handleRoute(c, async () => {
@@ -489,7 +637,21 @@ app.get("/api/ghosts/:name/health", (c) =>
 
 app.get("/api/ghosts/:name/history", (c) =>
   handleRoute(c, async () => {
-    return c.json(await getGhostHistory(c.req.param("name")));
+    const limit = parsePositiveInteger(c.req.query("limit"), "history limit");
+    const before = parseNonNegativeInteger(c.req.query("before"), "history cursor");
+    const segmentQuery = c.req.query("segment");
+
+    if (limit === undefined && before === undefined && segmentQuery === undefined) {
+      return c.json(await getGhostHistory(c.req.param("name")));
+    }
+
+    return c.json(
+      await getGhostHistory(c.req.param("name"), {
+        limit,
+        before,
+        segment: parseHistorySegment(segmentQuery)
+      })
+    );
   })
 );
 
@@ -502,6 +664,12 @@ app.get("/api/ghosts/:name/sessions", (c) =>
 app.get("/api/ghosts/:name/stats", (c) =>
   handleRoute(c, async () => {
     return c.json(await getGhostStats(c.req.param("name")));
+  })
+);
+
+app.get("/api/ghosts/:name/runtime/meta", (c) =>
+  handleRoute(c, async () => {
+    return c.json(await getGhostRuntimeMeta(c.req.param("name")));
   })
 );
 
@@ -963,6 +1131,6 @@ if (import.meta.main || process.argv[1] === __apiFilename) {
   process.on("SIGTERM", shutdown);
 }
 
-export { app };
 export { ensureApiAdminToken } from "./auth-config";
 export { ScheduleManager } from "./schedule-manager";
+export { app };

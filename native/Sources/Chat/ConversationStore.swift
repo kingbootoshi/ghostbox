@@ -22,18 +22,20 @@ final class ConversationStore {
             onConversationChanged()
         }
     }
-    private(set) var olderMessages: [ChatMessage] = []
-    var hasOlderMessages: Bool { !olderMessages.isEmpty }
+    private(set) var olderMessageCount = 0
+    var hasOlderMessages: Bool { olderMessageCount > 0 || isLoadingOlderMessages }
     var messagesVersion = 0
     var preCompactionDisplayVersion = 0
     var sessions: SessionListResponse?
     var ghost: Ghost?
     var stats: GhostStats?
     var isLoadingHistory = false
+    var isLoadingOlderMessages = false
     var isCreatingSession = false
     var isCompacting = false
+    var isLoadingPreCompactionMessages = false
     var compactionSummary: String?
-    var showingPreCompactionMessages = false
+    var preCompactionRemainingCount = 0
     var visiblePreCompactionCount = 0 {
         didSet {
             preCompactionDisplayVersion &+= 1
@@ -46,6 +48,8 @@ final class ConversationStore {
     @ObservationIgnored var showToast: @MainActor (String) -> Void = { _ in }
     @ObservationIgnored var hasError: @MainActor () -> Bool = { false }
     @ObservationIgnored var onConversationChanged: @MainActor () -> Void = {}
+    @ObservationIgnored private var nextHistoryBefore: Int?
+    @ObservationIgnored private var nextPreCompactionBefore: Int?
 
     init(ghostName: String, client: GhostboxClient, initialGhost: Ghost? = nil) {
         self.ghostName = ghostName
@@ -66,8 +70,8 @@ final class ConversationStore {
         return Array(preCompactionMessages[startIndex...])
     }
 
-    var hasMoreOlderMessages: Bool {
-        visiblePreCompactionCount < preCompactionMessages.count
+    var preCompactionOlderMessageCount: Int {
+        max(0, preCompactionMessages.count - visiblePreCompactionCount) + preCompactionRemainingCount
     }
 
     func loadStats() async {
@@ -101,23 +105,22 @@ final class ConversationStore {
         }
 
         do {
-            let history = try await client.getHistory(ghostName: ghostName)
-            let allMessages = history.messages.map(historyMessageToChatMessage)
-            preCompactionMessages = history.preCompactionMessages.map(historyMessageToChatMessage)
+            let history = try await client.getHistoryPage(
+                ghostName: ghostName,
+                segment: "post",
+                limit: Self.initialMessageCount
+            )
+            let latestMessages = history.messages.map(historyMessageToChatMessage)
+            preCompactionMessages = []
+            preCompactionRemainingCount = history.preCompactionCount
+            nextPreCompactionBefore = history.preCompactionCount > 0 ? history.preCompactionCount : nil
             compactionSummary = history.compactions.last?.summary
             visiblePreCompactionCount = 0
-            showingPreCompactionMessages = false
+            nextHistoryBefore = history.nextBefore
+            olderMessageCount = history.nextBefore ?? 0
+            messages = latestMessages
 
-            if allMessages.count > Self.initialMessageCount {
-                let splitIndex = allMessages.count - Self.initialMessageCount
-                olderMessages = Array(allMessages[..<splitIndex])
-                messages = Array(allMessages[splitIndex...])
-            } else {
-                olderMessages = []
-                messages = allMessages
-            }
-
-            if !history.compactions.isEmpty && messages.isEmpty && !preCompactionMessages.isEmpty {
+            if !history.compactions.isEmpty && messages.isEmpty && history.preCompactionCount > 0 {
                 messages = [ChatMessage(role: .system, content: "Session compacted")]
             }
 
@@ -133,11 +136,13 @@ final class ConversationStore {
 
         clearError()
         messages = []
-        olderMessages = []
+        olderMessageCount = 0
+        nextHistoryBefore = nil
         preCompactionMessages = []
+        preCompactionRemainingCount = 0
+        nextPreCompactionBefore = nil
         compactionSummary = nil
         visiblePreCompactionCount = 0
-        showingPreCompactionMessages = false
         isCreatingSession = true
         SoundManager.shared.play(.sessionNew)
 
@@ -237,25 +242,74 @@ final class ConversationStore {
     }
 
     func loadOlderMessageBatch() {
-        guard !olderMessages.isEmpty else { return }
-        let batchSize = min(Self.olderMessagesBatchSize, olderMessages.count)
-        let batch = Array(olderMessages.suffix(batchSize))
-        olderMessages.removeLast(batchSize)
-        messages.insert(contentsOf: batch, at: 0)
+        guard !isLoadingOlderMessages else { return }
+        guard let before = nextHistoryBefore, before > 0 else { return }
+
+        isLoadingOlderMessages = true
+
+        Task { [weak self] in
+            guard let self else { return }
+
+            defer {
+                isLoadingOlderMessages = false
+            }
+
+            do {
+                let page = try await client.getHistoryPage(
+                    ghostName: ghostName,
+                    segment: "post",
+                    limit: Self.olderMessagesBatchSize,
+                    before: before
+                )
+                let olderBatch = page.messages.map(historyMessageToChatMessage)
+                messages.insert(contentsOf: olderBatch, at: 0)
+                nextHistoryBefore = page.nextBefore
+                olderMessageCount = page.nextBefore ?? 0
+            } catch {
+                showToast(error.localizedDescription)
+            }
+        }
     }
 
     func showMoreOlderMessages() {
-        let newCount = min(
-            visiblePreCompactionCount + Self.olderMessagesBatchSize,
-            preCompactionMessages.count
-        )
-        visiblePreCompactionCount = newCount
-        showingPreCompactionMessages = newCount > 0
-    }
+        guard !isLoadingPreCompactionMessages else { return }
 
-    func hideOlderMessages() {
-        visiblePreCompactionCount = 0
-        showingPreCompactionMessages = false
+        if visiblePreCompactionCount < preCompactionMessages.count {
+            let newCount = min(
+                visiblePreCompactionCount + Self.olderMessagesBatchSize,
+                preCompactionMessages.count
+            )
+            visiblePreCompactionCount = newCount
+            return
+        }
+
+        guard let before = nextPreCompactionBefore, before > 0 else { return }
+
+        isLoadingPreCompactionMessages = true
+
+        Task { [weak self] in
+            guard let self else { return }
+
+            defer {
+                isLoadingPreCompactionMessages = false
+            }
+
+            do {
+                let page = try await client.getHistoryPage(
+                    ghostName: ghostName,
+                    segment: "pre",
+                    limit: Self.olderMessagesBatchSize,
+                    before: before
+                )
+                let olderBatch = page.messages.map(historyMessageToChatMessage)
+                preCompactionMessages.insert(contentsOf: olderBatch, at: 0)
+                visiblePreCompactionCount = preCompactionMessages.count
+                nextPreCompactionBefore = page.nextBefore
+                preCompactionRemainingCount = page.nextBefore ?? 0
+            } catch {
+                showToast(error.localizedDescription)
+            }
+        }
     }
 
     private func historyMessageToChatMessage(_ message: HistoryMessage) -> ChatMessage {

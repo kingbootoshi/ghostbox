@@ -103,36 +103,28 @@ struct ExchangeBreak: View {
 
 struct GhostTypingBlock: View {
     let name: String
-    @State private var phase = 0
-    @State private var timer: Timer?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(name)
-                .font(Theme.Typography.label(weight: .semibold))
-                .foregroundColor(Theme.Colors.accentLight)
+        TimelineView(.animation(minimumInterval: 0.4, paused: false)) { context in
+            let phase = Int(context.date.timeIntervalSinceReferenceDate / 0.4) % 3
 
-            HStack(spacing: 5) {
-                ForEach(0..<3, id: \.self) { index in
-                    Circle()
-                        .fill(Color.white.opacity(phase == index ? 0.4 : 0.1))
-                        .frame(width: 5, height: 5)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(name)
+                    .font(Theme.Typography.label(weight: .semibold))
+                    .foregroundColor(Theme.Colors.accentLight)
+
+                HStack(spacing: 5) {
+                    ForEach(0..<3, id: \.self) { index in
+                        Circle()
+                            .fill(Color.white.opacity(phase == index ? 0.4 : 0.1))
+                            .frame(width: 5, height: 5)
+                    }
                 }
             }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 20)
-        .onAppear {
-            timer?.invalidate()
-            timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { _ in
-                phase = (phase + 1) % 3
-            }
-        }
-        .onDisappear {
-            timer?.invalidate()
-            timer = nil
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
         }
     }
 }
