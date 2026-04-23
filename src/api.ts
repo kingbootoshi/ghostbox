@@ -31,11 +31,11 @@ import {
   getConfig,
   getGhost,
   getGhostHealth,
-  getGhostHistory,
   getGhostQueue,
   getGhostRuntimeMeta,
   getGhostSessions,
   getGhostStats,
+  getGhostTimeline,
   killBackgroundTask,
   killGhost,
   listApiKeys,
@@ -123,8 +123,6 @@ type VaultWriteBody = {
 type VaultDeleteBody = {
   path?: unknown;
 };
-
-type HistorySegment = "post" | "pre";
 
 type SessionSwitchBody = {
   sessionId?: unknown;
@@ -238,18 +236,6 @@ const getErrorStatus = (error: unknown): ApiStatusCode => {
   }
 
   return 500;
-};
-
-const parseHistorySegment = (value: string | undefined): HistorySegment => {
-  if (value === undefined || value === "post") {
-    return "post";
-  }
-
-  if (value === "pre") {
-    return "pre";
-  }
-
-  throw new ApiError(400, `Invalid history segment "${value}".`);
 };
 
 const parsePositiveInteger = (value: string | undefined, field: string): number | undefined => {
@@ -635,23 +621,11 @@ app.get("/api/ghosts/:name/health", (c) =>
   })
 );
 
-app.get("/api/ghosts/:name/history", (c) =>
+app.get("/api/ghosts/:name/timeline", (c) =>
   handleRoute(c, async () => {
-    const limit = parsePositiveInteger(c.req.query("limit"), "history limit");
-    const before = parseNonNegativeInteger(c.req.query("before"), "history cursor");
-    const segmentQuery = c.req.query("segment");
-
-    if (limit === undefined && before === undefined && segmentQuery === undefined) {
-      return c.json(await getGhostHistory(c.req.param("name")));
-    }
-
-    return c.json(
-      await getGhostHistory(c.req.param("name"), {
-        limit,
-        before,
-        segment: parseHistorySegment(segmentQuery)
-      })
-    );
+    const limit = parsePositiveInteger(c.req.query("limit"), "timeline limit");
+    const before = parseNonNegativeInteger(c.req.query("before"), "timeline cursor");
+    return c.json(await getGhostTimeline(c.req.param("name"), { limit, before }));
   })
 );
 

@@ -31,7 +31,6 @@ struct AgentChatView: View {
     @State private var expandedToolMessages: Set<UUID> = []
     @State private var fullscreenToolGroupID: UUID?
     @State private var cachedDisplayItems: [ChatDisplayItem] = []
-    @State private var cachedPreCompactionDisplayItems: [ChatDisplayItem] = []
     @State var showsVaultBrowser = false
     @State private var showHotkeyHelp = false
     @State var slashCommands: [GhostSlashCommand] = []
@@ -43,9 +42,8 @@ struct AgentChatView: View {
     @State private var shouldFollowLatest = true
     @State private var scrollViewHeight: CGFloat = 0
     @State private var hasScrolledToInitialBottom = false
-    @State private var cachedDisplaySourceIDs: [UUID] = []
-    @State private var cachedPreCompactionSourceIDs: [UUID] = []
-    @State private var pendingPrependAnchorID: UUID?
+    @State private var cachedDisplaySourceIDs: [String] = []
+    @State private var pendingPrependAnchorID: String?
 
     var body: some View {
         @Bindable var input = viewModel.input
@@ -206,7 +204,6 @@ struct AgentChatView: View {
         .onAppear {
             isInputFocused = true
             rebuildDisplayItems()
-            rebuildPreCompactionDisplayItems()
         }
         .onChange(of: showsVaultBrowser) {
             isInputFocused = !showsVaultBrowser
@@ -224,11 +221,8 @@ struct AgentChatView: View {
         .onChange(of: input.inputText) {
             handleInputTextChanged()
         }
-        .onChange(of: store.messagesVersion) {
+        .onChange(of: store.timelineVersion) {
             rebuildDisplayItems()
-        }
-        .onChange(of: store.preCompactionDisplayVersion) {
-            rebuildPreCompactionDisplayItems()
         }
         .onKeyPress(.escape, action: handleEscapeKey)
         .onReceive(NotificationCenter.default.publisher(for: .toggleGhostChatFiles)) { notification in
@@ -244,7 +238,7 @@ struct AgentChatView: View {
     }
 
     private var hasEmptyState: Bool {
-        viewModel.store.messages.isEmpty
+        viewModel.store.timelineItems.isEmpty
     }
 
     private var chatContent: some View {
@@ -287,16 +281,8 @@ struct AgentChatView: View {
                         LazyVStack(spacing: 20) {
                             topHistoryTrigger
 
-                            if viewModel.store.isLoadingOlderMessages || viewModel.store.isLoadingPreCompactionMessages {
+                            if viewModel.store.isLoadingOlderMessages {
                                 historyLoadingIndicator
-                            }
-
-                            if !viewModel.store.preCompactionMessages.isEmpty || viewModel.store.preCompactionRemainingCount > 0 {
-                                if !viewModel.store.visiblePreCompactionMessages.isEmpty {
-                                    chatItemsSection(cachedPreCompactionDisplayItems)
-                                }
-
-                                CompactionDivider(summary: viewModel.store.compactionSummary)
                             }
 
                             chatItemsSection(cachedDisplayItems)
@@ -346,7 +332,7 @@ struct AgentChatView: View {
                     requestOlderHistoryIfNeeded()
                 }
                 .onAppear {
-                    if !viewModel.store.messages.isEmpty {
+                    if !viewModel.store.timelineItems.isEmpty {
                         proxy.scrollTo(ChatScrollAnchor.bottom, anchor: .bottom)
                         hasScrolledToInitialBottom = true
                     }
@@ -357,11 +343,11 @@ struct AgentChatView: View {
                         shouldFollowLatest = false
                     }
                 )
-                .onChange(of: viewModel.store.messagesVersion) {
+                .onChange(of: viewModel.store.timelineVersion) {
                     if preservePrependScrollPosition(using: proxy) {
                         return
                     }
-                    if !hasScrolledToInitialBottom && !viewModel.store.messages.isEmpty {
+                    if !hasScrolledToInitialBottom && !viewModel.store.timelineItems.isEmpty {
                         DispatchQueue.main.async {
                             proxy.scrollTo(ChatScrollAnchor.bottom, anchor: .bottom)
                         }
@@ -376,7 +362,7 @@ struct AgentChatView: View {
                     guard let selectionID = viewModel.input.historySelectionMessageID else { return }
                     shouldFollowLatest = false
                     withAnimation(.easeOut(duration: 0.2)) {
-                        proxy.scrollTo(ChatScrollAnchor.message(selectionID), anchor: .center)
+                        proxy.scrollTo(ChatScrollAnchor.message("message-\(selectionID.uuidString)"), anchor: .center)
                     }
                 }
                 .onChange(of: viewModel.isStreaming) {
@@ -387,9 +373,6 @@ struct AgentChatView: View {
                     hasScrolledToInitialBottom = false
                     shouldFollowLatest = true
                     scrollToLatest(using: proxy)
-                }
-                .onChange(of: viewModel.store.preCompactionDisplayVersion) {
-                    _ = preservePrependScrollPosition(using: proxy)
                 }
 
                 if !shouldFollowLatest && !viewModel.store.messages.isEmpty {
@@ -602,26 +585,14 @@ struct AgentChatView: View {
     }
 
     private func rebuildDisplayItems() {
-        let messages = viewModel.store.messages
-        let sourceIDs = messages.map(\.id)
+        let timelineItems = viewModel.store.timelineItems
+        let sourceIDs = timelineItems.map(\.id)
 
         if sourceIDs == cachedDisplaySourceIDs, !cachedDisplayItems.isEmpty {
-            cachedDisplayItems = ChatDisplayItem.patch(existing: cachedDisplayItems, from: messages)
+            cachedDisplayItems = ChatDisplayItem.patch(existing: cachedDisplayItems, from: timelineItems)
         } else {
-            cachedDisplayItems = ChatDisplayItem.build(from: messages)
+            cachedDisplayItems = ChatDisplayItem.build(from: timelineItems)
             cachedDisplaySourceIDs = sourceIDs
-        }
-    }
-
-    private func rebuildPreCompactionDisplayItems() {
-        let messages = viewModel.store.visiblePreCompactionMessages
-        let sourceIDs = messages.map(\.id)
-
-        if sourceIDs == cachedPreCompactionSourceIDs, !cachedPreCompactionDisplayItems.isEmpty {
-            cachedPreCompactionDisplayItems = ChatDisplayItem.patch(existing: cachedPreCompactionDisplayItems, from: messages)
-        } else {
-            cachedPreCompactionDisplayItems = ChatDisplayItem.build(from: messages)
-            cachedPreCompactionSourceIDs = sourceIDs
         }
     }
 
@@ -648,22 +619,16 @@ struct AgentChatView: View {
         .padding(.vertical, 4)
     }
 
-    private var oldestLoadedMessageID: UUID? {
-        viewModel.store.visiblePreCompactionMessages.first?.id ?? viewModel.store.messages.first?.id
+    private var oldestLoadedTimelineItemID: String? {
+        viewModel.store.timelineItems.first?.id
     }
 
     private func requestOlderHistoryIfNeeded() {
         guard pendingPrependAnchorID == nil else { return }
 
         if viewModel.store.hasOlderMessages {
-            pendingPrependAnchorID = oldestLoadedMessageID
+            pendingPrependAnchorID = oldestLoadedTimelineItemID
             viewModel.store.loadOlderMessageBatch()
-            return
-        }
-
-        if viewModel.store.preCompactionOlderMessageCount > 0 {
-            pendingPrependAnchorID = oldestLoadedMessageID
-            viewModel.store.showMoreOlderMessages()
         }
     }
 
@@ -722,8 +687,8 @@ private enum ChatScrollAnchor {
     static let typing = "chat-typing-anchor"
     static let bottom = "chat-bottom-anchor"
 
-    static func message(_ id: UUID) -> String {
-        "chat-message-\(id.uuidString)"
+    static func message(_ id: String) -> String {
+        "chat-message-\(id)"
     }
 }
 
@@ -767,6 +732,8 @@ private struct ChatDisplayRow: View {
                 onToggle: { onToggleToolGroup(group.id) },
                 onShowFullscreen: { onShowFullscreenToolGroup(group.id) }
             )
+        case .compaction(let marker, _):
+            CompactionDivider(summary: marker.summary)
         }
     }
 }

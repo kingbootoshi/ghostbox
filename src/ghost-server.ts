@@ -1744,8 +1744,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
-  if (req.method === "GET" && req.url?.startsWith("/history")) {
-    await handlers.handleHistory(req, res);
+  if (req.method === "GET" && req.url?.startsWith("/timeline")) {
+    await handlers.handleTimeline(req, res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }

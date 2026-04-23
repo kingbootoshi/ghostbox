@@ -24,9 +24,10 @@ import type {
   GhostSchedule,
   GhostStats,
   HistoryMessage,
-  HistoryResponse,
   SessionInfo,
-  SessionListResponse
+  SessionListResponse,
+  TimelineItem,
+  TimelineResponse
 } from "../src/types";
 
 const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || "/vault/.claude";
@@ -136,18 +137,6 @@ type RequestBodySessionSwitch = {
 type RequestBodySessionRename = {
   sessionId?: unknown;
   name?: unknown;
-};
-
-type HistorySegment = "post" | "pre";
-
-type HistoryPageResponse = {
-  segment: HistorySegment;
-  messages: HistoryMessage[];
-  totalCount: number;
-  nextBefore: number | null;
-  compactions: CompactionInfo[];
-  preCompactionCount: number;
-  postCompactionCount: number;
 };
 
 type ScheduleBody = {
@@ -696,143 +685,92 @@ const parseHistoryMessage = (line: JsonRecord): HistoryMessage | null => {
   return null;
 };
 
-const parseCompactions = (lines: JsonRecord[]): CompactionInfo[] => {
-  return lines
-    .filter((line) => line.isReplay === true && getString(line.type) === "local-command-stdout")
-    .map((line) => ({
-      timestamp: readSessionTimestamp(line, new Date()),
-      summary: extractText(line.message ?? line.content ?? line.text) || "Session compacted.",
-      tokensBefore: 0
-    }))
-    .filter((entry) => entry.summary.toLowerCase().includes("compact"));
+const parseCompaction = (line: JsonRecord): CompactionInfo | null => {
+  if (!(line.isReplay === true && getString(line.type) === "local-command-stdout")) {
+    return null;
+  }
+
+  const summary = extractText(line.message ?? line.content ?? line.text) || "Session compacted.";
+  if (!summary.toLowerCase().includes("compact")) {
+    return null;
+  }
+
+  return {
+    timestamp: readSessionTimestamp(line, new Date()),
+    summary,
+    tokensBefore: 0
+  };
 };
 
-const collectCompactionInfo = (
-  lines: JsonRecord[]
-): { lastCompactionIndex: number; compactions: CompactionInfo[] } => {
-  let lastCompactionIndex = -1;
-  const compactions: CompactionInfo[] = [];
-
-  lines.forEach((line, index) => {
-    if (!(line.isReplay === true && getString(line.type) === "local-command-stdout")) {
-      return;
-    }
-
-    const summary = extractText(line.message ?? line.content ?? line.text) || "Session compacted.";
-    if (!summary.toLowerCase().includes("compact")) {
-      return;
-    }
-
-    lastCompactionIndex = index;
-    compactions.push({
-      timestamp: readSessionTimestamp(line, new Date()),
-      summary,
-      tokensBefore: 0
-    });
-  });
-
-  return { lastCompactionIndex, compactions };
-};
-
-const paginateHistoryMessages = (
-  messages: HistoryMessage[],
+const paginateTimelineItems = (
+  items: TimelineItem[],
   before: number | undefined,
-  limit: number
-): { messages: HistoryMessage[]; totalCount: number; nextBefore: number | null } => {
-  const totalCount = messages.length;
+  limit: number | undefined
+): TimelineResponse => {
+  const totalCount = items.length;
   const boundedBefore = before === undefined ? totalCount : Math.max(0, Math.min(before, totalCount));
-  const boundedLimit = Math.max(1, Math.min(limit, 200));
+  const boundedLimit = limit === undefined ? totalCount : Math.max(1, Math.min(limit, 200));
   const startIndex = Math.max(0, boundedBefore - boundedLimit);
 
   return {
-    messages: messages.slice(startIndex, boundedBefore),
+    items: items.slice(startIndex, boundedBefore),
     totalCount,
     nextBefore: startIndex > 0 ? startIndex : null
   };
 };
 
-const parseHistoryRequest = (
+const parseTimelineRequest = (
   req: IncomingMessage
-): { paginated: false } | { paginated: true; segment: HistorySegment; before: number | undefined; limit: number } => {
-  const url = new URL(req.url ?? "/history", "http://localhost");
+): { before: number | undefined; limit: number | undefined } => {
+  const url = new URL(req.url ?? "/timeline", "http://localhost");
   const limitValue = url.searchParams.get("limit");
   const beforeValue = url.searchParams.get("before");
-  const segmentValue = url.searchParams.get("segment");
-
-  if (limitValue === null && beforeValue === null && segmentValue === null) {
-    return { paginated: false };
-  }
-
-  const segment: HistorySegment = segmentValue === "pre" ? "pre" : "post";
-  const limit = Number(limitValue ?? "50");
+  const limit = limitValue === null ? undefined : Number(limitValue);
   const before = beforeValue === null ? undefined : Number(beforeValue);
 
-  if (!Number.isSafeInteger(limit) || limit <= 0) {
-    throw new Error("Invalid history limit");
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) {
+    throw new Error("Invalid timeline limit");
   }
 
   if (before !== undefined && (!Number.isSafeInteger(before) || before < 0)) {
-    throw new Error("Invalid history cursor");
+    throw new Error("Invalid timeline cursor");
   }
 
-  return {
-    paginated: true,
-    segment,
-    before,
-    limit
-  };
+  return { before, limit };
 };
 
-const loadHistoryResponse = async (sessionId: string | null): Promise<HistoryResponse> => {
+const loadTimelineItems = async (sessionId: string | null): Promise<TimelineItem[]> => {
   if (!sessionId || !(await sessionFileExists(sessionId))) {
-    return { messages: [], preCompactionMessages: [], compactions: [] };
+    return [];
   }
 
   const lines = await readJsonLines(getSessionFilePath(sessionId));
-  const { lastCompactionIndex, compactions } = collectCompactionInfo(lines);
-  const preCompactionMessages: HistoryMessage[] = [];
-  const messages: HistoryMessage[] = [];
+  const items: TimelineItem[] = [];
 
   lines.forEach((line, index) => {
+    const compaction = parseCompaction(line);
+    if (compaction) {
+      items.push({
+        id: `compaction:${index}`,
+        type: "compaction",
+        compaction
+      });
+      return;
+    }
+
     const message = parseHistoryMessage(line);
     if (message === null) {
       return;
     }
 
-    if (lastCompactionIndex >= 0 && index < lastCompactionIndex) {
-      preCompactionMessages.push(message);
-      return;
-    }
-
-    messages.push(message);
+    items.push({
+      id: `message:${index}`,
+      type: "message",
+      message
+    });
   });
 
-  return {
-    messages,
-    preCompactionMessages,
-    compactions
-  };
-};
-
-const loadHistoryPageResponse = async (
-  sessionId: string | null,
-  segment: HistorySegment,
-  limit: number,
-  before: number | undefined
-): Promise<HistoryPageResponse> => {
-  const history = await loadHistoryResponse(sessionId);
-  const segmentMessages = segment === "pre" ? history.preCompactionMessages : history.messages;
-  const page = paginateHistoryMessages(segmentMessages, before, limit);
-
-  return {
-    segment,
-    messages: page.messages,
-    totalCount: page.totalCount,
-    nextBefore: page.nextBefore,
-    compactions: history.compactions,
-    preCompactionCount: history.preCompactionMessages.length,
-    postCompactionCount: history.messages.length
-  };
+  return items;
 };
 
 const loadSessions = async (): Promise<SessionListResponse> => {
@@ -1863,24 +1801,10 @@ const handleClearQueue = (res: ServerResponse): void => {
   sendJson(res, 200, response);
 };
 
-const handleHistory = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-  const historyRequest = parseHistoryRequest(req);
-
-  if (!historyRequest.paginated) {
-    sendJson(res, 200, await loadHistoryResponse(currentSessionId));
-    return;
-  }
-
-  sendJson(
-    res,
-    200,
-    await loadHistoryPageResponse(
-      currentSessionId,
-      historyRequest.segment,
-      historyRequest.limit,
-      historyRequest.before
-    )
-  );
+const handleTimeline = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const timelineRequest = parseTimelineRequest(req);
+  const items = await loadTimelineItems(currentSessionId);
+  sendJson(res, 200, paginateTimelineItems(items, timelineRequest.before, timelineRequest.limit));
 };
 
 const handleSessions = async (res: ServerResponse): Promise<void> => {
@@ -1891,8 +1815,8 @@ const handleStats = async (res: ServerResponse): Promise<void> => {
   const baseStats = latestStats ? { ...latestStats } : await loadStatsFromSessionFile(currentSessionId);
 
   if (currentSessionId && (await sessionFileExists(currentSessionId))) {
-    const history = await loadHistoryResponse(currentSessionId);
-    baseStats.messageCount = history.messages.length;
+    const timeline = await loadTimelineItems(currentSessionId);
+    baseStats.messageCount = timeline.filter((item) => item.type === "message").length;
   }
 
   sendJson(res, 200, {
@@ -2171,8 +2095,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
-  if (req.method === "GET" && req.url?.startsWith("/history")) {
-    await handleHistory(req, res);
+  if (req.method === "GET" && req.url?.startsWith("/timeline")) {
+    await handleTimeline(req, res);
     return;
   }
 

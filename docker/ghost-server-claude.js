@@ -476,99 +476,72 @@ var parseHistoryMessage = (line) => {
   }
   return null;
 };
-var collectCompactionInfo = (lines) => {
-  let lastCompactionIndex = -1;
-  const compactions = [];
-  lines.forEach((line, index) => {
-    if (!(line.isReplay === true && getString(line.type) === "local-command-stdout")) {
-      return;
-    }
-    const summary = extractText(line.message ?? line.content ?? line.text) || "Session compacted.";
-    if (!summary.toLowerCase().includes("compact")) {
-      return;
-    }
-    lastCompactionIndex = index;
-    compactions.push({
-      timestamp: readSessionTimestamp(line, new Date),
-      summary,
-      tokensBefore: 0
-    });
-  });
-  return { lastCompactionIndex, compactions };
+var parseCompaction = (line) => {
+  if (!(line.isReplay === true && getString(line.type) === "local-command-stdout")) {
+    return null;
+  }
+  const summary = extractText(line.message ?? line.content ?? line.text) || "Session compacted.";
+  if (!summary.toLowerCase().includes("compact")) {
+    return null;
+  }
+  return {
+    timestamp: readSessionTimestamp(line, new Date),
+    summary,
+    tokensBefore: 0
+  };
 };
-var paginateHistoryMessages = (messages, before, limit) => {
-  const totalCount = messages.length;
+var paginateTimelineItems = (items, before, limit) => {
+  const totalCount = items.length;
   const boundedBefore = before === undefined ? totalCount : Math.max(0, Math.min(before, totalCount));
-  const boundedLimit = Math.max(1, Math.min(limit, 200));
+  const boundedLimit = limit === undefined ? totalCount : Math.max(1, Math.min(limit, 200));
   const startIndex = Math.max(0, boundedBefore - boundedLimit);
   return {
-    messages: messages.slice(startIndex, boundedBefore),
+    items: items.slice(startIndex, boundedBefore),
     totalCount,
     nextBefore: startIndex > 0 ? startIndex : null
   };
 };
-var parseHistoryRequest = (req) => {
-  const url = new URL(req.url ?? "/history", "http://localhost");
+var parseTimelineRequest = (req) => {
+  const url = new URL(req.url ?? "/timeline", "http://localhost");
   const limitValue = url.searchParams.get("limit");
   const beforeValue = url.searchParams.get("before");
-  const segmentValue = url.searchParams.get("segment");
-  if (limitValue === null && beforeValue === null && segmentValue === null) {
-    return { paginated: false };
-  }
-  const segment = segmentValue === "pre" ? "pre" : "post";
-  const limit = Number(limitValue ?? "50");
+  const limit = limitValue === null ? undefined : Number(limitValue);
   const before = beforeValue === null ? undefined : Number(beforeValue);
-  if (!Number.isSafeInteger(limit) || limit <= 0) {
-    throw new Error("Invalid history limit");
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) {
+    throw new Error("Invalid timeline limit");
   }
   if (before !== undefined && (!Number.isSafeInteger(before) || before < 0)) {
-    throw new Error("Invalid history cursor");
+    throw new Error("Invalid timeline cursor");
   }
-  return {
-    paginated: true,
-    segment,
-    before,
-    limit
-  };
+  return { before, limit };
 };
-var loadHistoryResponse = async (sessionId) => {
+var loadTimelineItems = async (sessionId) => {
   if (!sessionId || !await sessionFileExists(sessionId)) {
-    return { messages: [], preCompactionMessages: [], compactions: [] };
+    return [];
   }
   const lines = await readJsonLines(getSessionFilePath(sessionId));
-  const { lastCompactionIndex, compactions } = collectCompactionInfo(lines);
-  const preCompactionMessages = [];
-  const messages = [];
+  const items = [];
   lines.forEach((line, index) => {
+    const compaction = parseCompaction(line);
+    if (compaction) {
+      items.push({
+        id: `compaction:${index}`,
+        type: "compaction",
+        compaction
+      });
+      return;
+    }
     const message = parseHistoryMessage(line);
     if (message === null) {
       return;
     }
-    if (lastCompactionIndex >= 0 && index < lastCompactionIndex) {
-      preCompactionMessages.push(message);
-      return;
-    }
-    messages.push(message);
+    items.push({
+      id: `message:${index}`,
+      type: "message",
+      message
+    });
   });
-  return {
-    messages,
-    preCompactionMessages,
-    compactions
-  };
-};
-var loadHistoryPageResponse = async (sessionId, segment, limit, before) => {
-  const history = await loadHistoryResponse(sessionId);
-  const segmentMessages = segment === "pre" ? history.preCompactionMessages : history.messages;
-  const page = paginateHistoryMessages(segmentMessages, before, limit);
-  return {
-    segment,
-    messages: page.messages,
-    totalCount: page.totalCount,
-    nextBefore: page.nextBefore,
-    compactions: history.compactions,
-    preCompactionCount: history.preCompactionMessages.length,
-    postCompactionCount: history.messages.length
-  };
+  return items;
 };
 var loadSessions = async () => {
   if (!await fileExists(CLAUDE_PROJECTS_DIR)) {
@@ -1432,13 +1405,10 @@ var handleClearQueue = (res) => {
   queue.messages = [];
   sendJson(res, 200, response);
 };
-var handleHistory = async (req, res) => {
-  const historyRequest = parseHistoryRequest(req);
-  if (!historyRequest.paginated) {
-    sendJson(res, 200, await loadHistoryResponse(currentSessionId));
-    return;
-  }
-  sendJson(res, 200, await loadHistoryPageResponse(currentSessionId, historyRequest.segment, historyRequest.limit, historyRequest.before));
+var handleTimeline = async (req, res) => {
+  const timelineRequest = parseTimelineRequest(req);
+  const items = await loadTimelineItems(currentSessionId);
+  sendJson(res, 200, paginateTimelineItems(items, timelineRequest.before, timelineRequest.limit));
 };
 var handleSessions = async (res) => {
   sendJson(res, 200, await loadSessions());
@@ -1446,8 +1416,8 @@ var handleSessions = async (res) => {
 var handleStats = async (res) => {
   const baseStats = latestStats ? { ...latestStats } : await loadStatsFromSessionFile(currentSessionId);
   if (currentSessionId && await sessionFileExists(currentSessionId)) {
-    const history = await loadHistoryResponse(currentSessionId);
-    baseStats.messageCount = history.messages.length;
+    const timeline = await loadTimelineItems(currentSessionId);
+    baseStats.messageCount = timeline.filter((item) => item.type === "message").length;
   }
   sendJson(res, 200, {
     sessionId: baseStats.sessionId,
@@ -1666,8 +1636,8 @@ var handleRequest = async (req, res) => {
     handleClearQueue(res);
     return;
   }
-  if (req.method === "GET" && req.url?.startsWith("/history")) {
-    await handleHistory(req, res);
+  if (req.method === "GET" && req.url?.startsWith("/timeline")) {
+    await handleTimeline(req, res);
     return;
   }
   if (req.method === "GET" && req.url === "/sessions") {

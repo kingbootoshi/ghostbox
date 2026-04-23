@@ -108,7 +108,7 @@ final class AgentChatViewModel {
         input.pendingImages = []
 
         if store.isCreatingSession {
-            store.messages.append(
+            store.appendMessage(
                 ChatMessage(
                     role: .user,
                     content: prompt,
@@ -139,7 +139,7 @@ final class AgentChatViewModel {
             return
         }
 
-        store.messages.append(
+        store.appendMessage(
             ChatMessage(
                 role: .user,
                 content: prompt,
@@ -210,7 +210,7 @@ final class AgentChatViewModel {
 
     func switchModel(to model: GhostModel) {
         let command = "/model \(model.provider)/\(model.modelId)"
-        store.messages.append(ChatMessage(role: .system, content: "Switching to \(model.displayName)..."))
+        store.appendMessage(ChatMessage(role: .system, content: "Switching to \(model.displayName)..."))
 
         Task { [weak self] in
             guard let self else { return }
@@ -219,7 +219,7 @@ final class AgentChatViewModel {
                 let stream = client.sendMessage(ghostName: ghostName, prompt: command, model: nil)
                 for try await event in stream {
                     if event.type == .result || event.type == .assistant, let text = event.text, !text.isEmpty {
-                        store.messages.append(ChatMessage(role: .system, content: text))
+                        store.appendMessage(ChatMessage(role: .system, content: text))
                     }
                 }
 
@@ -230,7 +230,7 @@ final class AgentChatViewModel {
                         model: model.modelId
                     )
                 } catch {
-                    store.messages.append(
+                    store.appendMessage(
                         ChatMessage(
                             role: .system,
                             content: "Model switch finished, but persisted state could not be confirmed: \(error.localizedDescription)"
@@ -239,7 +239,7 @@ final class AgentChatViewModel {
                     await loadGhost()
                 }
             } catch {
-                store.messages.append(ChatMessage(role: .system, content: "Model switch failed: \(error.localizedDescription)"))
+                store.appendMessage(ChatMessage(role: .system, content: "Model switch failed: \(error.localizedDescription)"))
             }
         }
     }
@@ -380,7 +380,7 @@ final class AgentChatViewModel {
         let nextMessage = queuedMessages.removeFirst()
 
         if !nextMessage.isAlreadyDisplayed {
-            store.messages.append(
+            store.appendMessage(
                 ChatMessage(
                     role: .user,
                     content: nextMessage.prompt,
@@ -431,7 +431,7 @@ final class AgentChatViewModel {
         showsTypingIndicator = true
         var currentAssistantText = ""      // running target (everything the server has sent)
         var visibleAssistantText = ""      // what the UI has painted so far (typewriter drain)
-        var currentAssistantIndex: Int?
+        var currentAssistantMessageID: UUID?
         var drainTask: Task<Void, Never>?
         var streamFinished = false
         let isCompactCommand = Self.isCompactCommand(prompt)
@@ -446,17 +446,17 @@ final class AgentChatViewModel {
             guard !visibleAssistantText.isEmpty else { return }
             showsTypingIndicator = false
 
-            if let index = currentAssistantIndex, store.messages.indices.contains(index) {
-                let existing = store.messages[index]
+            if let messageID = currentAssistantMessageID,
+               let existing = store.messages.first(where: { $0.id == messageID }) {
                 let updated = existing.updatingContent(visibleAssistantText)
-                store.updateMessage(at: index, with: updated)
+                store.updateMessage(id: existing.id, with: updated)
                 if isCompactCommand {
                     compactResponseMessageID = updated.id
                 }
             } else {
                 let assistantMessage = ChatMessage(role: .ghost, content: visibleAssistantText)
-                store.messages.append(assistantMessage)
-                currentAssistantIndex = store.messages.count - 1
+                store.appendMessage(assistantMessage)
+                currentAssistantMessageID = assistantMessage.id
                 SoundManager.shared.play(.messageReceived)
                 if isCompactCommand {
                     compactResponseMessageID = assistantMessage.id
@@ -525,7 +525,7 @@ final class AgentChatViewModel {
             cancelDrain()
             currentAssistantText = ""
             visibleAssistantText = ""
-            currentAssistantIndex = nil
+            currentAssistantMessageID = nil
             showsTypingIndicator = isStreaming
         }
 
@@ -580,11 +580,10 @@ final class AgentChatViewModel {
                     flushAssistantMessage(force: true)
                     resetAssistantAccumulators()
 
-                    if let last = store.messages.last, last.role == .thinking {
-                        let index = store.messages.count - 1
-                        store.updateMessage(at: index, with: last.updatingContent(chunk))
+                    if let last = store.lastMessage(), last.role == .thinking {
+                        store.updateMessage(id: last.id, with: last.updatingContent(chunk))
                     } else {
-                        store.messages.append(ChatMessage(role: .thinking, content: chunk))
+                        store.appendMessage(ChatMessage(role: .thinking, content: chunk))
                     }
 
                 case .tool_use:
@@ -593,14 +592,14 @@ final class AgentChatViewModel {
 
                     let toolName = event.tool ?? "Tool"
                     let content = event.input?.stringValue ?? "Running \(toolName)"
-                    store.messages.append(ChatMessage(role: .toolUse, content: content, toolName: toolName))
+                    store.appendMessage(ChatMessage(role: .toolUse, content: content, toolName: toolName))
 
                 case .tool_result:
                     flushAssistantMessage(force: true)
                     resetAssistantAccumulators()
 
                     let content = event.output?.stringValue ?? "Tool finished."
-                    store.messages.append(ChatMessage(role: .toolResult, content: content, toolName: "Result"))
+                    store.appendMessage(ChatMessage(role: .toolResult, content: content, toolName: "Result"))
                     rebuildActiveBackgroundTasks()
 
                 case .result:
@@ -617,7 +616,7 @@ final class AgentChatViewModel {
             return
         } catch {
             notifications.showError(error.localizedDescription)
-            store.messages.append(
+            store.appendMessage(
                 ChatMessage(role: .system, content: "Error: \(error.localizedDescription)")
             )
 
@@ -758,7 +757,7 @@ final class AgentChatViewModel {
         var tasksByID: [String: ActiveBackgroundTask] = [:]
         var orderedTaskIDs: [String] = []
 
-        for message in store.preCompactionMessages + store.messages {
+        for message in store.messages {
             guard message.role == .toolResult else { continue }
 
             if let task = Self.parseBackgroundTaskStart(from: message.content) {

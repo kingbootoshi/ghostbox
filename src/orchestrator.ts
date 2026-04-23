@@ -23,29 +23,16 @@ import type {
   GhostRuntimeMeta,
   GhostState,
   GhostStreamingBehavior,
-  HistoryMessage,
-  HistoryResponse,
-  SessionListResponse
+  SessionListResponse,
+  TimelineResponse
 } from "./types";
 import { getHomeDirectory, isNodeError, sleep } from "./utils";
 import { commitVault, getVaultPath, initVault, mergeVaults } from "./vault";
 
 const defaultImageName = "ghostbox-agent";
 const defaultProvider = "anthropic";
-type HistorySegment = "post" | "pre";
-
-type HistoryPageResponse = {
-  segment: HistorySegment;
-  messages: HistoryMessage[];
-  totalCount: number;
-  nextBefore: number | null;
-  compactions: HistoryResponse["compactions"];
-  preCompactionCount: number;
-  postCompactionCount: number;
-};
 
 type HistoryRequestOptions = {
-  segment?: HistorySegment;
   limit?: number;
   before?: number;
 };
@@ -1065,15 +1052,8 @@ export const getGhostHealth = async (name: string): Promise<boolean> => {
   }
 };
 
-export const getGhostHistory = async (
-  name: string,
-  options?: HistoryRequestOptions
-): Promise<HistoryResponse | HistoryPageResponse> => {
+export const getGhostTimeline = async (name: string, options?: HistoryRequestOptions): Promise<TimelineResponse> => {
   const query = new URLSearchParams();
-
-  if (options?.segment) {
-    query.set("segment", options.segment);
-  }
 
   if (options?.limit !== undefined) {
     query.set("limit", String(options.limit));
@@ -1083,13 +1063,13 @@ export const getGhostHistory = async (
     query.set("before", String(options.before));
   }
 
-  const path = query.size > 0 ? `/history?${query.toString()}` : "/history";
+  const path = query.size > 0 ? `/timeline?${query.toString()}` : "/timeline";
   const response = await callGhost(name, path, {
-    errorMessage: "Ghost history request failed",
+    errorMessage: "Ghost timeline request failed",
     decodeError: false
   });
 
-  return (await response.json()) as HistoryResponse | HistoryPageResponse;
+  return (await response.json()) as TimelineResponse;
 };
 
 export const getGhostSessions = async (name: string): Promise<SessionListResponse> => {

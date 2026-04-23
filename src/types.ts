@@ -170,10 +170,22 @@ export type CompactionInfo = {
   tokensBefore: number;
 };
 
-export type HistoryResponse = {
-  messages: HistoryMessage[];
-  preCompactionMessages: HistoryMessage[];
-  compactions: CompactionInfo[];
+export type TimelineItem =
+  | {
+      id: string;
+      type: "message";
+      message: HistoryMessage;
+    }
+  | {
+      id: string;
+      type: "compaction";
+      compaction: CompactionInfo;
+    };
+
+export type TimelineResponse = {
+  items: TimelineItem[];
+  totalCount: number;
+  nextBefore: number | null;
 };
 
 export type SessionInfo = {

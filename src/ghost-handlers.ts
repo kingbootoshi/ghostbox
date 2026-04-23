@@ -5,7 +5,6 @@ import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import type { NudgeEvent } from "./ghost-memory";
 import type {
-  CompactionInfo,
   GhostImage,
   GhostQueueState,
   GhostRuntimeMeta,
@@ -13,7 +12,8 @@ import type {
   GhostStreamingBehavior,
   HistoryMessage,
   SessionInfo,
-  SessionListResponse
+  SessionListResponse,
+  TimelineItem
 } from "./types";
 
 type LogContext = Record<string, unknown>;
@@ -69,10 +69,8 @@ type SessionManagerEntry = {
   modified?: string | Date;
 };
 
-type HistorySegment = "post" | "pre";
-
-type HistoryPageResult = {
-  messages: HistoryMessage[];
+type TimelinePageResult = {
+  items: TimelineItem[];
   totalCount: number;
   nextBefore: number | null;
 };
@@ -147,133 +145,76 @@ const historyMessagesForMessage = (
   getHistoryMessages: (messages: PiAgentMessage[]) => HistoryMessage[]
 ): HistoryMessage[] => getHistoryMessages([message]);
 
-const countHistoryMessages = (
-  messages: PiAgentMessage[],
+const buildTimelineItems = (
+  entries: SessionHistoryEntry[],
   getHistoryMessages: (messages: PiAgentMessage[]) => HistoryMessage[]
-): number =>
-  messages.reduce((total, message) => total + historyMessagesForMessage(message, getHistoryMessages).length, 0);
+): TimelineItem[] => {
+  const items: TimelineItem[] = [];
 
-const paginateHistoryMessages = (
-  messages: PiAgentMessage[],
-  getHistoryMessages: (messages: PiAgentMessage[]) => HistoryMessage[],
-  before: number | undefined,
-  limit: number
-): HistoryPageResult => {
-  const totalCount = countHistoryMessages(messages, getHistoryMessages);
-  const boundedBefore = before === undefined ? totalCount : Math.max(0, Math.min(before, totalCount));
-  const boundedLimit = Math.max(1, Math.min(limit, 200));
-  const startIndex = Math.max(0, boundedBefore - boundedLimit);
-  const page: HistoryMessage[] = [];
-
-  let seen = 0;
-  for (const message of messages) {
-    if (seen >= boundedBefore) {
-      break;
-    }
-
-    const chunk = historyMessagesForMessage(message, getHistoryMessages);
-    if (chunk.length === 0) {
+  for (const [entryIndex, entry] of entries.entries()) {
+    if (entry.type === "compaction") {
+      items.push({
+        id: `compaction:${entryIndex}`,
+        type: "compaction",
+        compaction: {
+          timestamp: entry.timestamp ?? "",
+          summary: entry.summary ?? "",
+          tokensBefore: entry.tokensBefore ?? 0
+        }
+      });
       continue;
     }
 
-    const chunkStart = seen;
-    const chunkEnd = seen + chunk.length;
-
-    if (chunkEnd > startIndex && chunkStart < boundedBefore) {
-      const localStart = Math.max(0, startIndex - chunkStart);
-      const localEnd = Math.min(chunk.length, boundedBefore - chunkStart);
-      page.push(...chunk.slice(localStart, localEnd));
+    if (entry.type !== "message" || !entry.message) {
+      continue;
     }
 
-    seen = chunkEnd;
+    const historyMessages = historyMessagesForMessage(entry.message, getHistoryMessages);
+    for (const [messageIndex, message] of historyMessages.entries()) {
+      items.push({
+        id: `message:${entryIndex}:${messageIndex}`,
+        type: "message",
+        message
+      });
+    }
   }
 
+  return items;
+};
+
+const paginateTimelineItems = (
+  items: TimelineItem[],
+  before: number | undefined,
+  limit: number | undefined
+): TimelinePageResult => {
+  const totalCount = items.length;
+  const boundedBefore = before === undefined ? totalCount : Math.max(0, Math.min(before, totalCount));
+  const boundedLimit = limit === undefined ? totalCount : Math.max(1, Math.min(limit, 200));
+  const startIndex = Math.max(0, boundedBefore - boundedLimit);
+
   return {
-    messages: page,
+    items: items.slice(startIndex, boundedBefore),
     totalCount,
     nextBefore: startIndex > 0 ? startIndex : null
   };
 };
 
-const collectCompactionInfo = (
-  entries: SessionHistoryEntry[]
-): { lastCompactionIndex: number; compactions: CompactionInfo[] } => {
-  let lastCompactionIndex = -1;
-  const compactions: CompactionInfo[] = [];
-
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i];
-    if (entry.type === "compaction") {
-      lastCompactionIndex = i;
-      compactions.push({
-        timestamp: entry.timestamp ?? "",
-        summary: entry.summary ?? "",
-        tokensBefore: entry.tokensBefore ?? 0
-      });
-    }
-  }
-
-  return { lastCompactionIndex, compactions };
-};
-
-const splitMessagesAroundLastCompaction = (
-  entries: SessionHistoryEntry[],
-  lastCompactionIndex: number
-): { pre: PiAgentMessage[]; post: PiAgentMessage[] } => {
-  const pre: PiAgentMessage[] = [];
-  const post: PiAgentMessage[] = [];
-
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i];
-    if (entry.type !== "message") {
-      continue;
-    }
-
-    const message = entry.message;
-    if (!message) {
-      continue;
-    }
-
-    if (lastCompactionIndex >= 0 && i < lastCompactionIndex) {
-      pre.push(message);
-    } else {
-      post.push(message);
-    }
-  }
-
-  return { pre, post };
-};
-
-const parseHistoryRequest = (
-  req: IncomingMessage
-): { paginated: false } | { paginated: true; segment: HistorySegment; before: number | undefined; limit: number } => {
-  const url = new URL(req.url ?? "/history", "http://localhost");
+const parseTimelineRequest = (req: IncomingMessage): { before: number | undefined; limit: number | undefined } => {
+  const url = new URL(req.url ?? "/timeline", "http://localhost");
   const limitValue = url.searchParams.get("limit");
   const beforeValue = url.searchParams.get("before");
-  const segmentValue = url.searchParams.get("segment");
-
-  if (limitValue === null && beforeValue === null && segmentValue === null) {
-    return { paginated: false };
-  }
-
-  const segment: HistorySegment = segmentValue === "pre" ? "pre" : "post";
-  const limit = Number(limitValue ?? "50");
+  const limit = limitValue === null ? undefined : Number(limitValue);
   const before = beforeValue === null ? undefined : Number(beforeValue);
 
-  if (!Number.isSafeInteger(limit) || limit <= 0) {
-    throw new Error("Invalid history limit");
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) {
+    throw new Error("Invalid timeline limit");
   }
 
   if (before !== undefined && (!Number.isSafeInteger(before) || before < 0)) {
-    throw new Error("Invalid history cursor");
+    throw new Error("Invalid timeline cursor");
   }
 
-  return {
-    paginated: true,
-    segment,
-    before,
-    limit
-  };
+  return { before, limit };
 };
 
 const withJsonResponse = async (
@@ -707,45 +648,21 @@ export const createGhostHandlers = ({
     );
   };
 
-  const handleHistory = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const handleTimeline = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     await withJsonResponse(
       res,
       log,
       serializeError,
-      "Pi history failed",
+      "Pi timeline failed",
       () => {
-        const request = parseHistoryRequest(req);
+        const request = parseTimelineRequest(req);
         const sessionManager = getSessionManager();
         const entries = getSessionEntries(sessionManager);
-        const { lastCompactionIndex, compactions } = collectCompactionInfo(entries);
-        const { pre, post } = splitMessagesAroundLastCompaction(entries, lastCompactionIndex);
-
-        if (request.paginated) {
-          const sourceMessages = request.segment === "pre" ? pre : post;
-          const page = paginateHistoryMessages(sourceMessages, getHistoryMessages, request.before, request.limit);
-
-          return {
-            body: {
-              segment: request.segment,
-              messages: page.messages,
-              totalCount: page.totalCount,
-              nextBefore: page.nextBefore,
-              compactions,
-              preCompactionCount: countHistoryMessages(pre, getHistoryMessages),
-              postCompactionCount: countHistoryMessages(post, getHistoryMessages)
-            }
-          };
-        }
-
         return {
-          body: {
-            messages: getHistoryMessages(post),
-            preCompactionMessages: getHistoryMessages(pre),
-            compactions
-          }
+          body: paginateTimelineItems(buildTimelineItems(entries, getHistoryMessages), request.before, request.limit)
         };
       },
-      "History failed"
+      "Timeline failed"
     );
   };
 
@@ -982,7 +899,7 @@ export const createGhostHandlers = ({
     handleSwitchSession,
     handleRenameSession,
     handleDeleteSession,
-    handleHistory,
+    handleTimeline,
     handleCompact,
     handleStats,
     handleSchedules,

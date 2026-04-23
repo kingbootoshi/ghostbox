@@ -236,24 +236,18 @@ describe("api route validation", () => {
     expect(await response.json()).toEqual({ status: "ok" });
   });
 
-  test("GET /api/ghosts/:name/history rejects invalid pagination query values", async () => {
-    const invalidLimit = await app.request("/api/ghosts/demo/history?limit=abc", {
+  test("GET /api/ghosts/:name/timeline rejects invalid pagination query values", async () => {
+    const invalidLimit = await app.request("/api/ghosts/demo/timeline?limit=abc", {
       headers: apiHeaders(TEST_ADMIN_TOKEN)
     });
     expect(invalidLimit.status).toBe(400);
-    expect(await invalidLimit.json()).toEqual({ error: "Invalid history limit." });
+    expect(await invalidLimit.json()).toEqual({ error: "Invalid timeline limit." });
 
-    const invalidCursor = await app.request("/api/ghosts/demo/history?limit=25&before=-1", {
+    const invalidCursor = await app.request("/api/ghosts/demo/timeline?limit=25&before=-1", {
       headers: apiHeaders(TEST_ADMIN_TOKEN)
     });
     expect(invalidCursor.status).toBe(400);
-    expect(await invalidCursor.json()).toEqual({ error: "Invalid history cursor." });
-
-    const invalidSegment = await app.request("/api/ghosts/demo/history?limit=25&segment=future", {
-      headers: apiHeaders(TEST_ADMIN_TOKEN)
-    });
-    expect(invalidSegment.status).toBe(400);
-    expect(await invalidSegment.json()).toEqual({ error: 'Invalid history segment "future".' });
+    expect(await invalidCursor.json()).toEqual({ error: "Invalid timeline cursor." });
   });
 
   test("GET /api/ghosts/:name/runtime/meta proxies adapter runtime meta", async () => {

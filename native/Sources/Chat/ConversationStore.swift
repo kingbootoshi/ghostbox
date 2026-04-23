@@ -10,22 +10,15 @@ final class ConversationStore {
 
     let ghostName: String
 
-    var messages: [ChatMessage] = [] {
+    var timelineItems: [ConversationTimelineItem] = [] {
         didSet {
-            messagesVersion &+= 1
-            onConversationChanged()
-        }
-    }
-    var preCompactionMessages: [ChatMessage] = [] {
-        didSet {
-            preCompactionDisplayVersion &+= 1
+            timelineVersion &+= 1
             onConversationChanged()
         }
     }
     private(set) var olderMessageCount = 0
     var hasOlderMessages: Bool { olderMessageCount > 0 || isLoadingOlderMessages }
-    var messagesVersion = 0
-    var preCompactionDisplayVersion = 0
+    var timelineVersion = 0
     var sessions: SessionListResponse?
     var ghost: Ghost?
     var stats: GhostStats?
@@ -33,14 +26,6 @@ final class ConversationStore {
     var isLoadingOlderMessages = false
     var isCreatingSession = false
     var isCompacting = false
-    var isLoadingPreCompactionMessages = false
-    var compactionSummary: String?
-    var preCompactionRemainingCount = 0
-    var visiblePreCompactionCount = 0 {
-        didSet {
-            preCompactionDisplayVersion &+= 1
-        }
-    }
 
     @ObservationIgnored private let client: GhostboxClient
     @ObservationIgnored var clearError: @MainActor () -> Void = {}
@@ -48,13 +33,19 @@ final class ConversationStore {
     @ObservationIgnored var showToast: @MainActor (String) -> Void = { _ in }
     @ObservationIgnored var hasError: @MainActor () -> Bool = { false }
     @ObservationIgnored var onConversationChanged: @MainActor () -> Void = {}
-    @ObservationIgnored private var nextHistoryBefore: Int?
-    @ObservationIgnored private var nextPreCompactionBefore: Int?
+    @ObservationIgnored private var nextTimelineBefore: Int?
 
     init(ghostName: String, client: GhostboxClient, initialGhost: Ghost? = nil) {
         self.ghostName = ghostName
         self.client = client
         self.ghost = initialGhost
+    }
+
+    var messages: [ChatMessage] {
+        timelineItems.compactMap { item in
+            guard case .message(let message) = item else { return nil }
+            return message
+        }
     }
 
     var currentSession: SessionInfo? {
@@ -64,14 +55,41 @@ final class ConversationStore {
             ?? sessions.sessions.first { $0.id.contains(current) || current.contains($0.id) }
     }
 
-    var visiblePreCompactionMessages: [ChatMessage] {
-        guard visiblePreCompactionCount > 0 else { return [] }
-        let startIndex = max(0, preCompactionMessages.count - visiblePreCompactionCount)
-        return Array(preCompactionMessages[startIndex...])
+    func appendMessage(_ message: ChatMessage) {
+        timelineItems.append(.message(message))
     }
 
-    var preCompactionOlderMessageCount: Int {
-        max(0, preCompactionMessages.count - visiblePreCompactionCount) + preCompactionRemainingCount
+    func lastMessage() -> ChatMessage? {
+        for item in timelineItems.reversed() {
+            if case .message(let message) = item {
+                return message
+            }
+        }
+        return nil
+    }
+
+    func updateMessage(id: UUID, with message: ChatMessage) {
+        guard let index = timelineItems.firstIndex(where: { item in
+            guard case .message(let existing) = item else { return false }
+            return existing.id == id
+        }) else {
+            return
+        }
+
+        timelineItems[index] = .message(message)
+    }
+
+    func truncateMessages(after id: UUID) {
+        guard let index = timelineItems.firstIndex(where: { item in
+            guard case .message(let message) = item else { return false }
+            return message.id == id
+        }) else {
+            return
+        }
+
+        if index < timelineItems.count - 1 {
+            timelineItems.removeSubrange((index + 1)..<timelineItems.count)
+        }
     }
 
     func loadStats() async {
@@ -105,25 +123,13 @@ final class ConversationStore {
         }
 
         do {
-            let history = try await client.getHistoryPage(
+            let page = try await client.getTimelinePage(
                 ghostName: ghostName,
-                segment: "post",
                 limit: Self.initialMessageCount
             )
-            let latestMessages = history.messages.map(historyMessageToChatMessage)
-            preCompactionMessages = []
-            preCompactionRemainingCount = history.preCompactionCount
-            nextPreCompactionBefore = history.preCompactionCount > 0 ? history.preCompactionCount : nil
-            compactionSummary = history.compactions.last?.summary
-            visiblePreCompactionCount = 0
-            nextHistoryBefore = history.nextBefore
-            olderMessageCount = history.nextBefore ?? 0
-            messages = latestMessages
-
-            if !history.compactions.isEmpty && messages.isEmpty && history.preCompactionCount > 0 {
-                messages = [ChatMessage(role: .system, content: "Session compacted")]
-            }
-
+            timelineItems = page.items.compactMap(timelineItemFromResponse)
+            nextTimelineBefore = page.nextBefore
+            olderMessageCount = page.nextBefore ?? 0
             return true
         } catch {
             showError(error.localizedDescription)
@@ -135,14 +141,9 @@ final class ConversationStore {
         guard !isLoadingHistory, !isCompacting, !isCreatingSession else { return }
 
         clearError()
-        messages = []
+        timelineItems = []
         olderMessageCount = 0
-        nextHistoryBefore = nil
-        preCompactionMessages = []
-        preCompactionRemainingCount = 0
-        nextPreCompactionBefore = nil
-        compactionSummary = nil
-        visiblePreCompactionCount = 0
+        nextTimelineBefore = nil
         isCreatingSession = true
         SoundManager.shared.play(.sessionNew)
 
@@ -236,14 +237,9 @@ final class ConversationStore {
         return didLoadHistory
     }
 
-    func updateMessage(at index: Int, with message: ChatMessage) {
-        guard messages.indices.contains(index) else { return }
-        messages[index] = message
-    }
-
     func loadOlderMessageBatch() {
         guard !isLoadingOlderMessages else { return }
-        guard let before = nextHistoryBefore, before > 0 else { return }
+        guard let before = nextTimelineBefore, before > 0 else { return }
 
         isLoadingOlderMessages = true
 
@@ -255,15 +251,14 @@ final class ConversationStore {
             }
 
             do {
-                let page = try await client.getHistoryPage(
+                let page = try await client.getTimelinePage(
                     ghostName: ghostName,
-                    segment: "post",
                     limit: Self.olderMessagesBatchSize,
                     before: before
                 )
-                let olderBatch = page.messages.map(historyMessageToChatMessage)
-                messages.insert(contentsOf: olderBatch, at: 0)
-                nextHistoryBefore = page.nextBefore
+                let olderBatch = page.items.compactMap(timelineItemFromResponse)
+                timelineItems.insert(contentsOf: olderBatch, at: 0)
+                nextTimelineBefore = page.nextBefore
                 olderMessageCount = page.nextBefore ?? 0
             } catch {
                 showToast(error.localizedDescription)
@@ -271,44 +266,23 @@ final class ConversationStore {
         }
     }
 
-    func showMoreOlderMessages() {
-        guard !isLoadingPreCompactionMessages else { return }
-
-        if visiblePreCompactionCount < preCompactionMessages.count {
-            let newCount = min(
-                visiblePreCompactionCount + Self.olderMessagesBatchSize,
-                preCompactionMessages.count
-            )
-            visiblePreCompactionCount = newCount
-            return
-        }
-
-        guard let before = nextPreCompactionBefore, before > 0 else { return }
-
-        isLoadingPreCompactionMessages = true
-
-        Task { [weak self] in
-            guard let self else { return }
-
-            defer {
-                isLoadingPreCompactionMessages = false
-            }
-
-            do {
-                let page = try await client.getHistoryPage(
-                    ghostName: ghostName,
-                    segment: "pre",
-                    limit: Self.olderMessagesBatchSize,
-                    before: before
+    private func timelineItemFromResponse(_ item: TimelineItemData) -> ConversationTimelineItem? {
+        switch item.type {
+        case "message":
+            guard let message = item.message else { return nil }
+            return .message(historyMessageToChatMessage(message))
+        case "compaction":
+            guard let compaction = item.compaction else { return nil }
+            return .compaction(
+                CompactionMarker(
+                    id: item.id,
+                    summary: compaction.summary.isEmpty ? nil : compaction.summary,
+                    timestamp: parseTimestamp(compaction.timestamp),
+                    tokensBefore: compaction.tokensBefore
                 )
-                let olderBatch = page.messages.map(historyMessageToChatMessage)
-                preCompactionMessages.insert(contentsOf: olderBatch, at: 0)
-                visiblePreCompactionCount = preCompactionMessages.count
-                nextPreCompactionBefore = page.nextBefore
-                preCompactionRemainingCount = page.nextBefore ?? 0
-            } catch {
-                showToast(error.localizedDescription)
-            }
+            )
+        default:
+            return nil
         }
     }
 

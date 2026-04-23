@@ -21,13 +21,17 @@ struct CompactionInfo: Decodable {
     let tokensBefore: Int
 }
 
-struct HistoryPageData {
-    let messages: [HistoryMessage]
+struct TimelineItemData {
+    let id: String
+    let type: String
+    let message: HistoryMessage?
+    let compaction: CompactionInfo?
+}
+
+struct TimelinePageData {
+    let items: [TimelineItemData]
     let totalCount: Int
     let nextBefore: Int?
-    let preCompactionCount: Int
-    let postCompactionCount: Int
-    let compactions: [CompactionInfo]
 }
 
 struct VaultEntry: Decodable, Identifiable {
@@ -274,33 +278,37 @@ final class GhostboxClient {
         return Ghost(name: name, status: ghost.status, provider: ghost.provider, model: ghost.model, portBase: ghost.portBase, containerId: ghost.containerId, createdAt: ghost.createdAt, systemPrompt: ghost.systemPrompt)
     }
 
-    func getHistoryPage(
+    func getTimelinePage(
         ghostName: String,
-        segment: String = "post",
-        limit: Int,
+        limit: Int? = nil,
         before: Int? = nil
-    ) async throws -> HistoryPageData {
-        var queryItems = [
-            URLQueryItem(name: "segment", value: segment),
-            URLQueryItem(name: "limit", value: String(limit))
-        ]
+    ) async throws -> TimelinePageData {
+        var queryItems: [URLQueryItem] = []
+
+        if let limit {
+            queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
 
         if let before {
             queryItems.append(URLQueryItem(name: "before", value: String(before)))
         }
 
         let request = makeRequest(
-            path: ["api", "ghosts", ghostName, "history"],
+            path: ["api", "ghosts", ghostName, "timeline"],
             queryItems: queryItems
         )
-        let response = try await decodeResponse(for: request, as: HistoryPageResponse.self)
-        return HistoryPageData(
-            messages: response.messages,
+        let response = try await decodeResponse(for: request, as: TimelinePageResponse.self)
+        return TimelinePageData(
+            items: response.items.map { item in
+                TimelineItemData(
+                    id: item.id,
+                    type: item.type,
+                    message: item.message,
+                    compaction: item.compaction
+                )
+            },
             totalCount: response.totalCount,
-            nextBefore: response.nextBefore,
-            preCompactionCount: response.preCompactionCount,
-            postCompactionCount: response.postCompactionCount,
-            compactions: response.compactions ?? []
+            nextBefore: response.nextBefore
         )
     }
 
@@ -713,14 +721,17 @@ final class GhostboxClient {
     }
 }
 
-private struct HistoryPageResponse: Decodable {
-    let segment: String?
-    let messages: [HistoryMessage]
+private struct TimelineItemResponse: Decodable {
+    let id: String
+    let type: String
+    let message: HistoryMessage?
+    let compaction: CompactionInfo?
+}
+
+private struct TimelinePageResponse: Decodable {
+    let items: [TimelineItemResponse]
     let totalCount: Int
     let nextBefore: Int?
-    let preCompactionCount: Int
-    let postCompactionCount: Int
-    let compactions: [CompactionInfo]?
 }
 
 private struct NewGhostSessionResponse: Decodable {

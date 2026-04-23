@@ -115,14 +115,11 @@ final class InputController {
     func commitHistorySelection(onCommit: @MainActor () -> Void = {}) -> Bool {
         guard isHistoryModeActive,
               let historySelectionMessageID,
-              let selectedIndex = store.messages.firstIndex(where: { $0.id == historySelectionMessageID }) else {
+              store.messages.contains(where: { $0.id == historySelectionMessageID }) else {
             return false
         }
 
-        if selectedIndex < store.messages.count - 1 {
-            store.messages.removeSubrange((selectedIndex + 1)..<store.messages.count)
-        }
-
+        store.truncateMessages(after: historySelectionMessageID)
         onCommit()
         return exitHistoryModeIfNeeded()
     }
