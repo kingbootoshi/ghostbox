@@ -318,11 +318,13 @@ struct AgentChatView: View {
                     }
                 }
                 .onPreferenceChange(ScrollOffsetKey.self) { bottomY in
-                    let nearBottom = bottomY < scrollViewHeight + 150
-                    if nearBottom != isNearBottom {
-                        isNearBottom = nearBottom
+                    let isBottomVisible = bottomY <= scrollViewHeight + 8
+                    if isBottomVisible != isNearBottom {
+                        isNearBottom = isBottomVisible
                     }
-                    if !supportsScrollPhaseTracking, shouldFollowLatest, !nearBottom {
+                    if isBottomVisible {
+                        shouldFollowLatest = true
+                    } else if shouldFollowLatest {
                         shouldFollowLatest = false
                     }
                 }
@@ -340,7 +342,9 @@ struct AgentChatView: View {
                 }
                 .modifier(
                     ScrollIntentTrackingModifier {
-                        shouldFollowLatest = false
+                        if !isNearBottom {
+                            shouldFollowLatest = false
+                        }
                     }
                 )
                 .onChange(of: viewModel.store.timelineVersion) {
@@ -376,7 +380,7 @@ struct AgentChatView: View {
                     scrollToLatest(using: proxy)
                 }
 
-                if !shouldFollowLatest && !viewModel.store.messages.isEmpty {
+                if !shouldFollowLatest && !isNearBottom && !viewModel.store.messages.isEmpty {
                     Button {
                         shouldFollowLatest = true
                         scrollToLatest(using: proxy)
@@ -656,13 +660,6 @@ struct AgentChatView: View {
         }
     }
 
-    private var supportsScrollPhaseTracking: Bool {
-        if #available(macOS 15.0, *) {
-            return true
-        }
-
-        return false
-    }
 }
 
 private struct ScrollIntentTrackingModifier: ViewModifier {
