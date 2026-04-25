@@ -318,15 +318,7 @@ struct AgentChatView: View {
                     }
                 }
                 .onPreferenceChange(ScrollOffsetKey.self) { bottomY in
-                    let isBottomVisible = bottomY <= scrollViewHeight + 8
-                    if isBottomVisible != isNearBottom {
-                        isNearBottom = isBottomVisible
-                    }
-                    if isBottomVisible {
-                        shouldFollowLatest = true
-                    } else if shouldFollowLatest {
-                        shouldFollowLatest = false
-                    }
+                    updateLatestVisibility(bottomY <= scrollViewHeight + 8)
                 }
                 .onPreferenceChange(TopScrollOffsetKey.self) { topY in
                     guard topY > -140 else { return }
@@ -345,6 +337,11 @@ struct AgentChatView: View {
                         if !isNearBottom {
                             shouldFollowLatest = false
                         }
+                    }
+                )
+                .modifier(
+                    ScrollBottomTrackingModifier { isBottomVisible in
+                        updateLatestVisibility(isBottomVisible)
                     }
                 )
                 .onChange(of: viewModel.store.timelineVersion) {
@@ -660,6 +657,17 @@ struct AgentChatView: View {
         }
     }
 
+    private func updateLatestVisibility(_ isVisible: Bool) {
+        if isVisible != isNearBottom {
+            isNearBottom = isVisible
+        }
+        if isVisible {
+            shouldFollowLatest = true
+        } else if shouldFollowLatest {
+            shouldFollowLatest = false
+        }
+    }
+
 }
 
 private struct ScrollIntentTrackingModifier: ViewModifier {
@@ -674,6 +682,22 @@ private struct ScrollIntentTrackingModifier: ViewModifier {
                 default:
                     break
                 }
+            }
+        } else {
+            content
+        }
+    }
+}
+
+private struct ScrollBottomTrackingModifier: ViewModifier {
+    let onBottomVisibilityChanged: (Bool) -> Void
+
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content.onScrollGeometryChange(for: Bool.self) { geometry in
+                geometry.visibleRect.maxY >= geometry.contentSize.height - 8
+            } action: { _, isBottomVisible in
+                onBottomVisibilityChanged(isBottomVisible)
             }
         } else {
             content
