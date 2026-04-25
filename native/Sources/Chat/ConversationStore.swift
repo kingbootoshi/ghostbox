@@ -17,7 +17,7 @@ final class ConversationStore {
         }
     }
     private(set) var olderMessageCount = 0
-    var hasOlderMessages: Bool { olderMessageCount > 0 || isLoadingOlderMessages }
+    var hasOlderMessages: Bool { nextTimelineCursor != nil || isLoadingOlderMessages }
     var timelineVersion = 0
     var sessions: SessionListResponse?
     var ghost: Ghost?
@@ -33,7 +33,7 @@ final class ConversationStore {
     @ObservationIgnored var showToast: @MainActor (String) -> Void = { _ in }
     @ObservationIgnored var hasError: @MainActor () -> Bool = { false }
     @ObservationIgnored var onConversationChanged: @MainActor () -> Void = {}
-    @ObservationIgnored private var nextTimelineBefore: Int?
+    @ObservationIgnored private var nextTimelineCursor: String?
 
     init(ghostName: String, client: GhostboxClient, initialGhost: Ghost? = nil) {
         self.ghostName = ghostName
@@ -64,6 +64,14 @@ final class ConversationStore {
             if case .message(let message) = item {
                 return message
             }
+        }
+        return nil
+    }
+
+    func displayID(forMessageID id: UUID) -> String? {
+        for item in timelineItems {
+            guard case .message(let message) = item, message.id == id else { continue }
+            return message.displayID
         }
         return nil
     }
@@ -128,8 +136,8 @@ final class ConversationStore {
                 limit: Self.initialMessageCount
             )
             timelineItems = page.items.compactMap(timelineItemFromResponse)
-            nextTimelineBefore = page.nextBefore
-            olderMessageCount = page.nextBefore ?? 0
+            nextTimelineCursor = page.nextCursor
+            olderMessageCount = page.nextCursor == nil ? 0 : 1
             return true
         } catch {
             showError(error.localizedDescription)
@@ -143,7 +151,7 @@ final class ConversationStore {
         clearError()
         timelineItems = []
         olderMessageCount = 0
-        nextTimelineBefore = nil
+        nextTimelineCursor = nil
         isCreatingSession = true
         SoundManager.shared.play(.sessionNew)
 
@@ -239,7 +247,7 @@ final class ConversationStore {
 
     func loadOlderMessageBatch() {
         guard !isLoadingOlderMessages else { return }
-        guard let before = nextTimelineBefore, before > 0 else { return }
+        guard let cursor = nextTimelineCursor else { return }
 
         isLoadingOlderMessages = true
 
@@ -254,12 +262,12 @@ final class ConversationStore {
                 let page = try await client.getTimelinePage(
                     ghostName: ghostName,
                     limit: Self.olderMessagesBatchSize,
-                    before: before
+                    cursor: cursor
                 )
                 let olderBatch = page.items.compactMap(timelineItemFromResponse)
                 timelineItems.insert(contentsOf: olderBatch, at: 0)
-                nextTimelineBefore = page.nextBefore
-                olderMessageCount = page.nextBefore ?? 0
+                nextTimelineCursor = page.nextCursor
+                olderMessageCount = page.nextCursor == nil ? 0 : 1
             } catch {
                 showToast(error.localizedDescription)
             }
@@ -270,7 +278,7 @@ final class ConversationStore {
         switch item.type {
         case "message":
             guard let message = item.message else { return nil }
-            return .message(historyMessageToChatMessage(message))
+            return .message(historyMessageToChatMessage(message, timelineID: item.id))
         case "compaction":
             guard let compaction = item.compaction else { return nil }
             return .compaction(
@@ -286,7 +294,7 @@ final class ConversationStore {
         }
     }
 
-    private func historyMessageToChatMessage(_ message: HistoryMessage) -> ChatMessage {
+    private func historyMessageToChatMessage(_ message: HistoryMessage, timelineID: String) -> ChatMessage {
         let thumbnails: [NSImage] = (message.images ?? []).compactMap { imageData in
             guard let data = Data(base64Encoded: imageData.data),
                   let image = NSImage(data: data) else { return nil }
@@ -294,6 +302,7 @@ final class ConversationStore {
         }
 
         return ChatMessage(
+            timelineID: timelineID,
             role: mapRole(message.role),
             content: message.text,
             timestamp: parseTimestamp(message.timestamp),

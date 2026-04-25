@@ -175,7 +175,7 @@ const PI_SUPPORTED_CAPABILITIES: GhostRuntimeCapability[] = [
   "message",
   "steer",
   "queue",
-  "history",
+  "timeline",
   "sessions",
   "stats",
   "commands",

@@ -2,6 +2,7 @@ import AppKit
 import Carbon
 import Combine
 import CoreText
+import Darwin
 import SwiftUI
 import UserNotifications
 
@@ -32,6 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        terminateOlderGhostboxInstances()
+
         UNUserNotificationCenter.current().delegate = self
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
             print("[notifications] authorization granted=\(granted) error=\(String(describing: error))")
@@ -69,7 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.launchHub()
         }
 
-        let window = NSWindow(
+        let window = ConnectionWindow(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 520),
             styleMask: [.borderless, .fullSizeContentView],
             backing: .buffered,
@@ -106,6 +109,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         connectionWindow = window
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    private func terminateOlderGhostboxInstances() {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return }
+
+        for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier) {
+            guard app.processIdentifier != getpid() else { continue }
+            app.terminate()
+        }
     }
 
     private func launchHub() {

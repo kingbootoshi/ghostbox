@@ -31,7 +31,7 @@ struct TimelineItemData {
 struct TimelinePageData {
     let items: [TimelineItemData]
     let totalCount: Int
-    let nextBefore: Int?
+    let nextCursor: String?
 }
 
 struct VaultEntry: Decodable, Identifiable {
@@ -281,7 +281,7 @@ final class GhostboxClient {
     func getTimelinePage(
         ghostName: String,
         limit: Int? = nil,
-        before: Int? = nil
+        cursor: String? = nil
     ) async throws -> TimelinePageData {
         var queryItems: [URLQueryItem] = []
 
@@ -289,8 +289,8 @@ final class GhostboxClient {
             queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
         }
 
-        if let before {
-            queryItems.append(URLQueryItem(name: "before", value: String(before)))
+        if let cursor {
+            queryItems.append(URLQueryItem(name: "cursor", value: cursor))
         }
 
         let request = makeRequest(
@@ -308,7 +308,7 @@ final class GhostboxClient {
                 )
             },
             totalCount: response.totalCount,
-            nextBefore: response.nextBefore
+            nextCursor: response.nextCursor
         )
     }
 
@@ -731,7 +731,7 @@ private struct TimelineItemResponse: Decodable {
 private struct TimelinePageResponse: Decodable {
     let items: [TimelineItemResponse]
     let totalCount: Int
-    let nextBefore: Int?
+    let nextCursor: String?
 }
 
 private struct NewGhostSessionResponse: Decodable {

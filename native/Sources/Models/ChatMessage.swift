@@ -3,6 +3,7 @@ import Foundation
 
 struct ChatMessage: Identifiable {
     let id: UUID
+    let timelineID: String?
     let role: Role
     let content: String
     let timestamp: Date
@@ -28,6 +29,7 @@ struct ChatMessage: Identifiable {
 
     init(
         id: UUID = UUID(),
+        timelineID: String? = nil,
         role: Role,
         content: String,
         timestamp: Date = Date(),
@@ -36,6 +38,7 @@ struct ChatMessage: Identifiable {
         thumbnails: [NSImage] = []
     ) {
         self.id = id
+        self.timelineID = timelineID
         self.role = role
         self.content = content
         self.timestamp = timestamp
@@ -110,11 +113,16 @@ extension ChatMessage {
         cachedContentSizeSummary
     }
 
+    var displayID: String {
+        timelineID ?? "message-\(id.uuidString)"
+    }
+
     func updatingContent(_ content: String) -> ChatMessage {
         guard content != self.content else { return self }
 
         return ChatMessage(
             id: id,
+            timelineID: timelineID,
             role: role,
             content: content,
             timestamp: timestamp,

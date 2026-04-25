@@ -34,7 +34,7 @@ const defaultProvider = "anthropic";
 
 type HistoryRequestOptions = {
   limit?: number;
-  before?: number;
+  cursor?: string;
 };
 
 const getGhostPiAgentPath = (name: string): string => join(getHomeDirectory(), ".ghostbox", "ghosts", name, "pi-agent");
@@ -1059,8 +1059,8 @@ export const getGhostTimeline = async (name: string, options?: HistoryRequestOpt
     query.set("limit", String(options.limit));
   }
 
-  if (options?.before !== undefined) {
-    query.set("before", String(options.before));
+  if (options?.cursor !== undefined) {
+    query.set("cursor", options.cursor);
   }
 
   const path = query.size > 0 ? `/timeline?${query.toString()}` : "/timeline";

@@ -255,21 +255,16 @@ const parsePositiveInteger = (value: string | undefined, field: string): number 
   return parsed;
 };
 
-const parseNonNegativeInteger = (value: string | undefined, field: string): number | undefined => {
+const parseOpaqueCursor = (value: string | undefined, field: string): string | undefined => {
   if (value === undefined) {
     return undefined;
   }
 
-  if (!/^\d+$/.test(value)) {
+  if (value.trim() === "") {
     throw new ApiError(400, `Invalid ${field}.`);
   }
 
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 0) {
-    throw new ApiError(400, `Invalid ${field}.`);
-  }
-
-  return parsed;
+  return value;
 };
 
 const getErrorMessage = (error: unknown): string => {
@@ -624,8 +619,8 @@ app.get("/api/ghosts/:name/health", (c) =>
 app.get("/api/ghosts/:name/timeline", (c) =>
   handleRoute(c, async () => {
     const limit = parsePositiveInteger(c.req.query("limit"), "timeline limit");
-    const before = parseNonNegativeInteger(c.req.query("before"), "timeline cursor");
-    return c.json(await getGhostTimeline(c.req.param("name"), { limit, before }));
+    const cursor = parseOpaqueCursor(c.req.query("cursor"), "timeline cursor");
+    return c.json(await getGhostTimeline(c.req.param("name"), { limit, cursor }));
   })
 );
 

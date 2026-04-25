@@ -243,11 +243,68 @@ describe("api route validation", () => {
     expect(invalidLimit.status).toBe(400);
     expect(await invalidLimit.json()).toEqual({ error: "Invalid timeline limit." });
 
-    const invalidCursor = await app.request("/api/ghosts/demo/timeline?limit=25&before=-1", {
+    const invalidCursor = await app.request("/api/ghosts/demo/timeline?limit=25&cursor=", {
       headers: apiHeaders(TEST_ADMIN_TOKEN)
     });
     expect(invalidCursor.status).toBe(400);
     expect(await invalidCursor.json()).toEqual({ error: "Invalid timeline cursor." });
+  });
+
+  test("GET /api/ghosts/:name/timeline proxies the canonical timeline contract", async () => {
+    const timeline = {
+      items: [
+        {
+          id: "message-session-1-0",
+          type: "message",
+          message: {
+            role: "user",
+            text: "hello",
+            timestamp: "2026-04-25T00:00:00.000Z"
+          }
+        },
+        {
+          id: "compaction-session-1-1",
+          type: "compaction",
+          compaction: {
+            summary: "older context compacted",
+            timestamp: "2026-04-25T00:01:00.000Z",
+            tokensBefore: 12000
+          }
+        }
+      ],
+      totalCount: 12,
+      nextCursor: Buffer.from("idx:10", "utf8").toString("base64")
+    };
+    const stub = await startGhostStub((req, res) => {
+      const cursor = Buffer.from("idx:12", "utf8").toString("base64");
+      if (req.method === "GET" && req.url === `/timeline?limit=2&cursor=${cursor}`) {
+        sendJson(res, 200, timeline);
+        return;
+      }
+
+      sendJson(res, 404, { error: "Not found" });
+    });
+
+    try {
+      await testHome.writeState(
+        createState({
+          ghosts: {
+            demo: createGhostState({ portBase: stub.port })
+          }
+        })
+      );
+
+      const cursor = Buffer.from("idx:12", "utf8").toString("base64");
+      const response = await app.request(`/api/ghosts/demo/timeline?limit=2&cursor=${cursor}`, {
+        headers: apiHeaders(TEST_ADMIN_TOKEN)
+      });
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual(timeline);
+      expect(stub.requests).toEqual(["/timeline"]);
+    } finally {
+      await stub.close();
+    }
   });
 
   test("GET /api/ghosts/:name/runtime/meta proxies adapter runtime meta", async () => {
@@ -255,7 +312,7 @@ describe("api route validation", () => {
       adapter: "claude-code",
       runtimeVersion: "node/v22.15.0",
       imageVersion: "gb-meta1234",
-      supportedCapabilities: ["message", "history", "sessions", "stats", "commands"],
+      supportedCapabilities: ["message", "timeline", "sessions", "stats", "commands"],
       supportedCommands: [{ name: "/help", description: "List available slash commands." }],
       currentModel: "claude-sonnet-4-6",
       currentSessionId: "session-123"
@@ -297,7 +354,7 @@ describe("api route validation", () => {
           adapter: "claude-code",
           runtimeVersion: "node/v22.15.0",
           imageVersion: "gb-meta1234",
-          supportedCapabilities: ["message", "history", "sessions", "stats", "commands"],
+          supportedCapabilities: ["message", "timeline", "sessions", "stats", "commands"],
           supportedCommands: [{ name: "/help", description: "List available slash commands." }],
           currentModel: "claude-sonnet-4-6",
           currentSessionId: null
@@ -339,7 +396,7 @@ describe("api route validation", () => {
           adapter: "claude-code",
           runtimeVersion: "node/v22.15.0",
           imageVersion: "gb-meta1234",
-          supportedCapabilities: ["message", "history", "sessions", "stats", "commands"],
+          supportedCapabilities: ["message", "timeline", "sessions", "stats", "commands"],
           supportedCommands: [{ name: "/help", description: "List available slash commands." }],
           currentModel: "claude-sonnet-4-6",
           currentSessionId: null

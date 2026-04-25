@@ -185,7 +185,7 @@ export type TimelineItem =
 export type TimelineResponse = {
   items: TimelineItem[];
   totalCount: number;
-  nextBefore: number | null;
+  nextCursor: string | null;
 };
 
 export type SessionInfo = {
@@ -218,7 +218,7 @@ export type GhostRuntimeCapability =
   | "message"
   | "steer"
   | "queue"
-  | "history"
+  | "timeline"
   | "sessions"
   | "stats"
   | "commands"

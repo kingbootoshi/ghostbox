@@ -59,7 +59,7 @@ const CLAUDE_SUPPORTED_CAPABILITIES: GhostRuntimeCapability[] = [
   "message",
   "steer",
   "queue",
-  "history",
+  "timeline",
   "sessions",
   "stats",
   "commands",
@@ -702,12 +702,31 @@ const parseCompaction = (line: JsonRecord): CompactionInfo | null => {
   };
 };
 
+const encodeTimelineCursor = (index: number): string => Buffer.from(`idx:${index}`, "utf8").toString("base64");
+
+const decodeTimelineCursor = (cursor: string): number => {
+  const decoded = Buffer.from(cursor, "base64").toString("utf8");
+  const match = /^idx:(\d+)$/.exec(decoded);
+
+  if (!match) {
+    throw new Error("Invalid timeline cursor");
+  }
+
+  const index = Number(match[1]);
+  if (!Number.isSafeInteger(index)) {
+    throw new Error("Invalid timeline cursor");
+  }
+
+  return index;
+};
+
 const paginateTimelineItems = (
   items: TimelineItem[],
-  before: number | undefined,
+  cursor: string | undefined,
   limit: number | undefined
 ): TimelineResponse => {
   const totalCount = items.length;
+  const before = cursor === undefined ? undefined : decodeTimelineCursor(cursor);
   const boundedBefore = before === undefined ? totalCount : Math.max(0, Math.min(before, totalCount));
   const boundedLimit = limit === undefined ? totalCount : Math.max(1, Math.min(limit, 200));
   const startIndex = Math.max(0, boundedBefore - boundedLimit);
@@ -715,28 +734,23 @@ const paginateTimelineItems = (
   return {
     items: items.slice(startIndex, boundedBefore),
     totalCount,
-    nextBefore: startIndex > 0 ? startIndex : null
+    nextCursor: startIndex > 0 ? encodeTimelineCursor(startIndex) : null
   };
 };
 
 const parseTimelineRequest = (
   req: IncomingMessage
-): { before: number | undefined; limit: number | undefined } => {
+): { cursor: string | undefined; limit: number | undefined } => {
   const url = new URL(req.url ?? "/timeline", "http://localhost");
   const limitValue = url.searchParams.get("limit");
-  const beforeValue = url.searchParams.get("before");
+  const cursorValue = url.searchParams.get("cursor");
   const limit = limitValue === null ? undefined : Number(limitValue);
-  const before = beforeValue === null ? undefined : Number(beforeValue);
 
   if (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) {
     throw new Error("Invalid timeline limit");
   }
 
-  if (before !== undefined && (!Number.isSafeInteger(before) || before < 0)) {
-    throw new Error("Invalid timeline cursor");
-  }
-
-  return { before, limit };
+  return { cursor: cursorValue === null ? undefined : cursorValue, limit };
 };
 
 const loadTimelineItems = async (sessionId: string | null): Promise<TimelineItem[]> => {
@@ -1804,7 +1818,7 @@ const handleClearQueue = (res: ServerResponse): void => {
 const handleTimeline = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
   const timelineRequest = parseTimelineRequest(req);
   const items = await loadTimelineItems(currentSessionId);
-  sendJson(res, 200, paginateTimelineItems(items, timelineRequest.before, timelineRequest.limit));
+  sendJson(res, 200, paginateTimelineItems(items, timelineRequest.cursor, timelineRequest.limit));
 };
 
 const handleSessions = async (res: ServerResponse): Promise<void> => {

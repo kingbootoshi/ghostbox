@@ -360,9 +360,10 @@ struct AgentChatView: View {
                 }
                 .onChange(of: viewModel.input.historySelectionMessageID) {
                     guard let selectionID = viewModel.input.historySelectionMessageID else { return }
+                    guard let displayID = viewModel.store.displayID(forMessageID: selectionID) else { return }
                     shouldFollowLatest = false
                     withAnimation(.easeOut(duration: 0.2)) {
-                        proxy.scrollTo(ChatScrollAnchor.message("message-\(selectionID.uuidString)"), anchor: .center)
+                        proxy.scrollTo(ChatScrollAnchor.message(displayID), anchor: .center)
                     }
                 }
                 .onChange(of: viewModel.isStreaming) {

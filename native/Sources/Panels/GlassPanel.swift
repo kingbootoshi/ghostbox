@@ -201,6 +201,11 @@ class GlassPanel: NSPanel {
     }
 }
 
+final class ConnectionWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
 struct BorderlessGlass<Content: View>: View {
     @ViewBuilder let content: () -> Content
 

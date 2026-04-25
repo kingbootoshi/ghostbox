@@ -608,7 +608,7 @@ final class AgentChatViewModel {
                     }
 
                     streamFinished = true
-                    flushAssistantMessage(force: true)
+                    flushAssistantMessage()
                 }
             }
         } catch is CancellationError {
@@ -628,7 +628,8 @@ final class AgentChatViewModel {
             return
         }
 
-        flushAssistantMessage(force: true)
+        streamFinished = true
+        flushAssistantMessage()
 
         guard activeStreamID == streamID else { return }
 

@@ -14,7 +14,7 @@ enum ConversationTimelineItem: Identifiable {
     var id: String {
         switch self {
         case .message(let message):
-            return "message-\(message.id.uuidString)"
+            return message.displayID
         case .compaction(let marker):
             return marker.id
         }
@@ -29,9 +29,9 @@ enum ChatDisplayItem: Identifiable {
     var id: String {
         switch self {
         case .message(let message, _):
-            return "message-\(message.id.uuidString)"
+            return message.displayID
         case .toolGroup(let group, _):
-            return "tool-\(group.id.uuidString)"
+            return group.toolUse.timelineID ?? "tool-\(group.id.uuidString)"
         case .compaction(let marker, _):
             return marker.id
         }
@@ -83,22 +83,22 @@ enum ChatDisplayItem: Identifiable {
     }
 
     static func patch(existing: [ChatDisplayItem], from timelineItems: [ConversationTimelineItem]) -> [ChatDisplayItem] {
-        let messagesByID: [UUID: ChatMessage] = Dictionary(
+        let messagesByDisplayID: [String: ChatMessage] = Dictionary(
             uniqueKeysWithValues: timelineItems.compactMap { item in
                 guard case .message(let message) = item else { return nil }
-                return (message.id, message)
+                return (message.displayID, message)
             }
         )
 
         return existing.map { item in
             switch item {
             case .message(let message, let showsBreakAfter):
-                let updatedMessage = messagesByID[message.id] ?? message
+                let updatedMessage = messagesByDisplayID[message.displayID] ?? message
                 return .message(updatedMessage, showsBreakAfter: showsBreakAfter)
 
             case .toolGroup(let group, let showsBreakAfter):
-                let updatedToolUse = messagesByID[group.toolUse.id] ?? group.toolUse
-                let updatedToolResult = group.toolResult.flatMap { messagesByID[$0.id] } ?? group.toolResult
+                let updatedToolUse = messagesByDisplayID[group.toolUse.displayID] ?? group.toolUse
+                let updatedToolResult = group.toolResult.flatMap { messagesByDisplayID[$0.displayID] } ?? group.toolResult
                 return .toolGroup(
                     ToolCallGroup(toolUse: updatedToolUse, toolResult: updatedToolResult),
                     showsBreakAfter: showsBreakAfter
