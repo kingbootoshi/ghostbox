@@ -476,9 +476,23 @@ export const createGhostMemory = ({
         log.error("Observer: failed to get Anthropic token");
         return;
       }
-      responseText = await callObserverAnthropic(token, modelId, observerSystemPrompt, userMessage, log, serializeError);
+      responseText = await callObserverAnthropic(
+        token,
+        modelId,
+        observerSystemPrompt,
+        userMessage,
+        log,
+        serializeError
+      );
     } else if (provider === "openai") {
-      responseText = await callObserverOpenAI(authEntry.access, modelId, observerSystemPrompt, userMessage, log, serializeError);
+      responseText = await callObserverOpenAI(
+        authEntry.access,
+        modelId,
+        observerSystemPrompt,
+        userMessage,
+        log,
+        serializeError
+      );
     } else {
       log.error("Observer: unsupported provider", { provider });
       return;

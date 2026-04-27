@@ -3,6 +3,10 @@ import Foundation
 import Observation
 import UniformTypeIdentifiers
 
+private let maximumAPIImageEdge: CGFloat = 1_568
+private let maximumAPIImagePixels: CGFloat = 1_150_000
+private let maximumAPIImageBytes = 4_500_000
+
 struct PendingImage: Identifiable {
     let id: UUID
     let data: Data
@@ -31,10 +35,6 @@ final class InputController {
     @ObservationIgnored private let store: ConversationStore
     @ObservationIgnored var isWakingGhost: @MainActor () -> Bool = { false }
     @ObservationIgnored private var historyDraft = ""
-
-    private static let maximumAPIImageEdge: CGFloat = 1_568
-    private static let maximumAPIImagePixels: CGFloat = 1_150_000
-    private static let maximumAPIImageBytes = 4_500_000
 
     init(store: ConversationStore) {
         self.store = store
@@ -182,10 +182,11 @@ final class InputController {
                 results.append((id: entry.id, data: processed.data, thumbData: thumbData, mediaType: processed.mediaType))
             }
 
+            let processedResults = results
             await MainActor.run { [weak self] in
                 guard let self else { return }
 
-                for result in results {
+                for result in processedResults {
                     guard !result.data.isEmpty,
                           let thumb = NSImage(data: result.thumbData),
                           let index = self.pendingImages.firstIndex(where: { $0.id == result.id }) else {
