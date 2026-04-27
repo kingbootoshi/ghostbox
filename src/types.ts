@@ -170,10 +170,22 @@ export type CompactionInfo = {
   tokensBefore: number;
 };
 
-export type HistoryResponse = {
-  messages: HistoryMessage[];
-  preCompactionMessages: HistoryMessage[];
-  compactions: CompactionInfo[];
+export type TimelineItem =
+  | {
+      id: string;
+      type: "message";
+      message: HistoryMessage;
+    }
+  | {
+      id: string;
+      type: "compaction";
+      compaction: CompactionInfo;
+    };
+
+export type TimelineResponse = {
+  items: TimelineItem[];
+  totalCount: number;
+  nextCursor: string | null;
 };
 
 export type SessionInfo = {
@@ -201,6 +213,38 @@ export type GhostStats = {
     percent: number;
   } | null;
 };
+
+export type GhostRuntimeCapability =
+  | "message"
+  | "steer"
+  | "queue"
+  | "timeline"
+  | "sessions"
+  | "stats"
+  | "commands"
+  | "compact"
+  | "newSession"
+  | "abort"
+  | "reload"
+  | "backgroundTaskKill"
+  | "nudge"
+  | "nudgeStatus"
+  | "schedules";
+
+export type GhostRuntimeCommand = {
+  name: string;
+  description: string;
+};
+
+export interface GhostRuntimeMeta {
+  adapter: AdapterType;
+  runtimeVersion: string;
+  imageVersion: string | null;
+  supportedCapabilities: GhostRuntimeCapability[];
+  supportedCommands: GhostRuntimeCommand[];
+  currentModel: string | null;
+  currentSessionId: string | null;
+}
 
 export type HeartbeatMessage = { type: "heartbeat" };
 
@@ -244,3 +288,32 @@ export interface AuthStatus {
   providers: Record<AuthProvider, AuthProviderStatus>;
   claudeCode: AuthProviderStatus;
 }
+
+export type RealtimeEvent =
+  | {
+      id: string;
+      at: string;
+      type: "snapshot";
+      ghosts: Record<string, GhostState>;
+    }
+  | {
+      id: string;
+      at: string;
+      type: "ghost.upsert";
+      ghostName: string;
+      ghost: GhostState;
+    }
+  | {
+      id: string;
+      at: string;
+      type: "ghost.remove";
+      ghostName: string;
+    }
+  | {
+      id: string;
+      at: string;
+      type: "message.completed";
+      ghostName: string;
+      sessionId: string;
+      preview: string;
+    };

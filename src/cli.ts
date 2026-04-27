@@ -1,6 +1,5 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
@@ -26,6 +25,7 @@ import {
   upgradeGhosts,
   wakeGhost
 } from "./orchestrator";
+import type { ConnectionConfig } from "./remote-config";
 import { clearRemoteConfig, getRemoteConfigPath, readRemoteConfig, updateRemoteConfig } from "./remote-config";
 import { startBot } from "./telegram";
 import type { AuthProvider, GhostApiKey, GhostboxState, GhostState } from "./types";
@@ -687,18 +687,43 @@ const printUsage = (): void => {
   log.info("  ghostbox remote token <token>           Save remote API token");
   log.info("  ghostbox remote status                  Show remote config");
   log.info("  ghostbox remote clear                   Clear remote config");
-  log.info("  ghostbox tui                            Launch terminal UI");
   log.info("  ghostbox serve                          Start web dashboard");
   log.info("  ghostbox bot                            Start Telegram bot");
 };
 
 const API_PORT = 8008;
 
+const redactSecret = (value: string): string => {
+  if (value.length <= 8) {
+    return `${"*".repeat(Math.max(0, value.length - 2))}${value.slice(-2)}`;
+  }
+
+  return `${value.slice(0, 4)}...${value.slice(-4)}`;
+};
+
+const redactRemoteConfig = (config: ConnectionConfig): ConnectionConfig => {
+  return {
+    ...(config.url ? { url: config.url } : {}),
+    ...(config.token ? { token: redactSecret(config.token) } : {})
+  };
+};
+
+const printRemoteConfig = (config: ConnectionConfig): void => {
+  console.log(JSON.stringify(redactRemoteConfig(config), null, 2));
+};
+
 const findRunningPort = async (): Promise<number | null> => {
   for (let p = API_PORT; p < API_PORT + 10; p++) {
     try {
-      const res = await fetch(`http://localhost:${p}/api/config`, { signal: AbortSignal.timeout(500) });
-      if (res.ok) return p;
+      const res = await fetch(`http://localhost:${p}/api/health`, { signal: AbortSignal.timeout(500) });
+      if (!res.ok) {
+        continue;
+      }
+
+      const body = (await res.json()) as { status?: string };
+      if (body.status === "ok") {
+        return p;
+      }
     } catch {
       /* not listening */
     }
@@ -716,26 +741,6 @@ const openUrl = (url: string): void => {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const require = createRequire(import.meta.url);
-
-const ensureTuiDependencies = (): void => {
-  const missing = ["react", "react/jsx-runtime", "react/jsx-dev-runtime", "ink", "@inkjs/ui"].filter((pkg) => {
-    try {
-      require.resolve(pkg);
-      return false;
-    } catch {
-      return true;
-    }
-  });
-
-  if (missing.length === 0) {
-    return;
-  }
-
-  throw new Error(
-    `TUI dependencies are not installed: ${missing.join(", ")}. Run "bun add ink @inkjs/ui react" first.`
-  );
-};
 
 const launchServer = async (): Promise<void> => {
   // Check if already running on any port in our range
@@ -1205,7 +1210,7 @@ const remote = async (args: string[]): Promise<void> => {
 
       const config = await updateRemoteConfig({ url });
       log.info(chalk.green(`Saved remote URL to ${getRemoteConfigPath()}.`));
-      console.log(JSON.stringify(config, null, 2));
+      printRemoteConfig(config);
       return;
     }
     case "token": {
@@ -1216,7 +1221,7 @@ const remote = async (args: string[]): Promise<void> => {
 
       const config = await updateRemoteConfig({ token });
       log.info(chalk.green(`Saved remote token to ${getRemoteConfigPath()}.`));
-      console.log(JSON.stringify(config, null, 2));
+      printRemoteConfig(config);
       return;
     }
     case "status": {
@@ -1230,7 +1235,7 @@ const remote = async (args: string[]): Promise<void> => {
         return;
       }
 
-      console.log(JSON.stringify(config, null, 2));
+      printRemoteConfig(config);
       return;
     }
     case "clear": {
@@ -1405,11 +1410,6 @@ const main = async (): Promise<void> => {
       case "serve":
         await launchServer();
         break;
-      case "tui": {
-        ensureTuiDependencies();
-        await runCommandInherit("bun", ["run", "src/tui/index.tsx"]);
-        break;
-      }
       case "bot":
         await bot();
         break;
