@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  check:
+  backend:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,3 +29,25 @@ jobs:
 
       - name: Test
         run: bun test
+
+      - name: Build ghost runtimes
+        run: |
+          bun run build:ghost-server
+          bun run build:ghost-server-claude
+
+  native:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build native app
+        run: bun run build:native
