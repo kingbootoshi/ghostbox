@@ -1425,8 +1425,6 @@ const MODELS = [
 let ghosts = [];
 let activeGhost = null;
 let messages = [];
-let preCompactionMessages = [];
-let compactionSummary = null;
 let isStreaming = false;
 let streamAbortController = null;
 let queuedMessages = [];
@@ -1672,8 +1670,6 @@ window.selectGhost = async function(name) {
   if (!ghost) return;
   activeGhost = ghost;
   messages = [];
-  preCompactionMessages = [];
-  compactionSummary = null;
   stats = null;
   queuedMessages = [];
   pendingImages = [];
@@ -2063,17 +2059,6 @@ function renderChatBodyImmediate() {
   const currentInner = document.getElementById('chatMessagesInner');
   if (!currentInner) return;
 
-  // Compaction divider - render once at position 0
-  if (renderedMessageCount === 0 && preCompactionMessages.length > 0 && compactionSummary) {
-    const divider = document.createElement('div');
-    divider.className = 'compaction-divider';
-    divider.innerHTML = `
-      <div class="compaction-divider-line"></div>
-      <span class="compaction-divider-label">COMPACTED</span>
-      <div class="compaction-divider-line"></div>`;
-    currentInner.appendChild(divider);
-  }
-
   // Check if the user is scrolled near the bottom (within 80px)
   const wasNearBottom = chatMessages.scrollHeight - chatMessages.scrollTop - chatMessages.clientHeight < 80;
 
@@ -2184,6 +2169,10 @@ function updateQueueIndicator() {
 }
 
 function renderMessageOuter(msg, index) {
+  if (msg.role === 'compaction') {
+    return `<div class="message message-system" data-msg-index="${index}">${renderMessageInner(msg, index)}</div>`;
+  }
+
   const roleClass = msg.role === 'user' ? 'message-user' :
                      msg.role === 'ghost' ? 'message-ghost' :
                      msg.role === 'system' ? 'message-system' :
@@ -2192,6 +2181,18 @@ function renderMessageOuter(msg, index) {
 }
 
 function renderMessageInner(msg, index) {
+  if (msg.role === 'compaction') {
+    const summary = msg.content ? `
+      <div class="message-bubble" style="margin-top:8px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.05);">
+        ${escapeHtml(msg.content).replace(/\n/g, '<br>')}
+      </div>` : '';
+    return `<div class="compaction-divider">
+      <div class="compaction-divider-line"></div>
+      <span class="compaction-divider-label">COMPACTED</span>
+      <div class="compaction-divider-line"></div>
+    </div>${summary}`;
+  }
+
   if (msg.role === 'toolUse' || msg.role === 'toolResult') {
     const isUse = msg.role === 'toolUse';
     const toolLabel = msg.toolName || (isUse ? 'Tool' : 'Result');
@@ -2502,15 +2503,9 @@ window.clearQueue = async function() {
 // Load history
 async function loadHistory(name) {
   try {
-    const data = await api(`/ghosts/${name}/history`);
+    const data = await api(`/ghosts/${name}/timeline`);
 
-    messages = (data.messages || []).map(mapHistoryMessage);
-    preCompactionMessages = (data.preCompactionMessages || []).map(mapHistoryMessage);
-    compactionSummary = data.compactions?.[data.compactions.length - 1]?.summary || null;
-
-    if (data.compactions?.length > 0 && messages.length === 0 && preCompactionMessages.length > 0) {
-      messages = [{ role: 'system', content: 'Session compacted' }];
-    }
+    messages = (data.items || []).map(mapTimelineItem).filter(Boolean);
 
     // Full message replacement from server - reset incremental state
     renderedMessageCount = 0;
@@ -2541,6 +2536,21 @@ function mapHistoryMessage(msg) {
     toolName: msg.toolName,
     images: images.length > 0 ? images : undefined,
   };
+}
+
+function mapTimelineItem(item) {
+  if (item.type === 'message' && item.message) {
+    return mapHistoryMessage(item.message);
+  }
+
+  if (item.type === 'compaction' && item.compaction) {
+    return {
+      role: 'compaction',
+      content: item.compaction.summary || '',
+    };
+  }
+
+  return null;
 }
 
 // Load stats

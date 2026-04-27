@@ -1,5 +1,12 @@
 import { readRemoteConfig } from "../remote-config";
-import type { GhostMessage, GhostState, GhostStats, HistoryResponse, SessionListResponse } from "../types";
+import type {
+  GhostMessage,
+  GhostState,
+  GhostStats,
+  HistoryMessage,
+  SessionListResponse,
+  TimelineResponse
+} from "../types";
 
 const DEFAULT_API_BASE_URL = "http://localhost:8008";
 
@@ -10,6 +17,10 @@ type ApiErrorPayload = {
 type SseEvent = {
   event: string;
   data: string;
+};
+
+type TuiHistoryResponse = {
+  messages: HistoryMessage[];
 };
 
 const readEnvValue = (value: string | undefined): string | null => {
@@ -100,13 +111,18 @@ const parseSseEvent = (chunk: string): SseEvent | null => {
   };
 };
 
+const timelineToHistory = (timeline: TimelineResponse): TuiHistoryResponse => ({
+  messages: timeline.items.flatMap((item) => (item.type === "message" ? [item.message] : []))
+});
+
 export const apiClient = {
   listGhosts(): Promise<Record<string, GhostState>> {
     return request<Record<string, GhostState>>("/api/ghosts");
   },
 
-  getHistory(name: string): Promise<HistoryResponse> {
-    return request<HistoryResponse>(`/api/ghosts/${encodeURIComponent(name)}/history`);
+  async getHistory(name: string): Promise<TuiHistoryResponse> {
+    const timeline = await request<TimelineResponse>(`/api/ghosts/${encodeURIComponent(name)}/timeline`);
+    return timelineToHistory(timeline);
   },
 
   getSessions(name: string): Promise<SessionListResponse> {
