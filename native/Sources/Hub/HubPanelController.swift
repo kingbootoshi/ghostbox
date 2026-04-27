@@ -40,7 +40,7 @@ final class HubPanelController {
 
         guard let targetFrame = centeredFrame(for: panelSize) else { return }
 
-        let glassPanel = GlassPanel(contentRect: targetFrame, title: "Ghostbox")
+        let glassPanel = GlassPanel(contentRect: targetFrame, title: "Ghostbox", minimumSize: panelSize)
         glassPanel.setSwiftUIContent(
             HubView(client: client)
                 .environmentObject(appState)
@@ -65,7 +65,7 @@ final class HubPanelController {
     func createPanelHidden() {
         guard panel == nil, let targetFrame = centeredFrame(for: panelSize) else { return }
 
-        let glassPanel = GlassPanel(contentRect: targetFrame, title: "Ghostbox")
+        let glassPanel = GlassPanel(contentRect: targetFrame, title: "Ghostbox", minimumSize: panelSize)
         glassPanel.setSwiftUIContent(
             HubView(client: client)
                 .environmentObject(appState)

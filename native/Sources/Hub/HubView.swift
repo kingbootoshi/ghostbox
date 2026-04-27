@@ -18,7 +18,7 @@ struct HubView: View {
     }
 
     private var displayGhosts: [Ghost] {
-        viewModel.ghosts.isEmpty ? appState.ghosts : viewModel.ghosts
+        appState.ghosts
     }
 
     var body: some View {
@@ -27,7 +27,7 @@ struct HubView: View {
                 titleSection
 
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
+                    LazyVStack(alignment: .leading, spacing: 18) {
                         if showsSettings {
                             HubSettingsView(
                                 settingsDraft: $settingsDraft,
@@ -63,23 +63,6 @@ struct HubView: View {
             }
         }
         .background(Color.clear)
-        .onAppear {
-            if !appState.isStartingServer {
-                viewModel.startPolling()
-            }
-        }
-        .onChange(of: appState.isStartingServer) {
-            if !appState.isStartingServer {
-                viewModel.error = nil
-                viewModel.startPolling()
-            }
-        }
-        .onDisappear {
-            viewModel.stopPolling()
-        }
-        .onReceive(viewModel.$ghosts) { ghosts in
-            appState.ghosts = ghosts
-        }
         .onReceive(viewModel.$isLoading) { isLoading in
             appState.isLoading = isLoading
         }

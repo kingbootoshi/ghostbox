@@ -15,7 +15,7 @@ final class ChatPanelController: NSObject, NSWindowDelegate {
     private let hubCenterProvider: @MainActor () -> NSPoint?
     private let userDefaults: UserDefaults
 
-    private let defaultPanelSize = NSSize(width: 380, height: 550)
+    private let defaultPanelSize = NSSize(width: ChatPanelLayout.defaultWidth, height: ChatPanelLayout.defaultHeight)
     private let hubSize = NSSize(width: 400, height: 600)
     private let panelResizeAnimationDuration: TimeInterval = 0.1
 
@@ -86,6 +86,14 @@ final class ChatPanelController: NSObject, NSWindowDelegate {
         hideInPlace()
     }
 
+    func close(completion: (() -> Void)? = nil) {
+        wasOpen = false
+        hideInPlace { [weak self] in
+            self?.releasePanel()
+            completion?()
+        }
+    }
+
     func hideInPlace(completion: (() -> Void)? = nil) {
         guard let panel, panel.isVisible else {
             completion?()
@@ -144,7 +152,11 @@ final class ChatPanelController: NSObject, NSWindowDelegate {
             return panel
         }
 
-        let glassPanel = GlassPanel(contentRect: targetFrame, title: ghostName)
+        let glassPanel = GlassPanel(
+            contentRect: targetFrame,
+            title: ghostName,
+            minimumSize: NSSize(width: ChatPanelLayout.minWidth, height: ChatPanelLayout.minHeight)
+        )
         glassPanel.delegate = self
         glassPanel.setSwiftUIContent(
             AgentChatView(viewModel: viewModel)
@@ -216,6 +228,15 @@ final class ChatPanelController: NSObject, NSWindowDelegate {
 
     private var positionKey: String {
         "ghostbox.panel.position.\(ghostName)"
+    }
+
+    private func releasePanel() {
+        panel?.delegate = nil
+        panel?.contentView = nil
+        panel = nil
+        isShowingVaultBrowser = false
+        isFullscreen = false
+        preFullscreenFrame = nil
     }
 
     @objc private func handlePanelResizeRequest(_ notification: Notification) {
@@ -307,16 +328,18 @@ final class ChatPanelController: NSObject, NSWindowDelegate {
             context.allowsImplicitAnimation = true
             panel.animator().setFrame(targetFrame, display: true)
         }, completionHandler: { [weak self] in
-            guard let self else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
 
-            self.isAnimatingPanel = false
-            self.isShowingVaultBrowser = showsVaultBrowser
+                self.isAnimatingPanel = false
+                self.isShowingVaultBrowser = showsVaultBrowser
 
-            if !showsVaultBrowser {
-                self.chatModeWidth = panel.frame.width
+                if !showsVaultBrowser {
+                    self.chatModeWidth = panel.frame.width
+                }
+
+                self.saveFrame(panel.frame)
             }
-
-            self.saveFrame(panel.frame)
         })
     }
 }

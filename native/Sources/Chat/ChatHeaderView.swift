@@ -13,72 +13,9 @@ struct ChatHeaderView: View {
         let store = viewModel.store
 
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .center, spacing: 10) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 8, height: 8)
-
-                AnimatedGhostView(
-                    state: viewModel.isStreaming ? .talking : .blink,
-                    size: 64
-                )
-                .frame(width: 64, height: 64)
-
-                Text(viewModel.ghostName)
-                    .font(Theme.Typography.display())
-                    .foregroundColor(Theme.Colors.accentLight)
-
-                ModelSwitcherMenu(
-                    currentModel: store.ghost?.model ?? "Loading...",
-                    currentProvider: store.ghost?.provider ?? "anthropic",
-                    onSelect: { model in
-                        viewModel.switchModel(to: model)
-                    }
-                )
-
-                SessionSwitcherRow(
-                    sessions: store.sessions,
-                    currentSession: store.currentSession,
-                    isDisabled: viewModel.isStreaming || store.isLoadingHistory || viewModel.isWakingGhost || store.isCompacting,
-                    onSelect: { sessionId in
-                        viewModel.switchSession(sessionId: sessionId)
-                    },
-                    onCreate: {
-                        viewModel.newSession()
-                    },
-                    onRename: { sessionId, name in
-                        viewModel.renameSession(sessionId: sessionId, name: name)
-                    },
-                    onDelete: { sessionId in
-                        viewModel.deleteSession(sessionId: sessionId)
-                    }
-                )
-
-                Spacer(minLength: 0)
-
-                if viewModel.isStreaming {
-                    Button("Stop") {
-                        viewModel.cancelStream()
-                    }
-                    .font(Theme.Typography.label())
-                    .foregroundColor(Color.white.opacity(Theme.Text.secondary))
-                    .buttonStyle(.plain)
-                    .fixedSize()
-                }
-
-                ChatHeaderButton(
-                    title: showsVaultBrowser ? "Chat" : "Files",
-                    systemImage: showsVaultBrowser ? "bubble.left.and.bubble.right" : "folder",
-                    action: toggleVaultBrowser
-                )
-                .fixedSize()
-
-                CircularIconButton(
-                    systemImage: "arrow.up.left.and.arrow.down.right",
-                    action: toggleFullscreen
-                )
-
-                CircularIconButton(systemImage: "xmark", action: closeCurrentPanel)
+            ViewThatFits(in: .horizontal) {
+                wideHeader(store: store)
+                compactHeader(store: store)
             }
 
             if store.isCreatingSession {
@@ -99,6 +36,123 @@ struct ChatHeaderView: View {
         .padding(.top, 20)
         .padding(.bottom, 12)
         .background(WindowDragArea())
+    }
+
+    private func wideHeader(store: ConversationStore) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            headerIdentity(ghostSize: 64, includeModelSwitcher: false)
+
+            ModelSwitcherMenu(
+                currentModel: store.ghost?.model ?? "Loading...",
+                currentProvider: store.ghost?.provider ?? "anthropic",
+                onSelect: { model in
+                    viewModel.switchModel(to: model)
+                }
+            )
+
+            sessionSwitcherRow(store: store)
+
+            Spacer(minLength: 0)
+
+            headerActionGroup
+        }
+    }
+
+    private func compactHeader(store: ConversationStore) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                headerIdentity(ghostSize: 52, includeModelSwitcher: true)
+
+                Spacer(minLength: 0)
+
+                headerActionGroup
+            }
+
+            sessionSwitcherRow(store: store)
+        }
+    }
+
+    private func headerIdentity(ghostSize: CGFloat, includeModelSwitcher: Bool) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 8, height: 8)
+
+            AnimatedGhostView(
+                state: viewModel.isStreaming ? .talking : .blink,
+                size: ghostSize
+            )
+            .frame(width: ghostSize, height: ghostSize)
+
+            VStack(alignment: .leading, spacing: includeModelSwitcher ? 7 : 0) {
+                Text(viewModel.ghostName)
+                    .font(Theme.Typography.display())
+                    .foregroundColor(Theme.Colors.accentLight)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .minimumScaleFactor(0.9)
+                    .allowsTightening(true)
+                    .layoutPriority(1)
+
+                if includeModelSwitcher {
+                    ModelSwitcherMenu(
+                        currentModel: viewModel.store.ghost?.model ?? "Loading...",
+                        currentProvider: viewModel.store.ghost?.provider ?? "anthropic",
+                        onSelect: { model in
+                            viewModel.switchModel(to: model)
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    private func sessionSwitcherRow(store: ConversationStore) -> some View {
+        SessionSwitcherRow(
+            sessions: store.sessions,
+            currentSession: store.currentSession,
+            isDisabled: viewModel.isStreaming || store.isLoadingHistory || viewModel.isWakingGhost || store.isCompacting,
+            onSelect: { sessionId in
+                viewModel.switchSession(sessionId: sessionId)
+            },
+            onCreate: {
+                viewModel.newSession()
+            },
+            onRename: { sessionId, name in
+                viewModel.renameSession(sessionId: sessionId, name: name)
+            },
+            onDelete: { sessionId in
+                viewModel.deleteSession(sessionId: sessionId)
+            }
+        )
+    }
+
+    private var headerActionGroup: some View {
+        HStack(spacing: 8) {
+            if viewModel.isStreaming {
+                Button("Stop") {
+                    viewModel.cancelStream()
+                }
+                .font(Theme.Typography.label())
+                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                .buttonStyle(.plain)
+                .fixedSize()
+            }
+
+            ChatHeaderButton(
+                title: showsVaultBrowser ? "Chat" : "Files",
+                systemImage: showsVaultBrowser ? "bubble.left.and.bubble.right" : "folder",
+                action: toggleVaultBrowser
+            )
+            .fixedSize()
+
+            CircularIconButton(
+                systemImage: "arrow.up.left.and.arrow.down.right",
+                action: toggleFullscreen
+            )
+
+            CircularIconButton(systemImage: "xmark", action: closeCurrentPanel)
+        }
     }
 }
 
@@ -152,14 +206,18 @@ private struct SessionSwitcherRow: View {
                     Image(systemName: "clock.arrow.trianglehead.counterclockwise.rotate.90")
                         .font(.system(size: Theme.FontSize.xs, weight: .semibold))
 
-                    Text(currentTitle)
-                        .font(Theme.Typography.label(weight: .regular))
+                Text(currentTitle)
+                    .font(Theme.Typography.label(weight: .regular))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
 
-                    if let currentSubtitle {
-                        Text(currentSubtitle)
-                            .font(Theme.Typography.caption())
-                            .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
-                    }
+                if let currentSubtitle {
+                    Text(currentSubtitle)
+                        .font(Theme.Typography.caption())
+                        .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
 
                     Image(systemName: "chevron.down")
                         .font(.system(size: 8, weight: .semibold))
@@ -294,6 +352,8 @@ struct ModelSwitcherMenu: View {
 
                 Text(displayModelName)
                     .font(Theme.Typography.label(weight: .regular))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
 
                 Image(systemName: "chevron.down")
                     .font(.system(size: 8, weight: .semibold))
@@ -302,7 +362,6 @@ struct ModelSwitcherMenu: View {
             .capsuleControlStyle()
         }
         .menuStyle(.borderlessButton)
-        .fixedSize()
     }
 
     private var displayModelName: String {
