@@ -206,15 +206,33 @@ final class InputTextView: NSTextView {
         super.paste(sender)
     }
 
-    private func pasteboardContainsImage() -> Bool {
-        let pasteboard = NSPasteboard.general
-        let items = pasteboard.pasteboardItems ?? []
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let key = event.charactersIgnoringModifiers?.lowercased()
 
-        for item in items {
-            if item.data(forType: .png) != nil || item.data(forType: .tiff) != nil {
+        if key == "v" {
+            if pasteboardContainsImage(), onPasteCommand?() == true {
                 return true
             }
 
+            if flags == [.control] {
+                paste(nil)
+                return true
+            }
+        }
+
+        return super.performKeyEquivalent(with: event)
+    }
+
+    private func pasteboardContainsImage() -> Bool {
+        let pasteboard = NSPasteboard.general
+
+        if NSImage.canInit(with: pasteboard) {
+            return true
+        }
+
+        let items = pasteboard.pasteboardItems ?? []
+        for item in items {
             if let fileURLString = item.string(forType: .fileURL),
                let url = URL(string: fileURLString),
                isSupportedImageFile(url) {

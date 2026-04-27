@@ -115,14 +115,11 @@ final class InputController {
     func commitHistorySelection(onCommit: @MainActor () -> Void = {}) -> Bool {
         guard isHistoryModeActive,
               let historySelectionMessageID,
-              let selectedIndex = store.messages.firstIndex(where: { $0.id == historySelectionMessageID }) else {
+              store.messages.contains(where: { $0.id == historySelectionMessageID }) else {
             return false
         }
 
-        if selectedIndex < store.messages.count - 1 {
-            store.messages.removeSubrange((selectedIndex + 1)..<store.messages.count)
-        }
-
+        store.truncateMessages(after: historySelectionMessageID)
         onCommit()
         return exitHistoryModeIfNeeded()
     }
@@ -131,8 +128,6 @@ final class InputController {
     func addImageFromPasteboard() -> Bool {
         let pasteboard = NSPasteboard.general
         let items = pasteboard.pasteboardItems ?? []
-
-        guard !items.isEmpty else { return false }
 
         var rawEntries: [(id: UUID, imageData: Data)] = []
         for item in items {
@@ -145,6 +140,22 @@ final class InputController {
             } else {
                 quickThumb = NSImage(size: NSSize(width: 48, height: 48))
             }
+
+            pendingImages.append(PendingImage(
+                id: placeholderID,
+                data: Data(),
+                thumbnail: quickThumb,
+                mediaType: "image/png",
+                isProcessing: true
+            ))
+            rawEntries.append((id: placeholderID, imageData: imageData))
+        }
+
+        if rawEntries.isEmpty,
+           let image = NSImage(pasteboard: pasteboard),
+           let imageData = image.pngData() {
+            let placeholderID = UUID()
+            let quickThumb = image.thumbnailImage(maxDimension: 200) ?? image
 
             pendingImages.append(PendingImage(
                 id: placeholderID,
@@ -205,12 +216,25 @@ final class InputController {
         if let tiffData = item.data(forType: .tiff) {
             return tiffData
         }
+        if let jpegData = item.data(forType: .init("public.jpeg")) {
+            return jpegData
+        }
         if let fileURLString = item.string(forType: .fileURL),
            let url = URL(string: fileURLString),
            isSupportedImageFile(url),
            let data = try? Data(contentsOf: url) {
             return data
         }
+
+        for type in item.types where type != .fileURL {
+            guard let data = item.data(forType: type),
+                  NSImage(data: data) != nil else {
+                continue
+            }
+
+            return data
+        }
+
         return nil
     }
 

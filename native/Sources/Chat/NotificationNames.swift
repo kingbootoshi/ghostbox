@@ -6,4 +6,5 @@ extension Notification.Name {
     static let toggleGhostHotkeyHelp = Notification.Name("toggleGhostHotkeyHelp")
     static let toggleGhostChatFullscreen = Notification.Name("toggleGhostChatFullscreen")
     static let ghostUnread = Notification.Name("ghostUnread")
+    static let ghostRealtimeEvent = Notification.Name("ghostRealtimeEvent")
 }
