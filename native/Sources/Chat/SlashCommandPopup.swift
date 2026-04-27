@@ -2,6 +2,8 @@ import SwiftUI
 
 struct SlashCommandPopup: View {
     let commands: [GhostSlashCommand]
+    let isLoading: Bool
+    let emptyStateText: String?
     let onSelect: (GhostSlashCommand) -> Void
 
     var body: some View {
@@ -11,31 +13,35 @@ struct SlashCommandPopup: View {
                 .foregroundColor(Theme.Colors.accentLightest)
 
             VStack(alignment: .leading, spacing: 6) {
-                ForEach(commands) { command in
-                    Button {
-                        onSelect(command)
-                    } label: {
-                        HStack(alignment: .top, spacing: 10) {
-                            Text("/\(command.name)")
-                                .font(Theme.Typography.label(weight: .semibold))
-                                .foregroundColor(Theme.Colors.accentLightest)
-                                .frame(width: 92, alignment: .leading)
+                if commands.isEmpty {
+                    emptyStateRow
+                } else {
+                    ForEach(commands) { command in
+                        Button {
+                            onSelect(command)
+                        } label: {
+                            HStack(alignment: .top, spacing: 10) {
+                                Text("/\(command.name)")
+                                    .font(Theme.Typography.label(weight: .semibold))
+                                    .foregroundColor(Theme.Colors.accentLightest)
+                                    .frame(width: 92, alignment: .leading)
 
-                            Text(command.description)
-                                .font(Theme.Typography.body())
-                                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                                Text(command.description)
+                                    .font(Theme.Typography.body())
+                                    .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .background(Color.white.opacity(0.04))
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 14)
+                                    .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
+                            )
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .background(Color.white.opacity(0.04))
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 14)
-                                .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
-                        )
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
             }
         }
@@ -52,12 +58,29 @@ struct SlashCommandPopup: View {
         .shadow(color: Theme.Colors.accent.opacity(0.18), radius: 22, x: 0, y: 12)
     }
 
-    static let fallbackSlashCommands = [
-        GhostSlashCommand(name: "compact", description: "Condense the current chat into a shorter summary."),
-        GhostSlashCommand(name: "history", description: "Show the recent conversation history."),
-        GhostSlashCommand(name: "model", description: "Check or change the model for this ghost."),
-        GhostSlashCommand(name: "help", description: "List the available slash commands.")
-    ]
+    @ViewBuilder
+    private var emptyStateRow: some View {
+        HStack(spacing: 10) {
+            if isLoading {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(Theme.Colors.accentLight)
+            }
+
+            Text(emptyStateText ?? "No slash commands available.")
+                .font(Theme.Typography.body())
+                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.04))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(Theme.Colors.accentLight.opacity(0.18), lineWidth: 0.5)
+        )
+    }
 
     static func slashAutocompleteQuery(for inputText: String) -> String? {
         guard inputText.hasPrefix("/") else { return nil }
@@ -79,34 +102,14 @@ struct SlashCommandPopup: View {
             command.name.range(of: query, options: [.anchored, .caseInsensitive]) != nil
         }
     }
-
-    static func mergedSlashCommands(
-        fallbackSlashCommands: [GhostSlashCommand],
-        fetchedCommands: [GhostSlashCommand]
-    ) -> [GhostSlashCommand] {
-        var commandsByName = Dictionary(uniqueKeysWithValues: fallbackSlashCommands.map {
-            ($0.name.lowercased(), $0)
-        })
-
-        for command in fetchedCommands {
-            commandsByName[command.name.lowercased()] = command
-        }
-
-        let orderedNames = fallbackSlashCommands.map(\.name) + fetchedCommands.map(\.name)
-        var seenNames = Set<String>()
-
-        return orderedNames.compactMap { name in
-            let normalizedName = name.lowercased()
-            guard seenNames.insert(normalizedName).inserted else { return nil }
-            return commandsByName[normalizedName]
-        }
-    }
 }
 
 extension AgentChatView {
     var slashCommandPopup: some View {
         SlashCommandPopup(
             commands: filteredSlashCommands,
+            isLoading: isLoadingSlashCommands && filteredSlashCommands.isEmpty,
+            emptyStateText: slashCommandEmptyStateText,
             onSelect: selectSlashCommand
         )
     }
@@ -126,14 +129,22 @@ extension AgentChatView {
         !showsVaultBrowser &&
         isSlashCommandPopupVisible &&
         fullscreenToolGroup == nil &&
-        slashAutocompleteQuery != nil &&
-        !filteredSlashCommands.isEmpty
+        slashAutocompleteQuery != nil
     }
 
     func handleInputTextChanged() {
-        isSlashCommandPopupVisible = slashAutocompleteQuery != nil
+        let shouldShowPopup = slashAutocompleteQuery != nil
+        let becameVisible = shouldShowPopup && !isSlashCommandPopupVisible
+        isSlashCommandPopupVisible = shouldShowPopup
 
-        guard isSlashCommandPopupVisible else { return }
+        if becameVisible {
+            didAttemptSlashCommandFetchForVisiblePopup = false
+        }
+
+        guard isSlashCommandPopupVisible else {
+            didAttemptSlashCommandFetchForVisiblePopup = false
+            return
+        }
         loadSlashCommandsIfNeeded()
     }
 
@@ -145,31 +156,42 @@ extension AgentChatView {
 
     func dismissSlashCommandPopup() {
         isSlashCommandPopupVisible = false
+        didAttemptSlashCommandFetchForVisiblePopup = false
     }
 
     func loadSlashCommandsIfNeeded() {
-        guard !didAttemptSlashCommandFetch else { return }
+        guard !didAttemptSlashCommandFetchForVisiblePopup else { return }
+        guard !isLoadingSlashCommands else { return }
 
-        didAttemptSlashCommandFetch = true
+        didAttemptSlashCommandFetchForVisiblePopup = true
+        isLoadingSlashCommands = slashCommands.isEmpty
 
         Task {
             do {
                 let fetchedCommands = try await viewModel.ghostboxClient.fetchCommands(ghostName: viewModel.ghostName)
                 await MainActor.run {
-                    slashCommands = mergedSlashCommands(with: fetchedCommands)
+                    slashCommands = fetchedCommands
+                    isLoadingSlashCommands = false
                 }
             } catch {
                 await MainActor.run {
-                    slashCommands = SlashCommandPopup.fallbackSlashCommands
+                    isLoadingSlashCommands = false
                 }
             }
         }
     }
 
-    func mergedSlashCommands(with fetchedCommands: [GhostSlashCommand]) -> [GhostSlashCommand] {
-        SlashCommandPopup.mergedSlashCommands(
-            fallbackSlashCommands: SlashCommandPopup.fallbackSlashCommands,
-            fetchedCommands: fetchedCommands
-        )
+    var slashCommandEmptyStateText: String? {
+        guard filteredSlashCommands.isEmpty else { return nil }
+
+        if isLoadingSlashCommands {
+            return "Loading slash commands..."
+        }
+
+        if slashCommands.isEmpty {
+            return "No slash commands available."
+        }
+
+        return "No matching slash commands."
     }
 }

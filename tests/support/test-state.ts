@@ -22,6 +22,7 @@ export const createGhostState = (overrides: Partial<GhostState> = {}): GhostStat
   portBase: 3100,
   model: "claude-sonnet-4-6",
   provider: "anthropic",
+  adapter: "claude-code",
   imageVersion: "gb-deadbeef",
   status: "running",
   createdAt: "2026-03-25T00:00:00.000Z",

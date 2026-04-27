@@ -8,6 +8,7 @@ import Docker from "dockerode";
 import { refreshClaudeCodeToken, writeCredentialsFile } from "./claude-auth";
 import { createLogger } from "./logger";
 import { readClaudeCodeToken } from "./oauth";
+import { publishGhostRemoveEvent, publishGhostUpsertEvent, publishMessageCompletedEvent } from "./realtime-events";
 import type {
   AdapterType,
   GhostApiKey,
@@ -18,16 +19,24 @@ import type {
   GhostQueueClearResponse,
   GhostQueueEnqueueResponse,
   GhostQueueState,
+  GhostRuntimeCapability,
+  GhostRuntimeMeta,
   GhostState,
   GhostStreamingBehavior,
-  HistoryResponse,
-  SessionListResponse
+  SessionListResponse,
+  TimelineResponse
 } from "./types";
 import { getHomeDirectory, isNodeError, sleep } from "./utils";
 import { commitVault, getVaultPath, initVault, mergeVaults } from "./vault";
 
 const defaultImageName = "ghostbox-agent";
 const defaultProvider = "anthropic";
+
+type HistoryRequestOptions = {
+  limit?: number;
+  cursor?: string;
+};
+
 const getGhostPiAgentPath = (name: string): string => join(getHomeDirectory(), ".ghostbox", "ghosts", name, "pi-agent");
 const getGhostClaudeConfigPath = (name: string): string => join(getVaultPath(name), ".claude");
 const getSharedPiAgentPath = (): string => join(getHomeDirectory(), ".pi", "agent");
@@ -567,6 +576,7 @@ const startGhostContainer = async (
   const adapter = ghost.adapter ?? inferAdapterFromProvider(ghost.provider);
   const env = [
     `GHOSTBOX_MODEL=${fullModel}`,
+    `GHOSTBOX_IMAGE_VERSION=${state.config.imageVersion || ghost.imageVersion || ""}`,
     `GHOSTBOX_SYSTEM_PROMPT=${systemPrompt || ""}`,
     `GHOSTBOX_GHOST_NAME=${name}`,
     `GHOSTBOX_GITHUB_TOKEN=${state.config.githubToken || ""}`,
@@ -714,6 +724,12 @@ export const reconcileGhostStates = async (): Promise<{ started: string[]; marke
   }
 
   await saveState(state);
+  for (const name of marked) {
+    const ghost = state.ghosts[name];
+    if (ghost) {
+      publishGhostUpsertEvent(name, ghost);
+    }
+  }
 
   // Restart all ghosts that need it
   for (const name of marked) {
@@ -756,6 +772,7 @@ export const updateGhost = async (
   }
 
   await saveState(state);
+  publishGhostUpsertEvent(name, ghost);
   return ghost;
 };
 
@@ -835,6 +852,7 @@ export const spawnGhost = async (
   ghost.imageVersion = state.config.imageVersion;
   state.ghosts[name] = ghost;
   await saveState(state);
+  publishGhostUpsertEvent(name, ghost);
 };
 
 export const killGhost = async (name: string): Promise<void> => {
@@ -854,6 +872,7 @@ export const killGhost = async (name: string): Promise<void> => {
 
   ghost.status = "stopped";
   await saveState(state);
+  publishGhostUpsertEvent(name, ghost);
 };
 
 export const wakeGhost = async (name: string): Promise<void> => {
@@ -896,6 +915,7 @@ export const wakeGhost = async (name: string): Promise<void> => {
   ghost.status = "running";
   ghost.imageVersion = state.config.imageVersion;
   await saveState(state);
+  publishGhostUpsertEvent(name, ghost);
 };
 
 const refreshGhostAuth = async (name: string): Promise<void> => {
@@ -964,6 +984,9 @@ export const sendMessage = async function* (
       if (trimmed.length === 0) continue;
       const message = parseGhostMessage(trimmed);
       if (message.type === "heartbeat") continue;
+      if (message.type === "result" && message.sessionId) {
+        publishMessageCompletedEvent(name, message.sessionId, message.text.slice(0, 240));
+      }
       yield message;
     }
   }
@@ -971,7 +994,12 @@ export const sendMessage = async function* (
   const finalLine = buffer.trim();
   if (finalLine.length > 0) {
     const message = parseGhostMessage(finalLine);
-    if (message.type !== "heartbeat") yield message;
+    if (message.type !== "heartbeat") {
+      if (message.type === "result" && message.sessionId) {
+        publishMessageCompletedEvent(name, message.sessionId, message.text.slice(0, 240));
+      }
+      yield message;
+    }
   }
 };
 
@@ -1024,13 +1052,24 @@ export const getGhostHealth = async (name: string): Promise<boolean> => {
   }
 };
 
-export const getGhostHistory = async (name: string): Promise<HistoryResponse> => {
-  const response = await callGhost(name, "/history", {
-    errorMessage: "Ghost history request failed",
+export const getGhostTimeline = async (name: string, options?: HistoryRequestOptions): Promise<TimelineResponse> => {
+  const query = new URLSearchParams();
+
+  if (options?.limit !== undefined) {
+    query.set("limit", String(options.limit));
+  }
+
+  if (options?.cursor !== undefined) {
+    query.set("cursor", options.cursor);
+  }
+
+  const path = query.size > 0 ? `/timeline?${query.toString()}` : "/timeline";
+  const response = await callGhost(name, path, {
+    errorMessage: "Ghost timeline request failed",
     decodeError: false
   });
 
-  return (await response.json()) as HistoryResponse;
+  return (await response.json()) as TimelineResponse;
 };
 
 export const getGhostSessions = async (name: string): Promise<SessionListResponse> => {
@@ -1051,7 +1090,31 @@ export const getGhostStats = async (name: string): Promise<Record<string, unknow
   return (await response.json()) as Record<string, unknown>;
 };
 
+export const getGhostRuntimeMeta = async (name: string): Promise<GhostRuntimeMeta> => {
+  const response = await callGhost(name, "/runtime/meta", {
+    errorMessage: "Ghost runtime meta request failed",
+    decodeError: false
+  });
+
+  return (await response.json()) as GhostRuntimeMeta;
+};
+
+const ensureGhostCapability = async (
+  name: string,
+  capability: GhostRuntimeCapability,
+  operation: string
+): Promise<GhostRuntimeMeta> => {
+  const runtimeMeta = await getGhostRuntimeMeta(name);
+
+  if (!runtimeMeta.supportedCapabilities.includes(capability)) {
+    throw new Error(`${operation} is not supported by the ${runtimeMeta.adapter} adapter.`);
+  }
+
+  return runtimeMeta;
+};
+
 export const reloadGhost = async (name: string): Promise<void> => {
+  await ensureGhostCapability(name, "reload", "Reload");
   await callGhost(name, "/reload", {
     method: "POST",
     errorMessage: "Ghost reload failed"
@@ -1069,6 +1132,7 @@ export const killBackgroundTask = async (
   name: string,
   taskId: string
 ): Promise<{ status: "killed"; taskId: string }> => {
+  await ensureGhostCapability(name, "backgroundTaskKill", "Background task killing");
   const path = `/tasks/${encodeURIComponent(taskId)}/kill`;
   const response = await callGhost(name, path, {
     method: "POST",
@@ -1137,6 +1201,7 @@ export const nudgeGhost = async (
   event: string = "self",
   reason: string = "orchestrator"
 ): Promise<void> => {
+  await ensureGhostCapability(name, "nudge", "Nudging");
   await callGhost(name, "/nudge", {
     method: "POST",
     headers: {
@@ -1176,6 +1241,7 @@ export const removeGhost = async (name: string): Promise<void> => {
 
   delete refreshedState.ghosts[name];
   await saveState(refreshedState);
+  publishGhostRemoveEvent(name);
 };
 
 export const mergeGhosts = async (source: string, target: string): Promise<string> => {

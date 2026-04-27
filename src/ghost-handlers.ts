@@ -3,15 +3,17 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { basename } from "node:path";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
+import type { NudgeEvent } from "./ghost-memory";
 import type {
-  CompactionInfo,
   GhostImage,
   GhostQueueState,
+  GhostRuntimeMeta,
   GhostSchedule,
   GhostStreamingBehavior,
   HistoryMessage,
   SessionInfo,
-  SessionListResponse
+  SessionListResponse,
+  TimelineItem
 } from "./types";
 
 type LogContext = Record<string, unknown>;
@@ -34,6 +36,14 @@ type PiAgentMessage = {
   content?: unknown;
   timestamp?: number | string;
   toolName?: string;
+};
+
+type SessionHistoryEntry = {
+  type: string;
+  message?: PiAgentMessage;
+  timestamp?: string;
+  summary?: string;
+  tokensBefore?: number;
 };
 
 type PiPromptImage = {
@@ -59,8 +69,32 @@ type SessionManagerEntry = {
   modified?: string | Date;
 };
 
+type TimelinePageResult = {
+  items: TimelineItem[];
+  totalCount: number;
+  nextCursor: string | null;
+};
+
+const encodeTimelineCursor = (index: number): string => Buffer.from(`idx:${index}`, "utf8").toString("base64");
+
+const decodeTimelineCursor = (cursor: string): number => {
+  const decoded = Buffer.from(cursor, "base64").toString("utf8");
+  const match = /^idx:(\d+)$/.exec(decoded);
+
+  if (!match) {
+    throw new Error("Invalid timeline cursor");
+  }
+
+  const index = Number(match[1]);
+  if (!Number.isSafeInteger(index)) {
+    throw new Error("Invalid timeline cursor");
+  }
+
+  return index;
+};
+
 type NudgeController = {
-  emit: (...args: any[]) => Promise<void>;
+  emit: (event: NudgeEvent, reason: string) => Promise<void>;
   resetCounters: () => void;
   status: () => unknown;
 };
@@ -86,8 +120,9 @@ type GhostHandlersDependencies = {
   setSessionManager: (sessionManager: SessionManager) => void;
   createManagedSession: (nextSessionManager: SessionManager) => Promise<AgentSession>;
   getCurrentModelValue: () => string;
+  getRuntimeMeta: () => GhostRuntimeMeta;
   nudges: NudgeController;
-  nudgeEvents: readonly string[];
+  nudgeEvents: readonly NudgeEvent[];
   listScheduleOperation: () => Promise<{ data: GhostSchedule[]; text: string }>;
   createScheduleOperation: (
     input: { cron?: string; prompt?: string; once?: boolean; timezone?: string },
@@ -111,6 +146,89 @@ const sendJson = (res: ServerResponse, status: number, body: unknown): void => {
 
 const sendJsonError = (res: ServerResponse, status: number, message: string): void => {
   sendJson(res, status, { error: message });
+};
+
+const isNudgeEvent = (value: string, nudgeEvents: readonly NudgeEvent[]): value is NudgeEvent =>
+  nudgeEvents.some((event) => event === value);
+
+const getSessionEntries = (sessionManager: SessionManager): SessionHistoryEntry[] =>
+  (
+    sessionManager as SessionManager & {
+      getEntries: () => SessionHistoryEntry[];
+    }
+  ).getEntries();
+
+const historyMessagesForMessage = (
+  message: PiAgentMessage,
+  getHistoryMessages: (messages: PiAgentMessage[]) => HistoryMessage[]
+): HistoryMessage[] => getHistoryMessages([message]);
+
+const buildTimelineItems = (
+  entries: SessionHistoryEntry[],
+  getHistoryMessages: (messages: PiAgentMessage[]) => HistoryMessage[]
+): TimelineItem[] => {
+  const items: TimelineItem[] = [];
+
+  for (const [entryIndex, entry] of entries.entries()) {
+    if (entry.type === "compaction") {
+      items.push({
+        id: `compaction:${entryIndex}`,
+        type: "compaction",
+        compaction: {
+          timestamp: entry.timestamp ?? "",
+          summary: entry.summary ?? "",
+          tokensBefore: entry.tokensBefore ?? 0
+        }
+      });
+      continue;
+    }
+
+    if (entry.type !== "message" || !entry.message) {
+      continue;
+    }
+
+    const historyMessages = historyMessagesForMessage(entry.message, getHistoryMessages);
+    for (const [messageIndex, message] of historyMessages.entries()) {
+      items.push({
+        id: `message:${entryIndex}:${messageIndex}`,
+        type: "message",
+        message
+      });
+    }
+  }
+
+  return items;
+};
+
+const paginateTimelineItems = (
+  items: TimelineItem[],
+  cursor: string | undefined,
+  limit: number | undefined
+): TimelinePageResult => {
+  const totalCount = items.length;
+  const before = cursor === undefined ? undefined : decodeTimelineCursor(cursor);
+  const boundedBefore = before === undefined ? totalCount : Math.max(0, Math.min(before, totalCount));
+  const boundedLimit = limit === undefined ? totalCount : Math.max(1, Math.min(limit, 200));
+  const startIndex = Math.max(0, boundedBefore - boundedLimit);
+
+  return {
+    items: items.slice(startIndex, boundedBefore),
+    totalCount,
+    nextCursor: startIndex > 0 ? encodeTimelineCursor(startIndex) : null
+  };
+};
+
+const parseTimelineRequest = (req: IncomingMessage): { cursor: string | undefined; limit: number | undefined } => {
+  const url = new URL(req.url ?? "/timeline", "http://localhost");
+  const limitValue = url.searchParams.get("limit");
+  const cursorValue = url.searchParams.get("cursor");
+  const limit = limitValue === null ? undefined : Number(limitValue);
+
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) {
+    throw new Error("Invalid timeline limit");
+  }
+
+  return { cursor: cursorValue === null ? undefined : cursorValue, limit };
 };
 
 const withJsonResponse = async (
@@ -234,6 +352,7 @@ export const createGhostHandlers = ({
   setSessionManager,
   createManagedSession,
   getCurrentModelValue,
+  getRuntimeMeta,
   nudges,
   nudgeEvents,
   listScheduleOperation,
@@ -246,7 +365,8 @@ export const createGhostHandlers = ({
       return;
     }
 
-    const requestBody = typeof body === "object" && body !== null ? (body as { prompt?: unknown; images?: unknown }) : {};
+    const requestBody =
+      typeof body === "object" && body !== null ? (body as { prompt?: unknown; images?: unknown }) : {};
 
     if (typeof requestBody.prompt !== "string") {
       sendJsonError(res, 400, "Missing prompt");
@@ -353,7 +473,15 @@ export const createGhostHandlers = ({
       const handler = slashCommands.get(slashCommand.command);
       if (handler) {
         await runQueued(() =>
-          streamSlashCommand(res, handler, slashCommand.args, startNdjsonResponse, sendAssistantResult, log, serializeError)
+          streamSlashCommand(
+            res,
+            handler,
+            slashCommand.args,
+            startNdjsonResponse,
+            sendAssistantResult,
+            log,
+            serializeError
+          )
         );
         return;
       }
@@ -534,71 +662,21 @@ export const createGhostHandlers = ({
     );
   };
 
-  const handleHistory = async (res: ServerResponse): Promise<void> => {
+  const handleTimeline = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     await withJsonResponse(
       res,
       log,
       serializeError,
-      "Pi history failed",
+      "Pi timeline failed",
       () => {
+        const request = parseTimelineRequest(req);
         const sessionManager = getSessionManager();
-        const entries = (
-          sessionManager as SessionManager & {
-            getEntries: () => Array<{
-              type: string;
-              message?: PiAgentMessage;
-              timestamp?: string;
-              summary?: string;
-              tokensBefore?: number;
-            }>;
-          }
-        ).getEntries();
-
-        let lastCompactionIndex = -1;
-        const compactions: CompactionInfo[] = [];
-
-        for (let i = 0; i < entries.length; i++) {
-          const entry = entries[i];
-          if (entry.type === "compaction") {
-            lastCompactionIndex = i;
-            compactions.push({
-              timestamp: entry.timestamp ?? "",
-              summary: entry.summary ?? "",
-              tokensBefore: entry.tokensBefore ?? 0
-            });
-          }
-        }
-
-        const preCompactionPiMessages: PiAgentMessage[] = [];
-        const postCompactionPiMessages: PiAgentMessage[] = [];
-
-        for (let i = 0; i < entries.length; i++) {
-          const entry = entries[i];
-          if (entry.type !== "message") {
-            continue;
-          }
-
-          const message = entry.message;
-          if (!message) {
-            continue;
-          }
-
-          if (lastCompactionIndex >= 0 && i < lastCompactionIndex) {
-            preCompactionPiMessages.push(message);
-          } else {
-            postCompactionPiMessages.push(message);
-          }
-        }
-
+        const entries = getSessionEntries(sessionManager);
         return {
-          body: {
-            messages: getHistoryMessages(postCompactionPiMessages),
-            preCompactionMessages: getHistoryMessages(preCompactionPiMessages),
-            compactions
-          }
+          body: paginateTimelineItems(buildTimelineItems(entries, getHistoryMessages), request.cursor, request.limit)
         };
       },
-      "History failed"
+      "Timeline failed"
     );
   };
 
@@ -655,6 +733,31 @@ export const createGhostHandlers = ({
     );
   };
 
+  const handleScheduleGet = async (): Promise<JsonHandlerResult> => {
+    const result = await listScheduleOperation();
+    return { body: result.data };
+  };
+
+  const handleSchedulePost = async (req: IncomingMessage): Promise<JsonHandlerResult> => {
+    const body = await parseJsonRequestBody<unknown>(req);
+    const input =
+      typeof body === "object" && body !== null
+        ? (body as { cron?: string; prompt?: string; once?: boolean; timezone?: string })
+        : {};
+    const result = await createScheduleOperation(input, { validate: false });
+    return { status: 201, body: result.data };
+  };
+
+  const handleScheduleDelete = async (req: IncomingMessage): Promise<JsonHandlerResult> => {
+    const scheduleId = req.url?.replace("/schedules/", "").trim() ?? "";
+    if (!scheduleId) {
+      return { status: 400, body: { error: "Missing schedule id" } };
+    }
+
+    const result = await deleteScheduleOperation(scheduleId);
+    return { body: result.data };
+  };
+
   const handleSchedules = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     await withJsonResponse(
       res,
@@ -662,29 +765,16 @@ export const createGhostHandlers = ({
       serializeError,
       "Pi schedules failed",
       async () => {
-        if (req.method === "GET") {
-          const result = await listScheduleOperation();
-          return { body: result.data };
+        switch (req.method) {
+          case "GET":
+            return handleScheduleGet();
+          case "POST":
+            return handleSchedulePost(req);
+          case "DELETE":
+            return handleScheduleDelete(req);
+          default:
+            return { status: 405, body: { error: "Method not allowed" } };
         }
-
-        if (req.method === "POST") {
-          const body = await parseJsonRequestBody<unknown>(req);
-          const input = typeof body === "object" && body !== null ? (body as { cron?: string; prompt?: string; once?: boolean; timezone?: string }) : {};
-          const result = await createScheduleOperation(input, { validate: false });
-          return { status: 201, body: result.data };
-        }
-
-        if (req.method === "DELETE") {
-          const scheduleId = req.url?.replace("/schedules/", "").trim() ?? "";
-          if (!scheduleId) {
-            return { status: 400, body: { error: "Missing schedule id" } };
-          }
-
-          const result = await deleteScheduleOperation(scheduleId);
-          return { body: result.data };
-        }
-
-        return { status: 405, body: { error: "Method not allowed" } };
       },
       "Schedules failed"
     );
@@ -696,13 +786,19 @@ export const createGhostHandlers = ({
       log,
       serializeError,
       "Pi commands failed",
-      () => ({
-        body: Array.from(slashCommands.values()).map(({ name, description }) => ({
-          name,
-          description
-        }))
-      }),
+      () => ({ body: getRuntimeMeta().supportedCommands }),
       "Commands failed"
+    );
+  };
+
+  const handleRuntimeMeta = async (res: ServerResponse): Promise<void> => {
+    await withJsonResponse(
+      res,
+      log,
+      serializeError,
+      "Pi runtime meta failed",
+      () => ({ body: getRuntimeMeta() }),
+      "Runtime meta failed"
     );
   };
 
@@ -724,7 +820,7 @@ export const createGhostHandlers = ({
       const event = parsed.event ?? "self";
       const reason = parsed.reason ?? "api-trigger";
 
-      if (!nudgeEvents.includes(event)) {
+      if (!isNudgeEvent(event, nudgeEvents)) {
         sendJson(res, 400, { error: `Invalid event: ${event}`, valid: nudgeEvents });
         return;
       }
@@ -817,11 +913,12 @@ export const createGhostHandlers = ({
     handleSwitchSession,
     handleRenameSession,
     handleDeleteSession,
-    handleHistory,
+    handleTimeline,
     handleCompact,
     handleStats,
     handleSchedules,
     handleCommands,
+    handleRuntimeMeta,
     handleNudgeStatus,
     handleNudge,
     handleAbort,

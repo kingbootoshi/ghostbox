@@ -8,7 +8,6 @@ import { readAuthTokens, writeAuthTokens } from "./oauth";
 import type { AuthTokenStore, ClaudeCodeTokenRecord } from "./types";
 import { getHomeDirectory } from "./utils";
 
-const SETUP_TOKEN_PATTERN = /sk-ant-[^\s"'`]+/g;
 const EXPIRY_WARNING_BUFFER_MS = 5 * 60 * 1000;
 const CLAUDE_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -101,54 +100,6 @@ async function readKeychainClaudeToken(): Promise<ClaudeCodeTokenRecord | null> 
   }
 
   return toClaudeCodeTokenRecord(parsed.claudeAiOauth, "keychain");
-}
-
-async function runSetupToken(): Promise<ClaudeCodeTokenRecord> {
-  return new Promise((resolve, reject) => {
-    const child = nodeSpawn("claude", ["setup-token"], {
-      stdio: ["inherit", "pipe", "inherit"]
-    });
-
-    const stdoutChunks: Buffer[] = [];
-
-    const clearStdoutChunks = (): void => {
-      for (const chunk of stdoutChunks) {
-        chunk.fill(0);
-      }
-      stdoutChunks.length = 0;
-    };
-
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdoutChunks.push(Buffer.from(chunk));
-    });
-
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code !== 0) {
-        clearStdoutChunks();
-        reject(new Error(`claude setup-token failed with exit code ${code ?? 1}.`));
-        return;
-      }
-
-      const stdoutBuffer = Buffer.concat(stdoutChunks);
-      const matches = stdoutBuffer.toString("utf8").match(SETUP_TOKEN_PATTERN);
-      stdoutBuffer.fill(0);
-      clearStdoutChunks();
-      const accessToken = matches?.at(-1);
-      if (!accessToken) {
-        reject(new Error("claude setup-token did not print a Claude Code token."));
-        return;
-      }
-
-      process.stdout.write("Claude Code token captured.\n");
-
-      resolve({
-        type: "claude-code",
-        accessToken,
-        source: "setup-token"
-      });
-    });
-  });
 }
 
 type TokenExchangeResponse = {

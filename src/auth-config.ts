@@ -4,13 +4,13 @@ import { dirname, join } from "node:path";
 import { createLogger } from "./logger";
 import { getConfig, getGhost, loadState, saveState, steerGhost } from "./orchestrator";
 import type {
-  GhostImage,
-  GhostStreamingBehavior,
   GhostboxConfig,
   GhostboxConfigResponse,
   GhostboxConfigSensitiveStatus,
   GhostboxConfigUpdate,
   GhostboxState,
+  GhostImage,
+  GhostStreamingBehavior,
   MailboxState,
   MailMessage
 } from "./types";
@@ -649,10 +649,7 @@ export const listMail = async (
   return { messages };
 };
 
-export const markMailRead = async (
-  id: string,
-  auth: ApiAuthContext
-): Promise<{ status: "read" }> => {
+export const markMailRead = async (id: string, auth: ApiAuthContext): Promise<{ status: "read" }> => {
   const mailboxState = await loadMailboxState();
   const message = mailboxState.messages.find((entry) => entry.id === id);
 
@@ -670,10 +667,7 @@ export const markMailRead = async (
   return { status: "read" };
 };
 
-export const deleteMail = async (
-  id: string,
-  auth: ApiAuthContext
-): Promise<{ status: "deleted" }> => {
+export const deleteMail = async (id: string, auth: ApiAuthContext): Promise<{ status: "deleted" }> => {
   const mailboxState = await loadMailboxState();
   const message = mailboxState.messages.find((entry) => entry.id === id);
 

@@ -8,7 +8,8 @@ class GlassPanel: NSPanel {
 
     init(
         contentRect: NSRect,
-        title: String = ""
+        title: String = "",
+        minimumSize: NSSize = NSSize(width: 380, height: 450)
     ) {
         super.init(
             contentRect: contentRect,
@@ -28,7 +29,7 @@ class GlassPanel: NSPanel {
         isMovableByWindowBackground = false
         animationBehavior = .none
         collectionBehavior = [.fullScreenAuxiliary]
-        minSize = NSSize(width: 380, height: 450)
+        minSize = minimumSize
         if let screen = NSScreen.main {
             maxSize = screen.frame.size
         } else {
@@ -198,6 +199,11 @@ class GlassPanel: NSPanel {
 
         return super.performKeyEquivalent(with: event)
     }
+}
+
+final class ConnectionWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
 }
 
 struct BorderlessGlass<Content: View>: View {

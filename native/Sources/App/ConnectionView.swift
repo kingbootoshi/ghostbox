@@ -1,8 +1,8 @@
 import SwiftUI
 
 struct ConnectionView: View {
-    @State private var serverURL = ""
-    @State private var serverToken = ""
+    @State private var serverURL = ConnectionConfigStore.load()?.url ?? ConnectionConfig.defaultURLString
+    @State private var serverToken = ConnectionConfigStore.load()?.token ?? ""
     @State private var isConnecting = false
     @State private var error: String?
 
@@ -31,7 +31,7 @@ struct ConnectionView: View {
                             .font(Theme.Typography.label(weight: .medium))
                             .foregroundColor(.white.opacity(Theme.Text.secondary))
 
-                        TextField("http://100.127.73.47:8008", text: $serverURL)
+                        TextField("http://your-server:8008", text: $serverURL)
                             .textFieldStyle(.plain)
                             .font(Theme.Typography.body())
                             .foregroundColor(.white.opacity(Theme.Text.primary))

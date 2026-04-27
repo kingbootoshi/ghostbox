@@ -28,6 +28,10 @@ struct GhostRow: View {
                         Text(ghost.name)
                             .font(Theme.Typography.display())
                             .foregroundColor(Theme.Colors.accentLight)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .minimumScaleFactor(0.9)
+                            .allowsTightening(true)
                     }
 
                     HStack(spacing: 6) {

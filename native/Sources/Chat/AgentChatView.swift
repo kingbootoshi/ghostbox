@@ -1,13 +1,24 @@
 import Observation
 import SwiftUI
 
-private enum ChatPanelLayout {
-    static let defaultWidth: CGFloat = 380
+enum ChatPanelLayout {
+    static let minWidth: CGFloat = 340
+    static let defaultWidth: CGFloat = 400
+    static let defaultHeight: CGFloat = 600
+    static let minHeight: CGFloat = 450
     static let vaultBrowserWidth: CGFloat = 720
 }
 
 private struct ScrollOffsetKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct TopScrollOffsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = -.greatestFiniteMagnitude
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
@@ -20,16 +31,19 @@ struct AgentChatView: View {
     @State private var expandedToolMessages: Set<UUID> = []
     @State private var fullscreenToolGroupID: UUID?
     @State private var cachedDisplayItems: [ChatDisplayItem] = []
-    @State private var cachedPreCompactionDisplayItems: [ChatDisplayItem] = []
     @State var showsVaultBrowser = false
     @State private var showHotkeyHelp = false
-    @State var slashCommands = SlashCommandPopup.fallbackSlashCommands
-    @State var didAttemptSlashCommandFetch = false
+    @State var slashCommands: [GhostSlashCommand] = []
+    @State var didAttemptSlashCommandFetchForVisiblePopup = false
+    @State var isLoadingSlashCommands = false
     @State var isSlashCommandPopupVisible = false
     @State private var expandedImage: NSImage?
     @State private var isNearBottom = true
+    @State private var shouldFollowLatest = true
     @State private var scrollViewHeight: CGFloat = 0
     @State private var hasScrolledToInitialBottom = false
+    @State private var cachedDisplaySourceIDs: [String] = []
+    @State private var pendingPrependAnchorID: String?
 
     var body: some View {
         @Bindable var input = viewModel.input
@@ -190,7 +204,6 @@ struct AgentChatView: View {
         .onAppear {
             isInputFocused = true
             rebuildDisplayItems()
-            rebuildPreCompactionDisplayItems()
         }
         .onChange(of: showsVaultBrowser) {
             isInputFocused = !showsVaultBrowser
@@ -208,11 +221,8 @@ struct AgentChatView: View {
         .onChange(of: input.inputText) {
             handleInputTextChanged()
         }
-        .onChange(of: store.messagesVersion) {
+        .onChange(of: store.timelineVersion) {
             rebuildDisplayItems()
-        }
-        .onChange(of: store.preCompactionDisplayVersion) {
-            rebuildPreCompactionDisplayItems()
         }
         .onKeyPress(.escape, action: handleEscapeKey)
         .onReceive(NotificationCenter.default.publisher(for: .toggleGhostChatFiles)) { notification in
@@ -228,7 +238,7 @@ struct AgentChatView: View {
     }
 
     private var hasEmptyState: Bool {
-        viewModel.store.messages.isEmpty
+        viewModel.store.timelineItems.isEmpty
     }
 
     private var chatContent: some View {
@@ -269,32 +279,15 @@ struct AgentChatView: View {
                         Color.clear.frame(height: 0)
                     } else {
                         LazyVStack(spacing: 20) {
-                            if viewModel.store.hasOlderMessages {
-                                loadOlderButton
-                            }
+                            topHistoryTrigger
 
-                            if !viewModel.store.preCompactionMessages.isEmpty {
-                                if viewModel.store.hasMoreOlderMessages {
-                                    showMoreButton
-                                }
-
-                                if viewModel.store.showingPreCompactionMessages {
-                                    chatItemsSection(cachedPreCompactionDisplayItems)
-
-                                    HStack(spacing: 12) {
-                                        hideOlderButton
-                                        if viewModel.store.hasMoreOlderMessages {
-                                            showMoreButton
-                                        }
-                                    }
-                                }
-
-                                CompactionDivider(summary: viewModel.store.compactionSummary)
+                            if viewModel.store.isLoadingOlderMessages {
+                                historyLoadingIndicator
                             }
 
                             chatItemsSection(cachedDisplayItems)
 
-                            if viewModel.isStreaming {
+                            if viewModel.showsTypingIndicator {
                                 GhostTypingBlock(name: viewModel.ghostName)
                                     .id(ChatScrollAnchor.typing)
                             }
@@ -312,7 +305,6 @@ struct AgentChatView: View {
                         .padding(.bottom, 16)
                     }
                 }
-                .defaultScrollAnchor(.bottom)
                 .coordinateSpace(name: "chatScroll")
                 .background {
                     GeometryReader { geo in
@@ -326,50 +318,73 @@ struct AgentChatView: View {
                     }
                 }
                 .onPreferenceChange(ScrollOffsetKey.self) { bottomY in
-                    let nearBottom = bottomY < scrollViewHeight + 150
-                    if nearBottom != isNearBottom {
-                        isNearBottom = nearBottom
-                    }
+                    updateLatestVisibility(bottomY <= scrollViewHeight + 8)
+                }
+                .onPreferenceChange(TopScrollOffsetKey.self) { topY in
+                    guard topY > -140 else { return }
+                    guard !shouldFollowLatest else { return }
+                    requestOlderHistoryIfNeeded()
                 }
                 .onAppear {
-                    if !viewModel.store.messages.isEmpty {
+                    if !viewModel.store.timelineItems.isEmpty {
                         proxy.scrollTo(ChatScrollAnchor.bottom, anchor: .bottom)
                         hasScrolledToInitialBottom = true
                     }
+                    shouldFollowLatest = true
                 }
-                .onChange(of: viewModel.store.messagesVersion) {
-                    if !hasScrolledToInitialBottom && !viewModel.store.messages.isEmpty {
+                .modifier(
+                    ScrollIntentTrackingModifier {
+                        if !isNearBottom {
+                            shouldFollowLatest = false
+                        }
+                    }
+                )
+                .modifier(
+                    ScrollBottomTrackingModifier { isBottomVisible in
+                        updateLatestVisibility(isBottomVisible)
+                    }
+                )
+                .onChange(of: viewModel.store.timelineVersion) {
+                    if preservePrependScrollPosition(using: proxy) {
+                        return
+                    }
+                    if !hasScrolledToInitialBottom && !viewModel.store.timelineItems.isEmpty {
                         DispatchQueue.main.async {
                             proxy.scrollTo(ChatScrollAnchor.bottom, anchor: .bottom)
                         }
                         hasScrolledToInitialBottom = true
+                        shouldFollowLatest = true
                         return
                     }
-                    guard isNearBottom else { return }
-                    scrollToLatest(using: proxy)
+                    guard shouldFollowLatest else { return }
+                    scrollToLatest(using: proxy, animated: !viewModel.isStreaming)
                 }
                 .onChange(of: viewModel.input.historySelectionMessageID) {
                     guard let selectionID = viewModel.input.historySelectionMessageID else { return }
+                    guard let displayID = viewModel.store.displayID(forMessageID: selectionID) else { return }
+                    shouldFollowLatest = false
                     withAnimation(.easeOut(duration: 0.2)) {
-                        proxy.scrollTo(ChatScrollAnchor.message(selectionID), anchor: .center)
+                        proxy.scrollTo(ChatScrollAnchor.message(displayID), anchor: .center)
                     }
                 }
                 .onChange(of: viewModel.isStreaming) {
-                    guard isNearBottom else { return }
-                    scrollToLatest(using: proxy)
+                    guard shouldFollowLatest else { return }
+                    scrollToLatest(using: proxy, animated: false)
                 }
                 .onChange(of: viewModel.store.sessions?.current) {
                     hasScrolledToInitialBottom = false
+                    shouldFollowLatest = true
                     scrollToLatest(using: proxy)
                 }
 
-                if !isNearBottom && !viewModel.store.messages.isEmpty {
+                if !shouldFollowLatest && !isNearBottom && !viewModel.store.messages.isEmpty {
                     Button {
+                        shouldFollowLatest = true
                         scrollToLatest(using: proxy)
                     } label: {
                         HStack(spacing: 4) {
-                            Image(systemName: "arrow.down")
-                            Text("Latest")
+                            Image(systemName: "arrow.down.circle.fill")
+                            Text("Jump to latest")
                         }
                         .font(.system(size: 11, weight: .medium))
                         .capsuleControlStyle(
@@ -448,6 +463,7 @@ struct AgentChatView: View {
     private func submitInput() {
         dismissSlashCommandPopup()
         guard !viewModel.commitHistorySelection() else { return }
+        shouldFollowLatest = true
         viewModel.send()
     }
 
@@ -549,7 +565,7 @@ struct AgentChatView: View {
             return false
         })?.id
 
-        return ForEach(items) { item in
+        ForEach(items) { item in
             ChatDisplayRow(
                 item: item,
                 ghostName: viewModel.ghostName,
@@ -571,68 +587,120 @@ struct AgentChatView: View {
     }
 
     private func rebuildDisplayItems() {
-        cachedDisplayItems = ChatDisplayItem.build(from: viewModel.store.messages)
+        let timelineItems = viewModel.store.timelineItems
+        let sourceIDs = timelineItems.map(\.id)
+
+        if sourceIDs == cachedDisplaySourceIDs, !cachedDisplayItems.isEmpty {
+            cachedDisplayItems = ChatDisplayItem.patch(existing: cachedDisplayItems, from: timelineItems)
+        } else {
+            cachedDisplayItems = ChatDisplayItem.build(from: timelineItems)
+            cachedDisplaySourceIDs = sourceIDs
+        }
     }
 
-    private func rebuildPreCompactionDisplayItems() {
-        cachedPreCompactionDisplayItems = ChatDisplayItem.build(from: viewModel.store.visiblePreCompactionMessages)
+    private var topHistoryTrigger: some View {
+        GeometryReader { geo in
+            Color.clear.preference(
+                key: TopScrollOffsetKey.self,
+                value: geo.frame(in: .named("chatScroll")).minY
+            )
+        }
+        .frame(height: 1)
     }
 
-    private var loadOlderButton: some View {
-        let count = viewModel.store.olderMessages.count
-        let batch = min(count, ConversationStore.olderMessagesBatchSize)
+    private var historyLoadingIndicator: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+                .tint(Theme.Colors.accentLight)
+            Text("Loading older messages...")
+                .font(Theme.Typography.label())
+                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 4)
+    }
 
-        return Button {
+    private var oldestLoadedTimelineItemID: String? {
+        viewModel.store.timelineItems.first?.id
+    }
+
+    private func requestOlderHistoryIfNeeded() {
+        guard pendingPrependAnchorID == nil else { return }
+
+        if viewModel.store.hasOlderMessages {
+            pendingPrependAnchorID = oldestLoadedTimelineItemID
             viewModel.store.loadOlderMessageBatch()
-            rebuildDisplayItems()
-        } label: {
-            Text("Load \(batch) older messages (\(count) total)")
-                .font(Theme.Typography.label())
-                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.horizontal, 20)
-                .padding(.vertical, 8)
         }
-        .buttonStyle(.plain)
     }
 
-    private var showMoreButton: some View {
-        let remaining = viewModel.store.preCompactionMessages.count - viewModel.store.visiblePreCompactionCount
-        let batch = min(remaining, ConversationStore.olderMessagesBatchSize)
+    private func preservePrependScrollPosition(using proxy: ScrollViewProxy) -> Bool {
+        guard let anchorID = pendingPrependAnchorID else { return false }
+        pendingPrependAnchorID = nil
 
-        return Button {
-            withAnimation(.easeOut(duration: 0.18)) {
-                viewModel.store.showMoreOlderMessages()
-            }
-        } label: {
-            Text("Show \(batch) older messages (\(remaining) total)")
-                .font(Theme.Typography.label())
-                .foregroundColor(Color.white.opacity(Theme.Text.secondary))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 20)
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var hideOlderButton: some View {
-        Button {
-            withAnimation(.easeOut(duration: 0.18)) {
-                viewModel.store.hideOlderMessages()
-            }
-        } label: {
-            Text("Hide older messages")
-                .font(Theme.Typography.label())
-                .foregroundColor(Color.white.opacity(Theme.Text.tertiary))
-                .padding(.horizontal, 20)
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func scrollToLatest(using proxy: ScrollViewProxy) {
         DispatchQueue.main.async {
-            withAnimation(.easeOut(duration: 0.2)) {
+            proxy.scrollTo(ChatScrollAnchor.message(anchorID), anchor: .top)
+        }
+
+        return true
+    }
+
+    private func scrollToLatest(using proxy: ScrollViewProxy, animated: Bool = true) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo(ChatScrollAnchor.bottom, anchor: .bottom)
+                }
+            } else {
                 proxy.scrollTo(ChatScrollAnchor.bottom, anchor: .bottom)
             }
+        }
+    }
+
+    private func updateLatestVisibility(_ isVisible: Bool) {
+        if isVisible != isNearBottom {
+            isNearBottom = isVisible
+        }
+        if isVisible {
+            shouldFollowLatest = true
+        } else if shouldFollowLatest {
+            shouldFollowLatest = false
+        }
+    }
+
+}
+
+private struct ScrollIntentTrackingModifier: ViewModifier {
+    let onUserScrollIntent: () -> Void
+
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content.onScrollPhaseChange { _, newPhase in
+                switch newPhase {
+                case .tracking, .interacting, .decelerating:
+                    onUserScrollIntent()
+                default:
+                    break
+                }
+            }
+        } else {
+            content
+        }
+    }
+}
+
+private struct ScrollBottomTrackingModifier: ViewModifier {
+    let onBottomVisibilityChanged: (Bool) -> Void
+
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content.onScrollGeometryChange(for: Bool.self) { geometry in
+                geometry.visibleRect.maxY >= geometry.contentSize.height - 8
+            } action: { _, isBottomVisible in
+                onBottomVisibilityChanged(isBottomVisible)
+            }
+        } else {
+            content
         }
     }
 }
@@ -641,8 +709,8 @@ private enum ChatScrollAnchor {
     static let typing = "chat-typing-anchor"
     static let bottom = "chat-bottom-anchor"
 
-    static func message(_ id: UUID) -> String {
-        "chat-message-\(id.uuidString)"
+    static func message(_ id: String) -> String {
+        "chat-message-\(id)"
     }
 }
 
@@ -686,6 +754,8 @@ private struct ChatDisplayRow: View {
                 onToggle: { onToggleToolGroup(group.id) },
                 onShowFullscreen: { onShowFullscreenToolGroup(group.id) }
             )
+        case .compaction(let marker, _):
+            CompactionDivider(summary: marker.summary)
         }
     }
 }
