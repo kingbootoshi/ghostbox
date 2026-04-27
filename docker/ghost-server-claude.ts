@@ -19,12 +19,15 @@ import type {
   GhostMessage,
   GhostQueueClearResponse,
   GhostQueueState,
+  GhostRuntimeCapability,
+  GhostRuntimeMeta,
   GhostSchedule,
   GhostStats,
   HistoryMessage,
-  HistoryResponse,
   SessionInfo,
-  SessionListResponse
+  SessionListResponse,
+  TimelineItem,
+  TimelineResponse
 } from "../src/types";
 
 const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || "/vault/.claude";
@@ -36,6 +39,7 @@ const GHOSTBOX_SKILL_PATH = "/opt/ghostbox/skills/ghostbox-api/SKILL.md";
 const GHOSTBOX_API_PORT = process.env.GHOSTBOX_API_PORT || "8008";
 const GHOSTBOX_HOST_BASE = `http://host.docker.internal:${GHOSTBOX_API_PORT}`;
 const GHOSTBOX_GHOST_NAME = process.env.GHOSTBOX_GHOST_NAME || "";
+const GHOSTBOX_IMAGE_VERSION = process.env.GHOSTBOX_IMAGE_VERSION?.trim() || null;
 const MEMORY_PATH = "/vault/MEMORY.md";
 const USER_PATH = "/vault/USER.md";
 const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -50,6 +54,20 @@ const defaultSystemPrompt =
   'You are a ghost agent. Your vault at /vault is your persistent memory. Use memory_write to save facts (target "memory" for notes, target "user" for user profile). Use memory_show to check your current memory. Use `qmd` to search and read vault files on demand. Before responding to complex questions, check your memory and vault first. Write findings to /vault/knowledge/. Create tools in /vault/.pi/extensions/. Everything in /vault persists across sessions. The rest of the filesystem is throwaway.';
 const memoryCharLimit = 4000;
 const userCharLimit = 2000;
+const runtimeVersion = `node/${process.version}`;
+const CLAUDE_SUPPORTED_CAPABILITIES: GhostRuntimeCapability[] = [
+  "message",
+  "steer",
+  "queue",
+  "timeline",
+  "sessions",
+  "stats",
+  "commands",
+  "compact",
+  "newSession",
+  "abort",
+  "schedules"
+];
 
 type UserTurn = {
   text: string;
@@ -667,28 +685,106 @@ const parseHistoryMessage = (line: JsonRecord): HistoryMessage | null => {
   return null;
 };
 
-const parseCompactions = (lines: JsonRecord[]): CompactionInfo[] => {
-  return lines
-    .filter((line) => line.isReplay === true && getString(line.type) === "local-command-stdout")
-    .map((line) => ({
-      timestamp: readSessionTimestamp(line, new Date()),
-      summary: extractText(line.message ?? line.content ?? line.text) || "Session compacted.",
-      tokensBefore: 0
-    }))
-    .filter((entry) => entry.summary.toLowerCase().includes("compact"));
+const parseCompaction = (line: JsonRecord): CompactionInfo | null => {
+  if (!(line.isReplay === true && getString(line.type) === "local-command-stdout")) {
+    return null;
+  }
+
+  const summary = extractText(line.message ?? line.content ?? line.text) || "Session compacted.";
+  if (!summary.toLowerCase().includes("compact")) {
+    return null;
+  }
+
+  return {
+    timestamp: readSessionTimestamp(line, new Date()),
+    summary,
+    tokensBefore: 0
+  };
 };
 
-const loadHistoryResponse = async (sessionId: string | null): Promise<HistoryResponse> => {
+const encodeTimelineCursor = (index: number): string => Buffer.from(`idx:${index}`, "utf8").toString("base64");
+
+const decodeTimelineCursor = (cursor: string): number => {
+  const decoded = Buffer.from(cursor, "base64").toString("utf8");
+  const match = /^idx:(\d+)$/.exec(decoded);
+
+  if (!match) {
+    throw new Error("Invalid timeline cursor");
+  }
+
+  const index = Number(match[1]);
+  if (!Number.isSafeInteger(index)) {
+    throw new Error("Invalid timeline cursor");
+  }
+
+  return index;
+};
+
+const paginateTimelineItems = (
+  items: TimelineItem[],
+  cursor: string | undefined,
+  limit: number | undefined
+): TimelineResponse => {
+  const totalCount = items.length;
+  const before = cursor === undefined ? undefined : decodeTimelineCursor(cursor);
+  const boundedBefore = before === undefined ? totalCount : Math.max(0, Math.min(before, totalCount));
+  const boundedLimit = limit === undefined ? totalCount : Math.max(1, Math.min(limit, 200));
+  const startIndex = Math.max(0, boundedBefore - boundedLimit);
+
+  return {
+    items: items.slice(startIndex, boundedBefore),
+    totalCount,
+    nextCursor: startIndex > 0 ? encodeTimelineCursor(startIndex) : null
+  };
+};
+
+const parseTimelineRequest = (
+  req: IncomingMessage
+): { cursor: string | undefined; limit: number | undefined } => {
+  const url = new URL(req.url ?? "/timeline", "http://localhost");
+  const limitValue = url.searchParams.get("limit");
+  const cursorValue = url.searchParams.get("cursor");
+  const limit = limitValue === null ? undefined : Number(limitValue);
+
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) {
+    throw new Error("Invalid timeline limit");
+  }
+
+  return { cursor: cursorValue === null ? undefined : cursorValue, limit };
+};
+
+const loadTimelineItems = async (sessionId: string | null): Promise<TimelineItem[]> => {
   if (!sessionId || !(await sessionFileExists(sessionId))) {
-    return { messages: [], preCompactionMessages: [], compactions: [] };
+    return [];
   }
 
   const lines = await readJsonLines(getSessionFilePath(sessionId));
-  return {
-    messages: lines.map(parseHistoryMessage).filter((message): message is HistoryMessage => message !== null),
-    preCompactionMessages: [],
-    compactions: parseCompactions(lines)
-  };
+  const items: TimelineItem[] = [];
+
+  lines.forEach((line, index) => {
+    const compaction = parseCompaction(line);
+    if (compaction) {
+      items.push({
+        id: `compaction:${index}`,
+        type: "compaction",
+        compaction
+      });
+      return;
+    }
+
+    const message = parseHistoryMessage(line);
+    if (message === null) {
+      return;
+    }
+
+    items.push({
+      id: `message:${index}`,
+      type: "message",
+      message
+    });
+  });
+
+  return items;
 };
 
 const loadSessions = async (): Promise<SessionListResponse> => {
@@ -1497,13 +1593,22 @@ const runCompactCommand = async (): Promise<string> => {
   });
 };
 
-const listSupportedCommands = (): Array<{ name: string; description: string }> => [
+const listSupportedCommands = (): GhostRuntimeMeta["supportedCommands"] => [
   { name: "/model", description: "Show or switch model: /model <provider/id>" },
   { name: "/compact", description: "Compact the current session and reduce context." },
   { name: "/new", description: "Start a fresh Claude Code session." },
-  { name: "/reload", description: "No-op for Claude Code compatibility." },
   { name: "/help", description: "List available slash commands." }
 ];
+
+const getRuntimeMeta = (): GhostRuntimeMeta => ({
+  adapter: "claude-code",
+  runtimeVersion,
+  imageVersion: GHOSTBOX_IMAGE_VERSION,
+  supportedCapabilities: [...CLAUDE_SUPPORTED_CAPABILITIES],
+  supportedCommands: listSupportedCommands(),
+  currentModel,
+  currentSessionId: currentSessionId ?? null
+});
 
 const handleSlashCommand = async (
   res: ServerResponse,
@@ -1539,7 +1644,7 @@ const handleSlashCommand = async (
   }
 
   if (slash.command === "reload") {
-    sendAssistantResult(res, "Claude Code reload is not needed.", currentSessionId ?? "");
+    sendAssistantResult(res, "Reload is not supported by the claude-code adapter.", currentSessionId ?? "");
     return true;
   }
 
@@ -1710,8 +1815,10 @@ const handleClearQueue = (res: ServerResponse): void => {
   sendJson(res, 200, response);
 };
 
-const handleHistory = async (res: ServerResponse): Promise<void> => {
-  sendJson(res, 200, await loadHistoryResponse(currentSessionId));
+const handleTimeline = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const timelineRequest = parseTimelineRequest(req);
+  const items = await loadTimelineItems(currentSessionId);
+  sendJson(res, 200, paginateTimelineItems(items, timelineRequest.cursor, timelineRequest.limit));
 };
 
 const handleSessions = async (res: ServerResponse): Promise<void> => {
@@ -1722,8 +1829,8 @@ const handleStats = async (res: ServerResponse): Promise<void> => {
   const baseStats = latestStats ? { ...latestStats } : await loadStatsFromSessionFile(currentSessionId);
 
   if (currentSessionId && (await sessionFileExists(currentSessionId))) {
-    const history = await loadHistoryResponse(currentSessionId);
-    baseStats.messageCount = history.messages.length;
+    const timeline = await loadTimelineItems(currentSessionId);
+    baseStats.messageCount = timeline.filter((item) => item.type === "message").length;
   }
 
   sendJson(res, 200, {
@@ -1767,7 +1874,7 @@ const handleTaskKill = (res: ServerResponse): void => {
 };
 
 const handleReload = (res: ServerResponse): void => {
-  sendJson(res, 200, { status: "reloaded", warning: "No-op for claude-code adapter." });
+  sendJson(res, 501, { error: "Reload is not supported by the claude-code adapter." });
 };
 
 const handleSwitchSession = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -1936,15 +2043,19 @@ const handleSchedules = async (req: IncomingMessage, res: ServerResponse): Promi
 };
 
 const handleNudgeStatus = (res: ServerResponse): void => {
-  sendJson(res, 200, { supported: false, status: "unsupported" });
+  sendJson(res, 501, { error: "Nudge status is not supported by the claude-code adapter." });
 };
 
 const handleNudge = (res: ServerResponse): void => {
-  sendJson(res, 200, { ok: true, warning: "Nudges are not supported by the claude-code adapter." });
+  sendJson(res, 501, { error: "Nudges are not supported by the claude-code adapter." });
 };
 
 const handleCommands = (res: ServerResponse): void => {
-  sendJson(res, 200, listSupportedCommands());
+  sendJson(res, 200, getRuntimeMeta().supportedCommands);
+};
+
+const handleRuntimeMeta = (res: ServerResponse): void => {
+  sendJson(res, 200, getRuntimeMeta());
 };
 
 const authenticateRequest = (req: IncomingMessage, res: ServerResponse): boolean => {
@@ -1998,8 +2109,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
-  if (req.method === "GET" && req.url === "/history") {
-    await handleHistory(res);
+  if (req.method === "GET" && req.url?.startsWith("/timeline")) {
+    await handleTimeline(req, res);
     return;
   }
 
@@ -2074,6 +2185,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
 
   if (req.method === "GET" && req.url === "/commands") {
     handleCommands(res);
+    return;
+  }
+
+  if (req.method === "GET" && req.url === "/runtime/meta") {
+    handleRuntimeMeta(res);
     return;
   }
 

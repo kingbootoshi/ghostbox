@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import http from "node:http";
 
@@ -17,6 +17,8 @@ import { createGhostMemory, NUDGE_EVENTS, NudgeRegistry, registerDefaultNudgeHan
 import type {
   GhostImage,
   GhostMessage,
+  GhostRuntimeCapability,
+  GhostRuntimeMeta,
   GhostSchedule,
   GhostStreamingBehavior,
   HistoryMessage,
@@ -71,6 +73,8 @@ const buildSystemPrompt = (): string => {
 const hostApiPort = process.env.GHOSTBOX_API_PORT || "8008";
 const ghostName = process.env.GHOSTBOX_GHOST_NAME || "";
 const ghostApiKey = process.env.GHOST_API_KEY || "";
+const imageVersion = process.env.GHOSTBOX_IMAGE_VERSION?.trim() || null;
+const runtimeVersion = `node/${process.version}`;
 
 type ScheduleToolParams = {
   action: "create" | "list" | "delete";
@@ -167,6 +171,23 @@ const settingsPath = "/root/.pi/agent/settings.json";
 const defaultModelContextWindow = 200000;
 const defaultReserveTokens = 16384;
 const keepRecentTokens = 20000;
+const PI_SUPPORTED_CAPABILITIES: GhostRuntimeCapability[] = [
+  "message",
+  "steer",
+  "queue",
+  "timeline",
+  "sessions",
+  "stats",
+  "commands",
+  "compact",
+  "newSession",
+  "abort",
+  "reload",
+  "backgroundTaskKill",
+  "nudge",
+  "nudgeStatus",
+  "schedules"
+];
 
 type LogContext = Record<string, unknown>;
 
@@ -1431,6 +1452,19 @@ const registerSlashCommand = (command: SlashCommand): void => {
   slashCommands.set(key, command);
 };
 
+const getRuntimeMeta = (): GhostRuntimeMeta => ({
+  adapter: "pi",
+  runtimeVersion,
+  imageVersion,
+  supportedCapabilities: [...PI_SUPPORTED_CAPABILITIES],
+  supportedCommands: Array.from(slashCommands.values()).map(({ name, description }) => ({
+    name,
+    description
+  })),
+  currentModel: currentModelValue === "default" ? (startupModelValue ?? null) : currentModelValue,
+  currentSessionId: session.sessionId
+});
+
 const nudges = new NudgeRegistry(log, serializeError);
 const { flushMemories, runMemoryObserver } = createGhostMemory({
   log,
@@ -1653,6 +1687,7 @@ const handlers = createGhostHandlers({
   },
   createManagedSession,
   getCurrentModelValue: () => currentModelValue,
+  getRuntimeMeta,
   nudges,
   nudgeEvents: NUDGE_EVENTS,
   listScheduleOperation,
@@ -1709,8 +1744,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
-  if (req.method === "GET" && req.url === "/history") {
-    await handlers.handleHistory(res);
+  if (req.method === "GET" && req.url?.startsWith("/timeline")) {
+    await handlers.handleTimeline(req, res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
@@ -1739,6 +1774,12 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
 
   if (req.method === "GET" && req.url === "/commands") {
     await handlers.handleCommands(res);
+    log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
+    return;
+  }
+
+  if (req.method === "GET" && req.url === "/runtime/meta") {
+    await handlers.handleRuntimeMeta(res);
     log.info("Response sent", { method: req.method, url: req.url, status: res.statusCode });
     return;
   }
