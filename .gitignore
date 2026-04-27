@@ -6,7 +6,14 @@ docker/ghost-server.js
 .tmp/
 .DS_Store
 handoffs/
-native/Ghostbox.xcodeproj/
+native/Ghostbox.xcodeproj/**
+!native/Ghostbox.xcodeproj/project.xcworkspace/
+native/Ghostbox.xcodeproj/project.xcworkspace/*
+!native/Ghostbox.xcodeproj/project.xcworkspace/xcshareddata/
+native/Ghostbox.xcodeproj/project.xcworkspace/xcshareddata/*
+!native/Ghostbox.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+native/Ghostbox.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/*
+!native/Ghostbox.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 autoresearch-results.tsv
 .superpowers/
 native/build/
