@@ -1344,7 +1344,12 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: UserTurn[]): Pr
 
   const state = createStreamState();
   const stdoutDecoder = new StringDecoder("utf8");
-  activeTurn = {
+  // Capture the turn instance locally. Every handler below references `turn`
+  // (not the global `activeTurn`) so that if a stale turn's stdout/close
+  // handlers fire after a new turn has already been spawned, they cannot
+  // corrupt the new turn's state. The global `activeTurn` is only mutated
+  // when `activeTurn === turn` (i.e., this turn is still the live one).
+  const turn: ActiveTurn = {
     child,
     heartbeat: startHeartbeat(res),
     buffer: "",
@@ -1353,19 +1358,22 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: UserTurn[]): Pr
     snapshotPrompt,
     snapshotPersisted
   };
+  activeTurn = turn;
 
   child.stderr.on("data", (chunk: Buffer) => {
     process.stderr.write(chunk);
   });
 
   child.stdout.on("data", (chunk: Buffer) => {
-    if (!activeTurn) {
+    // Drop any data from a turn that is no longer the live turn — its
+    // handlers may still be running while a fresh turn owns the stream.
+    if (activeTurn !== turn) {
       return;
     }
 
-    activeTurn.buffer += stdoutDecoder.write(chunk);
-    const lines = activeTurn.buffer.split("\n");
-    activeTurn.buffer = lines.pop() ?? "";
+    turn.buffer += stdoutDecoder.write(chunk);
+    const lines = turn.buffer.split("\n");
+    turn.buffer = lines.pop() ?? "";
 
     for (const rawLine of lines) {
       const trimmed = rawLine.trim();
@@ -1383,9 +1391,19 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: UserTurn[]): Pr
               sessionId: currentSessionId ?? ""
             });
           });
-          activeTurn.finished = true;
+          turn.finished = true;
           if (!res.writableEnded) {
             res.end();
+          }
+          // Force the claude subprocess to exit so child.on('close') fires and
+          // clearActiveTurn() runs. Without this, a claude process that hangs
+          // after emitting its result event leaves activeTurn stuck forever,
+          // and every subsequent /message silently queues. Observed in
+          // production: PID 2156 hung 56h post-result on 2026-04-29.
+          try {
+            turn.child.kill("SIGTERM");
+          } catch {
+            // Already dead or kill failed; close handler will still fire.
           }
         }
       } catch (error) {
@@ -1407,16 +1425,19 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: UserTurn[]): Pr
       });
       res.end();
     }
-    clearActiveTurn();
+    if (activeTurn === turn) {
+      clearActiveTurn();
+    }
   });
 
   child.on("close", async (code) => {
-    if (activeTurn) {
-      activeTurn.buffer += stdoutDecoder.end();
-    }
+    turn.buffer += stdoutDecoder.end();
 
-    const trailingLine = activeTurn?.buffer.trim();
-    if (trailingLine) {
+    const trailingLine = turn.buffer.trim();
+    // Only parse trailing output if this turn is still the live one.
+    // A stale turn's trailing buffer could otherwise overwrite the new turn's
+    // currentSessionId or stream state via handleClaudeStreamLine.
+    if (trailingLine && activeTurn === turn) {
       try {
         const parsed = JSON.parse(trailingLine) as JsonRecord;
         handleClaudeStreamLine(res, parsed, state);
@@ -1428,18 +1449,21 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: UserTurn[]): Pr
       }
     }
 
-    await persistPendingSessionSnapshot(currentSessionId).catch((error) => {
-      log("ERROR", "Failed to persist final session snapshot", {
-        sessionId: currentSessionId ?? "",
-        error: error instanceof Error ? error.message : String(error)
+    if (activeTurn === turn) {
+      await persistPendingSessionSnapshot(currentSessionId).catch((error) => {
+        log("ERROR", "Failed to persist final session snapshot", {
+          sessionId: currentSessionId ?? "",
+          error: error instanceof Error ? error.message : String(error)
+        });
       });
-    });
-
-    if (activeTurn?.heartbeat) {
-      clearInterval(activeTurn.heartbeat);
     }
 
-    if (!res.writableEnded) {
+    // Always clear this turn's heartbeat — it belongs to this turn alone.
+    if (turn.heartbeat) {
+      clearInterval(turn.heartbeat);
+    }
+
+    if (activeTurn === turn && !res.writableEnded) {
       if ((code ?? 0) !== 0 && !state.receivedResultEvent) {
         const message = `Claude subprocess exited with code ${code ?? 1}.`;
         log("ERROR", message, { sessionId: currentSessionId ?? "" });
@@ -1464,7 +1488,9 @@ const spawnClaudeMessage = async (res: ServerResponse, messages: UserTurn[]): Pr
       res.end();
     }
 
-    clearActiveTurn();
+    if (activeTurn === turn) {
+      clearActiveTurn();
+    }
   });
 
   for (const message of messages) {
@@ -1745,15 +1771,37 @@ const handleMessage = async (req: IncomingMessage, res: ServerResponse): Promise
   }
 
   if (activeTurn) {
-    queue.messages.push(userTurn);
-    startNdjsonResponse(res);
-    sendJsonLine(res, {
-      type: "result",
-      text: "Queued for next turn.",
-      sessionId: currentSessionId ?? ""
-    });
-    res.end();
-    return;
+    // Defensive: if the prior turn already emitted its result but the child
+    // never exited (so close handler never fired), force-clear and proceed.
+    // This prevents the silent-queue-forever failure mode we hit on
+    // 2026-04-29 when PID 2156 hung post-result.
+    if (activeTurn.finished) {
+      log("ERROR", "Force-clearing stale activeTurn (finished but child stuck)", {
+        sessionId: currentSessionId ?? "",
+        childPid: activeTurn.child.pid ?? 0
+      });
+      try {
+        activeTurn.child.kill("SIGKILL");
+      } catch {
+        // Already dead.
+      }
+      clearActiveTurn();
+    } else {
+      log("INFO", "Message queued while turn in progress", {
+        sessionId: currentSessionId ?? "",
+        queueLength: queue.messages.length + 1,
+        childPid: activeTurn.child.pid ?? 0
+      });
+      queue.messages.push(userTurn);
+      startNdjsonResponse(res);
+      sendJsonLine(res, {
+        type: "result",
+        text: "Queued for next turn.",
+        sessionId: currentSessionId ?? ""
+      });
+      res.end();
+      return;
+    }
   }
 
   const queuedMessages = [...queue.messages];

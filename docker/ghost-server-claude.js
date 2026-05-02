@@ -1012,7 +1012,7 @@ var spawnClaudeMessage = async (res, messages) => {
   });
   const state = createStreamState();
   const stdoutDecoder = new StringDecoder("utf8");
-  activeTurn = {
+  const turn = {
     child,
     heartbeat: startHeartbeat(res),
     buffer: "",
@@ -1021,17 +1021,18 @@ var spawnClaudeMessage = async (res, messages) => {
     snapshotPrompt,
     snapshotPersisted
   };
+  activeTurn = turn;
   child.stderr.on("data", (chunk) => {
     process.stderr.write(chunk);
   });
   child.stdout.on("data", (chunk) => {
-    if (!activeTurn) {
+    if (activeTurn !== turn) {
       return;
     }
-    activeTurn.buffer += stdoutDecoder.write(chunk);
-    const lines = activeTurn.buffer.split(`
+    turn.buffer += stdoutDecoder.write(chunk);
+    const lines = turn.buffer.split(`
 `);
-    activeTurn.buffer = lines.pop() ?? "";
+    turn.buffer = lines.pop() ?? "";
     for (const rawLine of lines) {
       const trimmed = rawLine.trim();
       if (!trimmed) {
@@ -1047,10 +1048,13 @@ var spawnClaudeMessage = async (res, messages) => {
               sessionId: currentSessionId ?? ""
             });
           });
-          activeTurn.finished = true;
+          turn.finished = true;
           if (!res.writableEnded) {
             res.end();
           }
+          try {
+            turn.child.kill("SIGTERM");
+          } catch {}
         }
       } catch (error) {
         log("ERROR", "Failed to parse Claude stream line", {
@@ -1070,14 +1074,14 @@ var spawnClaudeMessage = async (res, messages) => {
       });
       res.end();
     }
-    clearActiveTurn();
+    if (activeTurn === turn) {
+      clearActiveTurn();
+    }
   });
   child.on("close", async (code) => {
-    if (activeTurn) {
-      activeTurn.buffer += stdoutDecoder.end();
-    }
-    const trailingLine = activeTurn?.buffer.trim();
-    if (trailingLine) {
+    turn.buffer += stdoutDecoder.end();
+    const trailingLine = turn.buffer.trim();
+    if (trailingLine && activeTurn === turn) {
       try {
         const parsed = JSON.parse(trailingLine);
         handleClaudeStreamLine(res, parsed, state);
@@ -1088,16 +1092,18 @@ var spawnClaudeMessage = async (res, messages) => {
         });
       }
     }
-    await persistPendingSessionSnapshot(currentSessionId).catch((error) => {
-      log("ERROR", "Failed to persist final session snapshot", {
-        sessionId: currentSessionId ?? "",
-        error: error instanceof Error ? error.message : String(error)
+    if (activeTurn === turn) {
+      await persistPendingSessionSnapshot(currentSessionId).catch((error) => {
+        log("ERROR", "Failed to persist final session snapshot", {
+          sessionId: currentSessionId ?? "",
+          error: error instanceof Error ? error.message : String(error)
+        });
       });
-    });
-    if (activeTurn?.heartbeat) {
-      clearInterval(activeTurn.heartbeat);
     }
-    if (!res.writableEnded) {
+    if (turn.heartbeat) {
+      clearInterval(turn.heartbeat);
+    }
+    if (activeTurn === turn && !res.writableEnded) {
       if ((code ?? 0) !== 0 && !state.receivedResultEvent) {
         const message = `Claude subprocess exited with code ${code ?? 1}.`;
         log("ERROR", message, { sessionId: currentSessionId ?? "" });
@@ -1120,7 +1126,9 @@ var spawnClaudeMessage = async (res, messages) => {
       });
       res.end();
     }
-    clearActiveTurn();
+    if (activeTurn === turn) {
+      clearActiveTurn();
+    }
   });
   for (const message of messages) {
     child.stdin.write(createUserTurn(message.text, message.images));
@@ -1355,15 +1363,31 @@ var handleMessage = async (req, res) => {
     return;
   }
   if (activeTurn) {
-    queue.messages.push(userTurn);
-    startNdjsonResponse(res);
-    sendJsonLine(res, {
-      type: "result",
-      text: "Queued for next turn.",
-      sessionId: currentSessionId ?? ""
-    });
-    res.end();
-    return;
+    if (activeTurn.finished) {
+      log("ERROR", "Force-clearing stale activeTurn (finished but child stuck)", {
+        sessionId: currentSessionId ?? "",
+        childPid: activeTurn.child.pid ?? 0
+      });
+      try {
+        activeTurn.child.kill("SIGKILL");
+      } catch {}
+      clearActiveTurn();
+    } else {
+      log("INFO", "Message queued while turn in progress", {
+        sessionId: currentSessionId ?? "",
+        queueLength: queue.messages.length + 1,
+        childPid: activeTurn.child.pid ?? 0
+      });
+      queue.messages.push(userTurn);
+      startNdjsonResponse(res);
+      sendJsonLine(res, {
+        type: "result",
+        text: "Queued for next turn.",
+        sessionId: currentSessionId ?? ""
+      });
+      res.end();
+      return;
+    }
   }
   const queuedMessages = [...queue.messages];
   queue.messages = [];
