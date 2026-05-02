@@ -39,6 +39,11 @@ const CRON_FIELD_RANGES: Array<{ name: CronFieldName; min: number; max: number }
 
 const SYSTEM_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 const MAX_CRON_SEARCH_MINUTES = 366 * 24 * 60;
+// Long operational cap for scheduled prompts. Real ghost workloads (e.g.,
+// GREED's news-ingestion scans) routinely run 10-30 minutes; allow up to two
+// hours before declaring the turn stuck. On timeout, sendMessage will abort
+// the ghost so its activeTurn cleans up.
+const SCHEDULED_PROMPT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 
 const createApiError = (status: ApiStatusCode, message: string): Error & { status: ApiStatusCode } => {
   const error = new Error(message) as Error & { status: ApiStatusCode };
@@ -416,14 +421,14 @@ const dispatchScheduledPrompt = async (schedule: GhostSchedule): Promise<void> =
     await wakeGhost(schedule.ghostName);
   }
 
-  void (async () => {
-    try {
-      for await (const _message of sendMessage(schedule.ghostName, schedule.prompt)) {
-      }
-    } catch (error) {
-      log.error({ err: error, scheduleId: schedule.id, ghostName: schedule.ghostName }, "Scheduled prompt failed");
-    }
-  })();
+  // Await the full turn so processDueSchedules only advances lastFired and
+  // nextFire after the ghost actually completed (or failed). Previously this
+  // detached the turn via void(async () => ...), which meant schedule state
+  // lied about success and any error was logged but not surfaced upstream.
+  for await (const _message of sendMessage(schedule.ghostName, schedule.prompt, undefined, undefined, undefined, {
+    timeoutMs: SCHEDULED_PROMPT_TIMEOUT_MS
+  })) {
+  }
 };
 
 export const scheduleManager = new ScheduleManager(dispatchScheduledPrompt);

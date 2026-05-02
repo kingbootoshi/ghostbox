@@ -31,6 +31,14 @@ import { commitVault, getVaultPath, initVault, mergeVaults } from "./vault";
 
 const defaultImageName = "ghostbox-agent";
 const defaultProvider = "anthropic";
+const DEFAULT_GHOST_MESSAGE_TIMEOUT_MS = 1_800_000;
+
+type SendMessageOptions = {
+  timeoutMs?: number | null;
+  abortOnTimeout?: boolean;
+};
+
+const isTimeoutError = (error: unknown): boolean => error instanceof DOMException && error.name === "TimeoutError";
 
 type HistoryRequestOptions = {
   limit?: number;
@@ -943,63 +951,80 @@ export const sendMessage = async function* (
   prompt: string,
   model?: string,
   images?: GhostImage[],
-  streamingBehavior?: GhostStreamingBehavior
+  streamingBehavior?: GhostStreamingBehavior,
+  options: SendMessageOptions = {}
 ): AsyncGenerator<GhostMessage> {
-  const response = await callGhost(name, "/message", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      prompt,
-      ...(model ? { model } : {}),
-      ...(images ? { images } : {}),
-      ...(streamingBehavior ? { streamingBehavior } : {})
-    }),
-    signal: AbortSignal.timeout(1_800_000),
-    errorMessage: "Ghost message request failed",
-    decodeError: false
-  });
+  const timeoutMs = options.timeoutMs === undefined ? DEFAULT_GHOST_MESSAGE_TIMEOUT_MS : options.timeoutMs;
+  const abortOnTimeout = options.abortOnTimeout !== false;
 
-  if (!response.body) {
-    throw new Error("Ghost message response did not include a body.");
-  }
+  try {
+    const response = await callGhost(name, "/message", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        prompt,
+        ...(model ? { model } : {}),
+        ...(images ? { images } : {}),
+        ...(streamingBehavior ? { streamingBehavior } : {})
+      }),
+      ...(timeoutMs && timeoutMs > 0 ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+      errorMessage: "Ghost message request failed",
+      decodeError: false
+    });
 
-  const decoder = new TextDecoder();
-  const reader = response.body.getReader();
-  let buffer = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
+    if (!response.body) {
+      throw new Error("Ghost message response did not include a body.");
     }
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
+    const decoder = new TextDecoder();
+    const reader = response.body.getReader();
+    let buffer = "";
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.length === 0) continue;
-      const message = parseGhostMessage(trimmed);
-      if (message.type === "heartbeat") continue;
-      if (message.type === "result" && message.sessionId) {
-        publishMessageCompletedEvent(name, message.sessionId, message.text.slice(0, 240));
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
       }
-      yield message;
-    }
-  }
 
-  const finalLine = buffer.trim();
-  if (finalLine.length > 0) {
-    const message = parseGhostMessage(finalLine);
-    if (message.type !== "heartbeat") {
-      if (message.type === "result" && message.sessionId) {
-        publishMessageCompletedEvent(name, message.sessionId, message.text.slice(0, 240));
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.length === 0) continue;
+        const message = parseGhostMessage(trimmed);
+        if (message.type === "heartbeat") continue;
+        if (message.type === "result" && message.sessionId) {
+          publishMessageCompletedEvent(name, message.sessionId, message.text.slice(0, 240));
+        }
+        yield message;
       }
-      yield message;
     }
+
+    const finalLine = buffer.trim();
+    if (finalLine.length > 0) {
+      const message = parseGhostMessage(finalLine);
+      if (message.type !== "heartbeat") {
+        if (message.type === "result" && message.sessionId) {
+          publishMessageCompletedEvent(name, message.sessionId, message.text.slice(0, 240));
+        }
+        yield message;
+      }
+    }
+  } catch (error) {
+    // When the host fetch times out, the in-container subprocess keeps
+    // running. Tell the ghost to /abort so it cleans up its activeTurn,
+    // otherwise the next /message would queue against a stuck turn until
+    // the post-result kill (commit 446cfd8) catches it.
+    if (isTimeoutError(error) && abortOnTimeout) {
+      await abortGhost(name).catch((abortError) => {
+        log.error({ name, err: abortError }, "Ghost abort after message timeout failed");
+      });
+    }
+    throw error;
   }
 };
 
