@@ -592,6 +592,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         "preview": preview,
                     ]
                 )
+            case .ghostTurnMessage(let id, let ghostName, let sessionId, let role, let text, let sequence, let completedAt):
+                storeRealtimeCursor(id)
+
+                if !isGhostPanelVisible(ghostName: ghostName), role == "assistant", !text.isEmpty {
+                    appState.markUnread(ghostName)
+                    deliverGhostNotification(ghostName: ghostName, preview: text)
+                }
+
+                var userInfo: [String: Any] = [
+                    "ghostName": ghostName,
+                    "type": "ghost.turn-message",
+                    "sessionId": sessionId,
+                    "role": role,
+                    "text": text,
+                    "sequence": sequence,
+                ]
+                if let completedAt {
+                    userInfo["completedAt"] = completedAt
+                }
+
+                NotificationCenter.default.post(
+                    name: .ghostRealtimeEvent,
+                    object: nil,
+                    userInfo: userInfo
+                )
             }
         }
     }

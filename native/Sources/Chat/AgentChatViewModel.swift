@@ -37,6 +37,8 @@ final class AgentChatViewModel {
     @ObservationIgnored private var hasLoadedInitialState = false
     @ObservationIgnored private var isPreparingForOpening = false
     @ObservationIgnored private var realtimeObserver: NSObjectProtocol?
+    @ObservationIgnored private var lastTurnSessionId: String?
+    @ObservationIgnored private var lastTurnSequenceBySession: [String: Int] = [:]
 
     init(ghostName: String, client: GhostboxClient, initialGhost: Ghost? = nil) {
         self.ghostName = ghostName
@@ -609,6 +611,13 @@ final class AgentChatViewModel {
 
                     streamFinished = true
                     flushAssistantMessage()
+                case .queued:
+                    let jobId = event.queueJobId ?? "queued"
+                    store.appendMessage(ChatMessage(role: .system, content: "Queued for next turn (\(jobId))."))
+                    streamFinished = true
+                case .aborted, .rejected:
+                    store.appendMessage(ChatMessage(role: .system, content: event.reason ?? "Turn did not run."))
+                    streamFinished = true
                 }
             }
         } catch is CancellationError {
@@ -708,6 +717,53 @@ final class AgentChatViewModel {
         let ghost = notification.userInfo?["ghost"] as? Ghost
 
         guard !isStreaming, !isWakingGhost, !store.isCreatingSession, !store.isCompacting else { return }
+
+        if eventType == "ghost.turn-message" {
+            let role = notification.userInfo?["role"] as? String
+            let text = notification.userInfo?["text"] as? String ?? ""
+            let sequence = notification.userInfo?["sequence"] as? Int
+            let completedAt = notification.userInfo?["completedAt"]
+
+            if let currentSession = store.sessions?.current,
+               let eventSessionId,
+               currentSession != eventSessionId {
+                _ = await store.loadSessions()
+                await store.loadStats()
+                await loadGhost()
+                return
+            }
+
+            if text.isEmpty {
+                if completedAt != nil {
+                    await loadGhost()
+                    await store.loadStats()
+                }
+                return
+            }
+
+            if role == "assistant" {
+                let sessionKey = eventSessionId ?? store.sessions?.current ?? ""
+                let currentSequence = sequence ?? 0
+                let lastSequence = lastTurnSequenceBySession[sessionKey] ?? 0
+                let startsNewTurn = lastTurnSessionId != sessionKey || currentSequence == 1 || currentSequence < lastSequence
+
+                if !startsNewTurn, let last = store.lastMessage(), last.role == .ghost {
+                    store.updateMessage(id: last.id, with: last.updatingContent(last.content + text))
+                } else {
+                    store.appendMessage(ChatMessage(role: .ghost, content: text))
+                }
+                lastTurnSessionId = sessionKey
+                lastTurnSequenceBySession[sessionKey] = currentSequence
+            } else {
+                store.appendMessage(ChatMessage(role: .system, content: text))
+            }
+
+            if completedAt != nil {
+                await loadGhost()
+                await store.loadStats()
+            }
+            return
+        }
 
         if eventType == "ghost.remove" {
             store.ghost = nil

@@ -13,6 +13,9 @@ struct GhostMessage: Decodable {
     let input: AnyCodable?
     let output: AnyCodable?
     let sessionId: String?
+    let queueJobId: String?
+    let position: Int?
+    let reason: String?
 
     enum MessageType: String, Codable {
         case assistant
@@ -20,6 +23,9 @@ struct GhostMessage: Decodable {
         case tool_use
         case tool_result
         case result
+        case queued
+        case aborted
+        case rejected
     }
 }
 

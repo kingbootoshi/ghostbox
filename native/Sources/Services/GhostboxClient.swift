@@ -144,6 +144,10 @@ private struct GhostboxRealtimeEnvelope: Decodable {
     let ghost: Ghost?
     let sessionId: String?
     let preview: String?
+    let role: String?
+    let text: String?
+    let sequence: Int?
+    let completedAt: String?
 }
 
 enum GhostboxRealtimeEvent {
@@ -151,13 +155,15 @@ enum GhostboxRealtimeEvent {
     case ghostUpsert(id: String, ghost: Ghost)
     case ghostRemove(id: String, ghostName: String)
     case messageCompleted(id: String, ghostName: String, sessionId: String, preview: String)
+    case ghostTurnMessage(id: String, ghostName: String, sessionId: String, role: String, text: String, sequence: Int, completedAt: String?)
 
     var id: String {
         switch self {
         case .snapshot(let id, _),
              .ghostUpsert(let id, _),
              .ghostRemove(let id, _),
-             .messageCompleted(let id, _, _, _):
+             .messageCompleted(let id, _, _, _),
+             .ghostTurnMessage(let id, _, _, _, _, _, _):
             return id
         }
     }
@@ -714,6 +720,23 @@ final class GhostboxClient {
                 ghostName: ghostName,
                 sessionId: sessionId,
                 preview: envelope.preview ?? ""
+            )
+        case "ghost.turn-message":
+            guard let ghostName = envelope.ghostName,
+                  let sessionId = envelope.sessionId,
+                  let role = envelope.role,
+                  let text = envelope.text,
+                  let sequence = envelope.sequence else {
+                return nil
+            }
+            return .ghostTurnMessage(
+                id: envelope.id,
+                ghostName: ghostName,
+                sessionId: sessionId,
+                role: role,
+                text: text,
+                sequence: sequence,
+                completedAt: envelope.completedAt
             )
         default:
             return nil
