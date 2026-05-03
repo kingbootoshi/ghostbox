@@ -84,6 +84,36 @@ export const publishMessageCompletedEvent = (ghostName: string, sessionId: strin
   return event;
 };
 
+export const publishGhostTurnMessageEvent = (
+  ghostName: string,
+  event: Omit<Extract<RealtimeEvent, { type: "ghost.turn-message" }>, "id" | "at" | "type" | "ghostName">
+): QueuedEvent => {
+  const queuedEvent: QueuedEvent = {
+    id: nextId(),
+    at: new Date().toISOString(),
+    type: "ghost.turn-message",
+    ghostName,
+    ...event
+  };
+  queueEvent(queuedEvent);
+  return queuedEvent;
+};
+
+export const publishGhostTurnCompleteEvent = (
+  ghostName: string,
+  event: Omit<Extract<RealtimeEvent, { type: "ghost.turn-complete" }>, "id" | "at" | "type" | "ghostName">
+): QueuedEvent => {
+  const queuedEvent: QueuedEvent = {
+    id: nextId(),
+    at: new Date().toISOString(),
+    type: "ghost.turn-complete",
+    ghostName,
+    ...event
+  };
+  queueEvent(queuedEvent);
+  return queuedEvent;
+};
+
 export const createRealtimeSubscription = (
   ghosts: Record<string, GhostState>,
   afterId: string | null | undefined

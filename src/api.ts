@@ -55,7 +55,11 @@ import {
   updateGhost,
   wakeGhost
 } from "./orchestrator";
-import { createRealtimeSubscription } from "./realtime-events";
+import {
+  createRealtimeSubscription,
+  publishGhostTurnCompleteEvent,
+  publishGhostTurnMessageEvent
+} from "./realtime-events";
 import { scheduleManager } from "./schedule-manager";
 import type { GhostboxConfig, GhostboxConfigUpdate, GhostState, RealtimeEvent } from "./types";
 import { commitVault } from "./vault";
@@ -100,6 +104,11 @@ type MessageBody = {
   model?: unknown;
   images?: unknown;
   streamingBehavior?: unknown;
+};
+
+type InternalRealtimePublishBody = {
+  ghostName?: unknown;
+  event?: unknown;
 };
 
 type SteerBody = {
@@ -292,6 +301,81 @@ const eventMatchesAuth = (event: RealtimeEvent, auth: ApiAuthContext): boolean =
   return "ghostName" in event && event.ghostName === auth.ghostName;
 };
 
+const normalizeInternalRealtimeEvent = (
+  ghostName: string,
+  event: unknown
+): Extract<RealtimeEvent, { type: "ghost.turn-message" | "ghost.turn-complete" }> => {
+  if (typeof event !== "object" || event === null || Array.isArray(event)) {
+    throw new ApiError(400, "Invalid realtime event");
+  }
+
+  const record = event as Record<string, unknown>;
+
+  if (record.type === "ghost.turn-message") {
+    const role = record.role;
+    if (
+      typeof record.sessionId !== "string" ||
+      (role !== "assistant" && role !== "system") ||
+      typeof record.text !== "string" ||
+      typeof record.sequence !== "number" ||
+      !Number.isSafeInteger(record.sequence)
+    ) {
+      throw new ApiError(400, "Invalid realtime event");
+    }
+
+    return {
+      id: "",
+      at: "",
+      type: "ghost.turn-message",
+      ghostName,
+      sessionId: record.sessionId,
+      role,
+      text: record.text,
+      sequence: record.sequence,
+      ...(typeof record.completedAt === "string" ? { completedAt: record.completedAt } : {})
+    };
+  }
+
+  if (record.type === "ghost.turn-complete") {
+    const originator = record.originator;
+    const outcome = record.outcome;
+    if (
+      typeof record.turnId !== "string" ||
+      typeof record.sessionId !== "string" ||
+      typeof record.agentName !== "string" ||
+      (originator !== "user" && originator !== "schedule" && originator !== "internal") ||
+      (outcome !== "result" &&
+        outcome !== "idle_timeout" &&
+        outcome !== "wallclock_timeout" &&
+        outcome !== "subprocess_error" &&
+        outcome !== "host_aborted") ||
+      typeof record.durationMs !== "number" ||
+      typeof record.bytesStreamed !== "number" ||
+      typeof record.queueDepthAtStart !== "number"
+    ) {
+      throw new ApiError(400, "Invalid realtime event");
+    }
+
+    return {
+      id: "",
+      at: "",
+      type: "ghost.turn-complete",
+      ghostName,
+      turnId: record.turnId,
+      sessionId: record.sessionId,
+      agentName: record.agentName,
+      originator,
+      durationMs: record.durationMs,
+      outcome,
+      lastStdoutAt: typeof record.lastStdoutAt === "string" ? record.lastStdoutAt : null,
+      bytesStreamed: record.bytesStreamed,
+      queueDepthAtStart: record.queueDepthAtStart
+    };
+  }
+
+  throw new ApiError(400, "Invalid realtime event");
+};
+
 const parseJsonBody = async <T>(c: Context): Promise<T> => {
   try {
     const text = await c.req.text();
@@ -391,6 +475,70 @@ app.use("/api/*", async (c, next) => {
 });
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));
+
+app.post("/internal/realtime-publish", async (c) => {
+  try {
+    const auth = await authenticateApiToken(c.req.header("authorization"));
+    if (!auth) {
+      return c.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const body = await parseJsonBody<InternalRealtimePublishBody>(c);
+    const ghostName = typeof body.ghostName === "string" ? body.ghostName.trim() : "";
+    if (!ghostName) {
+      throw new ApiError(400, "Missing ghostName");
+    }
+
+    if (auth.ghostName !== null && auth.ghostName !== ghostName) {
+      return c.json({ error: "Forbidden" }, { status: 403 });
+    }
+
+    const event = normalizeInternalRealtimeEvent(ghostName, body.event);
+    if (event.type === "ghost.turn-message") {
+      const published = publishGhostTurnMessageEvent(ghostName, {
+        sessionId: event.sessionId,
+        role: event.role,
+        text: event.text,
+        sequence: event.sequence,
+        ...(event.completedAt ? { completedAt: event.completedAt } : {})
+      });
+      return c.json({ status: "published", id: published.id });
+    }
+
+    const published = publishGhostTurnCompleteEvent(ghostName, {
+      turnId: event.turnId,
+      sessionId: event.sessionId,
+      agentName: event.agentName,
+      originator: event.originator,
+      durationMs: event.durationMs,
+      outcome: event.outcome,
+      lastStdoutAt: event.lastStdoutAt,
+      bytesStreamed: event.bytesStreamed,
+      queueDepthAtStart: event.queueDepthAtStart
+    });
+    log.info(
+      {
+        turn_id: event.turnId,
+        session_id: event.sessionId,
+        agent_name: event.agentName,
+        ghostName,
+        originator: event.originator,
+        duration_ms: event.durationMs,
+        outcome: event.outcome,
+        last_stdout_at: event.lastStdoutAt,
+        bytes_streamed: event.bytesStreamed,
+        queue_depth_at_start: event.queueDepthAtStart
+      },
+      "Ghost turn completed"
+    );
+    return c.json({ status: "published", id: published.id });
+  } catch (error) {
+    const status = getErrorStatus(error);
+    const message = getErrorMessage(error);
+    log.error({ err: error, method: c.req.method, path: c.req.path, status }, "Internal realtime publish failed");
+    return c.json({ error: message }, { status });
+  }
+});
 
 app.use("/api/*", async (c, next) => {
   try {
@@ -1101,5 +1249,5 @@ if (import.meta.main || process.argv[1] === __apiFilename) {
 }
 
 export { ensureApiAdminToken } from "./auth-config";
-export { ScheduleManager } from "./schedule-manager";
+export { ScheduleManager, ScheduleQueuedError } from "./schedule-manager";
 export { app };

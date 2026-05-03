@@ -1156,6 +1156,14 @@ const talk = async (name: string, message: string): Promise<void> => {
     }
     if (item.type === "result") {
       process.stdout.write(`${item.text}\n`);
+      continue;
+    }
+    if (item.type === "queued") {
+      process.stdout.write(`Queued for next turn (${item.queueJobId}).\n`);
+      continue;
+    }
+    if (item.type === "aborted" || item.type === "rejected") {
+      process.stdout.write(`${item.type}: ${item.reason}\n`);
     }
   }
 };

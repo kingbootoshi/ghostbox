@@ -3,7 +3,8 @@ import { readFile, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 
-import { app, ensureApiAdminToken, ScheduleManager } from "../../src/api";
+import { app, ensureApiAdminToken, ScheduleManager, ScheduleQueuedError } from "../../src/api";
+import { __resetRealtimeEventsForTests, createRealtimeSubscription } from "../../src/realtime-events";
 import type { GhostRuntimeMeta } from "../../src/types";
 import { createConfig, createGhostState, createState, createTestHome } from "../support/test-state";
 
@@ -118,6 +119,7 @@ describe("api route validation", () => {
     delete process.env.GHOSTBOX_ADMIN_TOKEN;
     delete process.env.GHOSTBOX_MAIL_USER_TOKEN;
     delete process.env.GHOSTBOX_CORS_ORIGINS;
+    __resetRealtimeEventsForTests();
     testHome = await createTestHome();
   });
 
@@ -234,6 +236,48 @@ describe("api route validation", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ status: "ok" });
+  });
+
+  test("POST /internal/realtime-publish accepts ghost-scoped turn messages", async () => {
+    await testHome.writeState(
+      createState({
+        ghosts: {
+          demo: createGhostState()
+        }
+      })
+    );
+
+    const response = await app.request("/internal/realtime-publish", {
+      method: "POST",
+      headers: apiHeaders("gbox_1234567890abcdef", { "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        ghostName: "demo",
+        event: {
+          type: "ghost.turn-message",
+          sessionId: "session-1",
+          role: "assistant",
+          text: "hello",
+          sequence: 1
+        }
+      })
+    });
+
+    expect(response.status).toBe(200);
+    const subscription = createRealtimeSubscription({}, "0");
+    expect(subscription.seed.kind).toBe("replay");
+    if (subscription.seed.kind === "replay") {
+      expect(subscription.seed.events).toMatchObject([
+        {
+          type: "ghost.turn-message",
+          ghostName: "demo",
+          sessionId: "session-1",
+          role: "assistant",
+          text: "hello",
+          sequence: 1
+        }
+      ]);
+    }
+    subscription.close();
   });
 
   test("GET /api/ghosts/:name/timeline rejects invalid pagination query values", async () => {
@@ -1008,5 +1052,45 @@ describe("api route validation", () => {
       nextFire: null
     });
     expect(savedSchedules[0].lastFired).toBe("2026-03-25T12:00:00.000Z");
+  });
+
+  test("ScheduleManager leaves lastFired unchanged when a schedule is queued for retry", async () => {
+    const schedulesPath = join(testHome.homeDir, ".ghostbox", "schedules.json");
+    await writeFile(
+      schedulesPath,
+      JSON.stringify(
+        [
+          {
+            id: "schedule-queued",
+            ghostName: "demo",
+            cron: "* * * * *",
+            prompt: "Ping",
+            timezone: "UTC",
+            once: false,
+            enabled: true,
+            createdAt: "2026-03-25T11:00:00.000Z",
+            lastFired: null,
+            nextFire: "2026-03-25T11:59:00.000Z"
+          }
+        ],
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const manager = new ScheduleManager(async () => {
+      throw new ScheduleQueuedError();
+    });
+
+    await manager.processDueSchedules(Date.parse("2026-03-25T12:00:00.000Z"));
+
+    const savedSchedules = JSON.parse(await readFile(schedulesPath, "utf8"));
+    expect(savedSchedules[0]).toMatchObject({
+      id: "schedule-queued",
+      enabled: true,
+      lastFired: null,
+      nextFire: "2026-03-25T11:59:00.000Z"
+    });
   });
 });

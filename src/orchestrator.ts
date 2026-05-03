@@ -36,6 +36,7 @@ const DEFAULT_GHOST_MESSAGE_TIMEOUT_MS = 1_800_000;
 type SendMessageOptions = {
   timeoutMs?: number | null;
   abortOnTimeout?: boolean;
+  originator?: "user" | "schedule";
 };
 
 const isTimeoutError = (error: unknown): boolean => error instanceof DOMException && error.name === "TimeoutError";
@@ -481,6 +482,40 @@ const parseGhostMessage = (line: string): GhostMessage => {
     };
   }
 
+  if (type === "queued") {
+    if (typeof record.queueJobId !== "string" || typeof record.position !== "number") {
+      throw new Error("Invalid queued message");
+    }
+    return {
+      type: "queued",
+      queueJobId: record.queueJobId,
+      position: record.position,
+      sessionId: typeof record.sessionId === "string" ? record.sessionId : ""
+    };
+  }
+
+  if (type === "aborted") {
+    if (typeof record.reason !== "string") {
+      throw new Error("Invalid aborted message");
+    }
+    return {
+      type: "aborted",
+      reason: record.reason,
+      sessionId: typeof record.sessionId === "string" ? record.sessionId : ""
+    };
+  }
+
+  if (type === "rejected") {
+    if (record.reason !== "busy" && record.reason !== "unavailable") {
+      throw new Error("Invalid rejected message");
+    }
+    return {
+      type: "rejected",
+      reason: record.reason,
+      sessionId: typeof record.sessionId === "string" ? record.sessionId : ""
+    };
+  }
+
   if (type === "heartbeat") {
     return { type: "heartbeat" };
   }
@@ -645,10 +680,11 @@ type GhostCallOptions = Omit<RequestInit, "headers"> & {
   decodeError?: boolean;
   errorMessage: string;
   headers?: Record<string, string>;
+  okStatuses?: number[];
 };
 
 const callGhost = async (name: string, path: string, options: GhostCallOptions): Promise<Response> => {
-  const { decodeError = true, errorMessage, headers, ...requestInit } = options;
+  const { decodeError = true, errorMessage, headers, okStatuses = [], ...requestInit } = options;
   const state = await loadState();
   const ghost = getGhostFromState(state, name);
 
@@ -664,7 +700,7 @@ const callGhost = async (name: string, path: string, options: GhostCallOptions):
     }
   });
 
-  if (response.ok) {
+  if (response.ok || okStatuses.includes(response.status)) {
     return response;
   }
 
@@ -967,12 +1003,21 @@ export const sendMessage = async function* (
         prompt,
         ...(model ? { model } : {}),
         ...(images ? { images } : {}),
-        ...(streamingBehavior ? { streamingBehavior } : {})
+        ...(streamingBehavior ? { streamingBehavior } : {}),
+        ...(options.originator ? { originator: options.originator } : {})
       }),
       ...(timeoutMs && timeoutMs > 0 ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
       errorMessage: "Ghost message request failed",
-      decodeError: false
+      decodeError: false,
+      okStatuses: [409]
     });
+
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const message = parseGhostMessage(JSON.stringify(await response.json()));
+      yield message;
+      return;
+    }
 
     if (!response.body) {
       throw new Error("Ghost message response did not include a body.");
@@ -1015,10 +1060,9 @@ export const sendMessage = async function* (
       }
     }
   } catch (error) {
-    // When the host fetch times out, the in-container subprocess keeps
-    // running. Tell the ghost to /abort so it cleans up its activeTurn,
-    // otherwise the next /message would queue against a stuck turn until
-    // the post-result kill (commit 446cfd8) catches it.
+    // The container supervisor's idle and wall-clock deadlines are primary.
+    // A host timeout should be rare; /abort is only a cleanup backstop if the
+    // host gives up before the supervisor returns its synthetic terminal line.
     if (isTimeoutError(error) && abortOnTimeout) {
       await abortGhost(name).catch((abortError) => {
         log.error({ name, err: abortError }, "Ghost abort after message timeout failed");

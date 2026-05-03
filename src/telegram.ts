@@ -347,6 +347,14 @@ export const startBot = async (token: string): Promise<void> => {
           await sendInChunks(ctx, output);
           return;
         }
+        if (item.type === "queued") {
+          await ctx.reply(`Queued for next turn (${item.queueJobId}).`);
+          return;
+        }
+        if (item.type === "aborted" || item.type === "rejected") {
+          await ctx.reply(`${item.type}: ${item.reason}`);
+          return;
+        }
       }
 
       await flushPendingTools();

@@ -19,6 +19,13 @@ type ScheduleDispatcher = (schedule: GhostSchedule) => Promise<void>;
 
 const log = createLogger("api");
 
+export class ScheduleQueuedError extends Error {
+  constructor(message = "Scheduled prompt was not run because the ghost is busy.") {
+    super(message);
+    this.name = "ScheduleQueuedError";
+  }
+}
+
 const CRON_WEEKDAY_MAP: Record<string, number> = {
   Sun: 0,
   Mon: 1,
@@ -39,10 +46,9 @@ const CRON_FIELD_RANGES: Array<{ name: CronFieldName; min: number; max: number }
 
 const SYSTEM_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 const MAX_CRON_SEARCH_MINUTES = 366 * 24 * 60;
-// Long operational cap for scheduled prompts. Real ghost workloads (e.g.,
-// GREED's news-ingestion scans) routinely run 10-30 minutes; allow up to two
-// hours before declaring the turn stuck. On timeout, sendMessage will abort
-// the ghost so its activeTurn cleans up.
+// Long host backstop for scheduled prompts. The container turn supervisor owns
+// normal idle and wall-clock deadlines; if the ghost is busy it returns a
+// rejected/queued envelope and ScheduleQueuedError keeps lastFired unchanged.
 const SCHEDULED_PROMPT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 
 const createApiError = (status: ApiStatusCode, message: string): Error & { status: ApiStatusCode } => {
@@ -403,6 +409,10 @@ export class ScheduleManager {
             schedule.nextFire = getNextCronFire(schedule.cron, schedule.timezone, referenceTime);
           }
         } catch (error) {
+          if (error instanceof ScheduleQueuedError) {
+            log.info({ scheduleId: schedule.id, ghostName: schedule.ghostName }, "Scheduled prompt queued for retry");
+            continue;
+          }
           log.error({ err: error, scheduleId: schedule.id, ghostName: schedule.ghostName }, "Scheduled prompt failed");
         }
       }
@@ -421,13 +431,24 @@ const dispatchScheduledPrompt = async (schedule: GhostSchedule): Promise<void> =
     await wakeGhost(schedule.ghostName);
   }
 
-  // Await the full turn so processDueSchedules only advances lastFired and
-  // nextFire after the ghost actually completed (or failed). Previously this
-  // detached the turn via void(async () => ...), which meant schedule state
-  // lied about success and any error was logged but not surfaced upstream.
-  for await (const _message of sendMessage(schedule.ghostName, schedule.prompt, undefined, undefined, undefined, {
-    timeoutMs: SCHEDULED_PROMPT_TIMEOUT_MS
+  // Await the supervisor result. Busy schedule dispatches surface as
+  // rejected/queued envelopes, which ScheduleQueuedError turns into a retry
+  // without advancing lastFired.
+  let completed = false;
+  for await (const message of sendMessage(schedule.ghostName, schedule.prompt, undefined, undefined, undefined, {
+    timeoutMs: SCHEDULED_PROMPT_TIMEOUT_MS,
+    originator: "schedule"
   })) {
+    if (message.type === "queued" || message.type === "rejected" || message.type === "aborted") {
+      throw new ScheduleQueuedError();
+    }
+    if (message.type === "result") {
+      completed = true;
+    }
+  }
+
+  if (!completed) {
+    throw new ScheduleQueuedError("Scheduled prompt ended without a result.");
   }
 };
 
