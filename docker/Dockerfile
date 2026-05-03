@@ -19,6 +19,12 @@ RUN npm install -g @mariozechner/pi-coding-agent@latest @anthropic-ai/claude-cod
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:$PATH"
 ENV NODE_PATH="/usr/local/lib/node_modules"
+# Bash tool timeout guard for the 2026-05-03 stuck-turn incident:
+# ~/Dev/agent-runtime-kernel/docs/learnings/2026-05-03-stuck-turn.md
+ENV BASH_DEFAULT_TIMEOUT_MS=300000
+ENV CLAUDE_CODE_BASH_DEFAULT_TIMEOUT_MS=300000
+ENV BASH_MAX_TIMEOUT_MS=480000
+ENV CLAUDE_CODE_BASH_MAX_TIMEOUT_MS=480000
 
 RUN mkdir -p /vault /root/.pi/agent/agents /root/.pi/agent/extensions /node_modules/@mariozechner /node_modules/@modelcontextprotocol && \
     ln -s /usr/local/lib/node_modules/@mariozechner/pi-coding-agent /node_modules/@mariozechner/pi-coding-agent && \

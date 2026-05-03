@@ -1,4 +1,4 @@
-import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn as nodeSpawn, type ChildProcessByStdio } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
@@ -12,13 +12,15 @@ import {
 } from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { basename, join } from "node:path";
+import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
+import { EventSink, HttpStreamSink, type Sink } from "./sinks";
+import { TurnSupervisor, type TurnCompletionEvent } from "./turn-supervisor";
+import { runClaudeTurn } from "./turn-runner";
 import type {
   CompactionInfo,
   GhostImage,
   GhostMessage,
-  GhostQueueClearResponse,
-  GhostQueueState,
   GhostRuntimeCapability,
   GhostRuntimeMeta,
   GhostSchedule,
@@ -42,7 +44,6 @@ const GHOSTBOX_GHOST_NAME = process.env.GHOSTBOX_GHOST_NAME || "";
 const GHOSTBOX_IMAGE_VERSION = process.env.GHOSTBOX_IMAGE_VERSION?.trim() || null;
 const MEMORY_PATH = "/vault/MEMORY.md";
 const USER_PATH = "/vault/USER.md";
-const HEARTBEAT_INTERVAL_MS = 30_000;
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SESSION_NAME_PATTERN = /^[a-zA-Z0-9 _-]+$/;
 const SNAPSHOT_SUFFIX = ".snapshot.txt";
@@ -76,10 +77,6 @@ type UserTurn = {
 
 type JsonRecord = Record<string, unknown>;
 
-type QueueState = {
-  messages: UserTurn[];
-};
-
 type NudgeEvent = "pre-compact" | "pre-new-session" | "message-complete";
 
 type NudgeHandler = (event: NudgeEvent, reason: string) => Promise<void> | void;
@@ -95,16 +92,6 @@ type StreamState = {
   currentToolInputBuffer: string;
   currentToolInputValue: unknown;
   emittedAssistantForBlock: boolean;
-};
-
-type ActiveTurn = {
-  child: ChildProcessWithoutNullStreams;
-  heartbeat: ReturnType<typeof setInterval> | null;
-  buffer: string;
-  finished: boolean;
-  pendingResultSessionId: string | null;
-  snapshotPrompt: string;
-  snapshotPersisted: boolean;
 };
 
 type ClaudeResultUsage = {
@@ -123,6 +110,7 @@ type RequestBodyMessage = {
   model?: unknown;
   images?: unknown;
   streamingBehavior?: unknown;
+  originator?: unknown;
 };
 
 type RequestBodySteer = {
@@ -514,7 +502,7 @@ const readSessionNames = async (): Promise<Record<string, string>> => {
       Object.entries(parsed).filter(
         ([sessionId, name]) => validateSessionId(sessionId) && typeof name === "string" && validateSessionName(name)
       )
-    );
+    ) as Record<string, string>;
   } catch {
     return {};
   }
@@ -935,7 +923,7 @@ const parseToolInput = (state: StreamState): unknown => {
   return state.currentToolInputValue ?? null;
 };
 
-const emitTextBlockIfNeeded = (res: ServerResponse, state: StreamState): void => {
+const emitTextBlockIfNeeded = (sink: Sink, state: StreamState): void => {
   if (state.currentBlockType !== "text") {
     return;
   }
@@ -952,18 +940,18 @@ const emitTextBlockIfNeeded = (res: ServerResponse, state: StreamState): void =>
     return;
   }
 
-  sendJsonLine(res, { type: "assistant", text: state.textBuffer });
+  sink.sendLine({ type: "assistant", text: state.textBuffer });
   state.lastAssistantText = state.textBuffer;
   state.assistantFallback = state.textBuffer;
   state.textBuffer = "";
 };
 
-const emitToolUseIfNeeded = (res: ServerResponse, state: StreamState): void => {
+const emitToolUseIfNeeded = (sink: Sink, state: StreamState): void => {
   if (state.currentBlockType !== "tool_use" || !state.currentToolName) {
     return;
   }
 
-  sendJsonLine(res, {
+  sink.sendLine({
     type: "tool_use",
     tool: state.currentToolName,
     input: parseToolInput(state)
@@ -992,16 +980,6 @@ const createStreamState = (): StreamState => ({
   emittedAssistantForBlock: false
 });
 
-const persistPendingSessionSnapshot = async (sessionId: string | null): Promise<void> => {
-  const turn = activeTurn;
-  if (!turn || turn.snapshotPersisted || !sessionId) {
-    return;
-  }
-
-  await persistSessionSnapshot(sessionId, turn.snapshotPrompt);
-  turn.snapshotPersisted = true;
-};
-
 const applyResultUsage = (line: JsonRecord): void => {
   const usageRecord = isRecord(line.usage) ? line.usage : null;
   const inputTokens =
@@ -1028,17 +1006,17 @@ const applyResultUsage = (line: JsonRecord): void => {
   };
 };
 
-const handleClaudeStreamLine = (res: ServerResponse, line: JsonRecord, state: StreamState): void => {
+const handleClaudeStreamLine = (
+  sink: Sink,
+  line: JsonRecord,
+  state: StreamState,
+  persistPendingSnapshot: (sessionId: string) => void
+): void => {
   const eventName = getEventName(line);
   const sessionId = extractSessionId(line);
   if (sessionId) {
     currentSessionId = sessionId;
-    void persistPendingSessionSnapshot(sessionId).catch((error) => {
-      log("ERROR", "Failed to persist session snapshot", {
-        sessionId,
-        error: error instanceof Error ? error.message : String(error)
-      });
-    });
+    persistPendingSnapshot(sessionId);
   }
 
   if (eventName === "system/init") {
@@ -1065,7 +1043,7 @@ const handleClaudeStreamLine = (res: ServerResponse, line: JsonRecord, state: St
         if (!output) {
           continue;
         }
-        sendJsonLine(res, { type: "tool_result", output });
+        sink.sendLine({ type: "tool_result", output });
       }
     }
     return;
@@ -1074,12 +1052,12 @@ const handleClaudeStreamLine = (res: ServerResponse, line: JsonRecord, state: St
   if (eventName === "result") {
     state.receivedResultEvent = true;
     if (!state.lastAssistantText && state.assistantFallback) {
-      sendJsonLine(res, { type: "assistant", text: state.assistantFallback });
+      sink.sendLine({ type: "assistant", text: state.assistantFallback });
       state.lastAssistantText = state.assistantFallback;
     }
 
     applyResultUsage(line);
-    sendJsonLine(res, {
+    sink.sendLine({
       type: "result",
       text: state.lastAssistantText || state.assistantFallback,
       sessionId: currentSessionId ?? ""
@@ -1132,7 +1110,7 @@ const handleClaudeStreamLine = (res: ServerResponse, line: JsonRecord, state: St
       if (delta.text.length === 0) {
         return;
       }
-      sendJsonLine(res, { type: "assistant", text: delta.text });
+      sink.sendLine({ type: "assistant", text: delta.text });
       state.textBuffer += delta.text;
       state.assistantFallback = state.textBuffer;
       state.lastAssistantText = state.textBuffer;
@@ -1142,13 +1120,13 @@ const handleClaudeStreamLine = (res: ServerResponse, line: JsonRecord, state: St
 
     if (deltaType === "thinking_delta" && typeof delta?.thinking === "string") {
       state.thinkingBuffer += delta.thinking;
-      sendJsonLine(res, { type: "thinking", text: state.thinkingBuffer });
+      sink.sendLine({ type: "thinking", text: state.thinkingBuffer });
       return;
     }
 
     if (deltaType === "thinking_delta" && typeof delta?.text === "string") {
       state.thinkingBuffer += delta.text;
-      sendJsonLine(res, { type: "thinking", text: state.thinkingBuffer });
+      sink.sendLine({ type: "thinking", text: state.thinkingBuffer });
       return;
     }
 
@@ -1160,13 +1138,13 @@ const handleClaudeStreamLine = (res: ServerResponse, line: JsonRecord, state: St
 
   if (streamType === "content_block_stop") {
     if (state.currentBlockType === "text") {
-      emitTextBlockIfNeeded(res, state);
+      emitTextBlockIfNeeded(sink, state);
       resetCurrentBlock(state);
       return;
     }
 
     if (state.currentBlockType === "tool_use") {
-      emitToolUseIfNeeded(res, state);
+      emitToolUseIfNeeded(sink, state);
       resetCurrentBlock(state);
       return;
     }
@@ -1215,24 +1193,12 @@ const buildClaudeArgs = async (
   };
 };
 
-const startHeartbeat = (res: ServerResponse): ReturnType<typeof setInterval> => {
-  return setInterval(() => {
-    sendJsonLine(res, { type: "heartbeat" });
-  }, HEARTBEAT_INTERVAL_MS);
-};
-
-const clearActiveTurn = (): void => {
-  if (activeTurn?.heartbeat) {
-    clearInterval(activeTurn.heartbeat);
-  }
-  activeTurn = null;
-};
-
 const flushMemories = async (reason: string): Promise<void> => {
   if (!currentSessionId || !(await sessionFileExists(currentSessionId))) {
     return;
   }
 
+  const sessionId = currentSessionId;
   const flushPrompt = `This session is ending (reason: ${reason}). Before context is lost, use mcp__ghostbox__memory_write to save any facts worth remembering: user preferences, important decisions, ongoing work, names and contacts. Skip if nothing notable. Call mcp__ghostbox__memory_show when done to confirm, or just reply done if nothing to save.`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FLUSH_MEMORY_TIMEOUT_MS);
@@ -1251,7 +1217,7 @@ const flushMemories = async (reason: string): Promise<void> => {
         "claude",
         [
           "--resume",
-          currentSessionId,
+          sessionId,
           "-p",
           flushPrompt,
           "--model",
@@ -1277,7 +1243,7 @@ const flushMemories = async (reason: string): Promise<void> => {
           stdio: ["ignore", "pipe", "pipe"],
           signal: controller.signal
         }
-      );
+      ) as ChildProcessByStdio<null, Readable, Readable>;
 
       child.stdout.on("data", (chunk: Buffer) => {
         log("INFO", "Memory flush output", {
@@ -1331,187 +1297,20 @@ const flushMemories = async (reason: string): Promise<void> => {
   }
 };
 
-const spawnClaudeMessage = async (res: ServerResponse, messages: UserTurn[]): Promise<void> => {
-  const { args, snapshotPrompt, snapshotPersisted } = await buildClaudeArgs(messages);
-  const child = nodeSpawn("claude", args, {
-    cwd: "/vault",
-    env: {
-      ...process.env,
-      CLAUDE_CONFIG_DIR
-    },
-    stdio: ["pipe", "pipe", "pipe"]
-  });
-
-  const state = createStreamState();
-  const stdoutDecoder = new StringDecoder("utf8");
-  // Capture the turn instance locally. Every handler below references `turn`
-  // (not the global `activeTurn`) so that if a stale turn's stdout/close
-  // handlers fire after a new turn has already been spawned, they cannot
-  // corrupt the new turn's state. The global `activeTurn` is only mutated
-  // when `activeTurn === turn` (i.e., this turn is still the live one).
-  const turn: ActiveTurn = {
-    child,
-    heartbeat: startHeartbeat(res),
-    buffer: "",
-    finished: false,
-    pendingResultSessionId: null,
-    snapshotPrompt,
-    snapshotPersisted
-  };
-  activeTurn = turn;
-
-  child.stderr.on("data", (chunk: Buffer) => {
-    process.stderr.write(chunk);
-  });
-
-  child.stdout.on("data", (chunk: Buffer) => {
-    // Drop any data from a turn that is no longer the live turn — its
-    // handlers may still be running while a fresh turn owns the stream.
-    if (activeTurn !== turn) {
-      return;
-    }
-
-    turn.buffer += stdoutDecoder.write(chunk);
-    const lines = turn.buffer.split("\n");
-    turn.buffer = lines.pop() ?? "";
-
-    for (const rawLine of lines) {
-      const trimmed = rawLine.trim();
-      if (!trimmed) {
-        continue;
-      }
-
-      try {
-        const parsed = JSON.parse(trimmed) as JsonRecord;
-        handleClaudeStreamLine(res, parsed, state);
-        if (getEventName(parsed) === "result") {
-          void nudges.emit("message-complete", "result").catch((error) => {
-            log("ERROR", "Message-complete nudge failed", {
-              error: error instanceof Error ? error.message : String(error),
-              sessionId: currentSessionId ?? ""
-            });
-          });
-          turn.finished = true;
-          if (!res.writableEnded) {
-            res.end();
-          }
-          // Force the claude subprocess to exit so child.on('close') fires and
-          // clearActiveTurn() runs. Without this, a claude process that hangs
-          // after emitting its result event leaves activeTurn stuck forever,
-          // and every subsequent /message silently queues. Observed in
-          // production: PID 2156 hung 56h post-result on 2026-04-29.
-          try {
-            turn.child.kill("SIGTERM");
-          } catch {
-            // Already dead or kill failed; close handler will still fire.
-          }
-        }
-      } catch (error) {
-        log("ERROR", "Failed to parse Claude stream line", {
-          error: error instanceof Error ? error.message : String(error),
-          line: trimmed
-        });
-      }
-    }
-  });
-
-  child.on("error", (error) => {
-    log("ERROR", "Claude process error", { error: error.message });
-    if (!res.writableEnded) {
-      sendJsonLine(res, {
-        type: "result",
-        text: "Ghost server failed while processing message.",
-        sessionId: currentSessionId ?? ""
-      });
-      res.end();
-    }
-    if (activeTurn === turn) {
-      clearActiveTurn();
-    }
-  });
-
-  child.on("close", async (code) => {
-    turn.buffer += stdoutDecoder.end();
-
-    const trailingLine = turn.buffer.trim();
-    // Only parse trailing output if this turn is still the live one.
-    // A stale turn's trailing buffer could otherwise overwrite the new turn's
-    // currentSessionId or stream state via handleClaudeStreamLine.
-    if (trailingLine && activeTurn === turn) {
-      try {
-        const parsed = JSON.parse(trailingLine) as JsonRecord;
-        handleClaudeStreamLine(res, parsed, state);
-      } catch (error) {
-        log("ERROR", "Failed to parse trailing Claude stream line", {
-          error: error instanceof Error ? error.message : String(error),
-          line: trailingLine
-        });
-      }
-    }
-
-    if (activeTurn === turn) {
-      await persistPendingSessionSnapshot(currentSessionId).catch((error) => {
-        log("ERROR", "Failed to persist final session snapshot", {
-          sessionId: currentSessionId ?? "",
-          error: error instanceof Error ? error.message : String(error)
-        });
-      });
-    }
-
-    // Always clear this turn's heartbeat — it belongs to this turn alone.
-    if (turn.heartbeat) {
-      clearInterval(turn.heartbeat);
-    }
-
-    if (activeTurn === turn && !res.writableEnded) {
-      if ((code ?? 0) !== 0 && !state.receivedResultEvent) {
-        const message = `Claude subprocess exited with code ${code ?? 1}.`;
-        log("ERROR", message, { sessionId: currentSessionId ?? "" });
-        sendJsonLine(res, {
-          type: "result",
-          text: message,
-          sessionId: currentSessionId ?? ""
-        });
-        res.end();
-        clearActiveTurn();
-        return;
-      }
-
-      if (!state.lastAssistantText && state.assistantFallback) {
-        sendJsonLine(res, { type: "assistant", text: state.assistantFallback });
-      }
-      sendJsonLine(res, {
-        type: "result",
-        text: state.lastAssistantText || state.assistantFallback,
-        sessionId: currentSessionId ?? ""
-      });
-      res.end();
-    }
-
-    if (activeTurn === turn) {
-      clearActiveTurn();
-    }
-  });
-
-  for (const message of messages) {
-    child.stdin.write(createUserTurn(message.text, message.images));
-  }
-  child.stdin.end();
-};
-
 const runCompactCommand = async (): Promise<string> => {
   if (!currentSessionId || !(await sessionFileExists(currentSessionId))) {
     throw new Error("No active session to compact.");
   }
 
+  const sessionId = currentSessionId;
   await nudges.emit("pre-compact", "compact");
-  await rebuildSessionSnapshot(currentSessionId);
+  await rebuildSessionSnapshot(sessionId);
   await ensureClaudeSupportFiles();
 
   return new Promise((resolve, reject) => {
     const args = [
       "--resume",
-      currentSessionId,
+      sessionId,
       "-p",
       "/compact",
       "--output-format",
@@ -1533,7 +1332,7 @@ const runCompactCommand = async (): Promise<string> => {
         CLAUDE_CONFIG_DIR
       },
       stdio: ["ignore", "pipe", "pipe"]
-    });
+    }) as ChildProcessByStdio<null, Readable, Readable>;
 
     let buffer = "";
     let fallback = "";
@@ -1678,7 +1477,7 @@ const handleSlashCommand = async (
     await nudges.emit("pre-new-session", "slash-command");
     await clearSessionSnapshot(currentSessionId);
     currentSessionId = null;
-    queue.messages = [];
+    supervisor.clearQueue();
     latestStats = null;
     sendAssistantResult(res, "New session started.", "");
     return true;
@@ -1698,12 +1497,131 @@ const handleSlashCommand = async (
   return true;
 };
 
+const parseTimeoutMs = (name: string, fallback: number): number => {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const createEventSink = (): EventSink =>
+  new EventSink({
+    hostBase: GHOSTBOX_HOST_BASE,
+    ghostName: GHOSTBOX_GHOST_NAME,
+    authToken: configuredApiKeys[0] ?? null,
+    getSessionId: () => currentSessionId ?? "",
+    log
+  });
+
+const publishTurnCompletion = (event: TurnCompletionEvent): void => {
+  void fetch(`${GHOSTBOX_HOST_BASE}/internal/realtime-publish`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(configuredApiKeys[0] ? { Authorization: `Bearer ${configuredApiKeys[0]}` } : {})
+    },
+    body: JSON.stringify({
+      ghostName: GHOSTBOX_GHOST_NAME,
+      event: {
+        type: "ghost.turn-complete",
+        turnId: event.turnId,
+        sessionId: event.sessionId,
+        agentName: event.agentName,
+        originator: event.originator,
+        durationMs: event.durationMs,
+        outcome: event.outcome,
+        lastStdoutAt: event.lastStdoutAt,
+        bytesStreamed: event.bytesStreamed,
+        queueDepthAtStart: event.queueDepthAtStart
+      }
+    })
+  }).catch((error) => {
+    log("ERROR", "Failed to publish turn completion event", {
+      turn_id: event.turnId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+};
+
 let currentSessionId: string | null = null;
 let currentModel = getInitialModel();
-let activeTurn: ActiveTurn | null = null;
-let sessionOpLock = false;
-const queue: QueueState = { messages: [] };
 let latestStats: ClaudeStatsSnapshot | null = null;
+
+const supervisor = new TurnSupervisor({
+  agentName: GHOSTBOX_GHOST_NAME,
+  makeEventSink: createEventSink,
+  createUserTurn,
+  getSessionId: () => currentSessionId ?? "",
+  publishCompletion: publishTurnCompletion,
+  log,
+  runTurn: async (item, sink, context) => {
+    let snapshotPrompt = "";
+    let snapshotPersisted = false;
+    const persistPendingSnapshot = (sessionId: string): void => {
+      if (snapshotPersisted) {
+        return;
+      }
+
+      void persistSessionSnapshot(sessionId, snapshotPrompt).then(
+        () => {
+          snapshotPersisted = true;
+        },
+        (error) => {
+          log("ERROR", "Failed to persist session snapshot", {
+            sessionId,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      );
+    };
+
+    const result = await runClaudeTurn([item.userTurn], sink, {
+      turnId: context.turnId,
+      idleTimeoutMs: parseTimeoutMs("GHOSTBOX_TURN_IDLE_TIMEOUT_MS", 8 * 60 * 1000),
+      wallTimeoutMs: parseTimeoutMs("GHOSTBOX_TURN_WALL_TIMEOUT_MS", 25 * 60 * 1000),
+      buildClaudeArgs: async (messages) => {
+        const spawnConfig = await buildClaudeArgs(messages);
+        snapshotPrompt = spawnConfig.snapshotPrompt;
+        snapshotPersisted = spawnConfig.snapshotPersisted;
+        return spawnConfig;
+      },
+      createUserTurn,
+      createStreamState,
+      handleClaudeStreamLine: (lineSink, line, state) => {
+        handleClaudeStreamLine(lineSink, line, state, persistPendingSnapshot);
+      },
+      getEventName,
+      getResultText: (state) => state.lastAssistantText || state.assistantFallback,
+      getSessionId: () => currentSessionId ?? "",
+      abortSignal: context.abortSignal,
+      onChild: context.setChild,
+      onChildClosed: context.clearChild,
+      onResult: () => {
+        void nudges.emit("message-complete", "result").catch((error) => {
+          log("ERROR", "Message-complete nudge failed", {
+            error: error instanceof Error ? error.message : String(error),
+            sessionId: currentSessionId ?? ""
+          });
+        });
+      },
+      log
+    });
+
+    if (!snapshotPersisted && currentSessionId) {
+      await persistSessionSnapshot(currentSessionId, snapshotPrompt).catch((error) => {
+        log("ERROR", "Failed to persist final session snapshot", {
+          sessionId: currentSessionId ?? "",
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
+    }
+
+    return result;
+  }
+});
 
 nudges.register("pre-compact", async (_event, reason) => {
   await flushMemories(reason);
@@ -1765,54 +1683,29 @@ const handleMessage = async (req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
-  if (sessionOpLock) {
-    sendJsonError(res, 409, "Turn in progress, try again.");
+  const originator = body.originator === "schedule" ? "schedule" : "user";
+  const result = await supervisor.enqueue({
+    userTurn,
+    deliverTo: new HttpStreamSink(res),
+    originator
+  });
+
+  if (result.status === "queued") {
+    sendJson(res, 202, {
+      type: "queued",
+      queueJobId: result.queueJobId,
+      position: result.position,
+      sessionId: currentSessionId ?? ""
+    });
     return;
   }
 
-  if (activeTurn) {
-    // Defensive: if the prior turn already emitted its result but the child
-    // never exited (so close handler never fired), force-clear and proceed.
-    // This prevents the silent-queue-forever failure mode we hit on
-    // 2026-04-29 when PID 2156 hung post-result.
-    if (activeTurn.finished) {
-      log("ERROR", "Force-clearing stale activeTurn (finished but child stuck)", {
-        sessionId: currentSessionId ?? "",
-        childPid: activeTurn.child.pid ?? 0
-      });
-      try {
-        activeTurn.child.kill("SIGKILL");
-      } catch {
-        // Already dead.
-      }
-      clearActiveTurn();
-    } else {
-      log("INFO", "Message queued while turn in progress", {
-        sessionId: currentSessionId ?? "",
-        queueLength: queue.messages.length + 1,
-        childPid: activeTurn.child.pid ?? 0
-      });
-      queue.messages.push(userTurn);
-      startNdjsonResponse(res);
-      sendJsonLine(res, {
-        type: "result",
-        text: "Queued for next turn.",
-        sessionId: currentSessionId ?? ""
-      });
-      res.end();
-      return;
-    }
-  }
-
-  const queuedMessages = [...queue.messages];
-  queue.messages = [];
-  sessionOpLock = true;
-
-  try {
-    startNdjsonResponse(res);
-    await spawnClaudeMessage(res, [...queuedMessages, userTurn]);
-  } finally {
-    sessionOpLock = false;
+  if (result.status === "rejected") {
+    sendJson(res, 409, {
+      type: "rejected",
+      reason: result.reason,
+      sessionId: currentSessionId ?? ""
+    });
   }
 };
 
@@ -1834,33 +1727,19 @@ const handleSteer = async (req: IncomingMessage, res: ServerResponse): Promise<v
     return;
   }
 
-  if (!activeTurn) {
-    sendJsonError(res, 400, "no active turn to steer");
-    return;
+  try {
+    sendJson(res, 200, await supervisor.steer({ text: prompt, images: imageParse.images }));
+  } catch (error) {
+    sendJsonError(res, 400, error instanceof Error ? error.message : "no active turn to steer");
   }
-
-  activeTurn.child.stdin.write(createUserTurn(prompt, imageParse.images));
-  sendJson(res, 200, { status: "queued", pendingCount: queue.messages.length });
 };
 
 const handleQueue = (res: ServerResponse): void => {
-  const response: GhostQueueState = {
-    steering: [],
-    followUp: queue.messages.map((message) => message.text),
-    pendingCount: queue.messages.length
-  };
-  sendJson(res, 200, response);
+  sendJson(res, 200, supervisor.queueSnapshot());
 };
 
 const handleClearQueue = (res: ServerResponse): void => {
-  const response: GhostQueueClearResponse = {
-    cleared: {
-      steering: [],
-      followUp: queue.messages.map((message) => message.text)
-    }
-  };
-  queue.messages = [];
-  sendJson(res, 200, response);
+  sendJson(res, 200, supervisor.clearQueue());
 };
 
 const handleTimeline = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -1892,7 +1771,7 @@ const handleStats = async (res: ServerResponse): Promise<void> => {
 };
 
 const handleCompact = async (res: ServerResponse): Promise<void> => {
-  if (activeTurn) {
+  if (supervisor.currentTurn() || supervisor.queueSnapshot().pendingCount > 0) {
     sendJsonError(res, 409, "Active turn in progress.");
     return;
   }
@@ -1904,16 +1783,16 @@ const handleCompact = async (res: ServerResponse): Promise<void> => {
 const handleNew = async (res: ServerResponse): Promise<void> => {
   await nudges.emit("pre-new-session", "api");
   await clearSessionSnapshot(currentSessionId);
+  // Abort before clearing and switching so the running turn cannot write into the old session.
+  await supervisor.abort();
+  supervisor.clearQueue();
   currentSessionId = null;
-  queue.messages = [];
   latestStats = null;
   sendJson(res, 200, { status: "new_session", sessionId: "" });
 };
 
 const handleAbort = (res: ServerResponse): void => {
-  if (activeTurn) {
-    activeTurn.child.kill("SIGTERM");
-  }
+  void supervisor.abort();
   sendJson(res, 200, { status: "aborted" });
 };
 
@@ -1986,27 +1865,21 @@ const handleRenameSession = async (req: IncomingMessage, res: ServerResponse): P
     return;
   }
 
-  if (activeTurn || sessionOpLock) {
+  if (supervisor.currentTurn()) {
     sendJsonError(res, 409, "Turn in progress, try again.");
     return;
   }
 
-  sessionOpLock = true;
-
-  try {
-    const sessionNames = await readSessionNames();
-    if (Object.entries(sessionNames).some(([existingId, existingName]) => existingId !== sessionId && existingName === name)) {
-      sendJsonError(res, 409, "A session with that name already exists.");
-      return;
-    }
-
-    await writeSessionNames({
-      ...sessionNames,
-      [sessionId]: name
-    });
-  } finally {
-    sessionOpLock = false;
+  const sessionNames = await readSessionNames();
+  if (Object.entries(sessionNames).some(([existingId, existingName]) => existingId !== sessionId && existingName === name)) {
+    sendJsonError(res, 409, "A session with that name already exists.");
+    return;
   }
+
+  await writeSessionNames({
+    ...sessionNames,
+    [sessionId]: name
+  });
 
   sendJson(res, 200, { status: "renamed", sessionId, name });
 };

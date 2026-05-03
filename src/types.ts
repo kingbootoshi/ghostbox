@@ -155,6 +155,25 @@ export type ResultMessage = {
   sessionId: string;
 };
 
+export type QueuedMessage = {
+  type: "queued";
+  queueJobId: string;
+  position: number;
+  sessionId: string;
+};
+
+export type AbortedMessage = {
+  type: "aborted";
+  reason: string;
+  sessionId: string;
+};
+
+export type RejectedMessage = {
+  type: "rejected";
+  reason: "busy" | "unavailable";
+  sessionId: string;
+};
+
 export type HistoryMessage = {
   role: "user" | "assistant" | "system" | "tool_use" | "tool_result";
   text: string;
@@ -254,6 +273,9 @@ export type GhostMessage =
   | ToolUseMessage
   | ToolResultMessage
   | ResultMessage
+  | QueuedMessage
+  | AbortedMessage
+  | RejectedMessage
   | HeartbeatMessage;
 
 export type AdapterType = "pi" | "claude-code";
@@ -316,4 +338,30 @@ export type RealtimeEvent =
       ghostName: string;
       sessionId: string;
       preview: string;
+    }
+  | {
+      id: string;
+      at: string;
+      type: "ghost.turn-message";
+      ghostName: string;
+      sessionId: string;
+      role: "assistant" | "system";
+      text: string;
+      sequence: number;
+      completedAt?: string;
+    }
+  | {
+      id: string;
+      at: string;
+      type: "ghost.turn-complete";
+      ghostName: string;
+      turnId: string;
+      sessionId: string;
+      agentName: string;
+      originator: "user" | "schedule" | "internal";
+      durationMs: number;
+      outcome: "result" | "idle_timeout" | "wallclock_timeout" | "subprocess_error" | "host_aborted";
+      lastStdoutAt: string | null;
+      bytesStreamed: number;
+      queueDepthAtStart: number;
     };

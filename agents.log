@@ -1,5 +1,13 @@
 # Agents Log
 
+## Session: 2026-05-03 turn-supervisor-and-idle-timeout
+
+Goal: Replace event-driven activeTurn + followUp queue in ghost-server-claude.ts with a turn supervisor that owns lifecycle, enforces idle + wall-clock deadlines, routes background output through typed sinks, and stops the schedule manager from lying about completion. Plus cap Claude Code Bash tool calls at 5-8 min as the root-cause defense.
+
+PRD: docs/prds/turn-supervisor-and-idle-timeout.md
+Postmortem: ~/Dev/agent-runtime-kernel/docs/learnings/2026-05-03-stuck-turn.md
+Stage: scope-implement
+
 ## Session: 2026-03-24T11:30:00Z
 Goal: De-slopify native macOS app - structural refactoring with zero visual changes
 

@@ -1,6 +1,6 @@
 // docker/ghost-server-claude.ts
-import { spawn as nodeSpawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { spawn as nodeSpawn2 } from "node:child_process";
+import { randomUUID as randomUUID2 } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
   mkdir,
@@ -13,7 +13,527 @@ import {
 } from "node:fs/promises";
 import http from "node:http";
 import { basename, join } from "node:path";
+import { StringDecoder as StringDecoder2 } from "node:string_decoder";
+
+// docker/sinks.ts
+class HttpStreamSink {
+  res;
+  constructor(res) {
+    this.res = res;
+  }
+  sendLine(line) {
+    if (!this.res.writableEnded) {
+      if (!this.res.headersSent) {
+        this.res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+      }
+      this.res.write(`${JSON.stringify(line)}
+`);
+    }
+  }
+  end() {
+    if (!this.res.writableEnded) {
+      if (!this.res.headersSent) {
+        this.res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+      }
+      this.res.end();
+    }
+  }
+}
+
+class EventSink {
+  options;
+  sequence = 0;
+  ended = false;
+  completionQueued = false;
+  publishQueue = Promise.resolve();
+  constructor(options) {
+    this.options = options;
+  }
+  sendLine(line) {
+    if (this.ended) {
+      return;
+    }
+    const event = this.toEvent(line);
+    if (event) {
+      this.enqueuePublish(event);
+    }
+  }
+  end() {
+    if (this.ended) {
+      return;
+    }
+    this.ended = true;
+    this.enqueueCompletion();
+  }
+  toEvent(line) {
+    if (line.type === "assistant") {
+      return this.createEvent("assistant", line.text);
+    }
+    if (line.type === "result") {
+      return this.createCompletionEvent(line.sessionId);
+    }
+    if (line.type === "aborted") {
+      return this.createEvent("system", line.reason, new Date().toISOString());
+    }
+    if (line.type === "rejected") {
+      return this.createEvent("system", line.reason, new Date().toISOString());
+    }
+    return null;
+  }
+  enqueueCompletion() {
+    const event = this.createCompletionEvent(this.options.getSessionId());
+    if (event) {
+      this.enqueuePublish(event);
+    }
+  }
+  createCompletionEvent(sessionId) {
+    if (this.completionQueued) {
+      return null;
+    }
+    this.completionQueued = true;
+    this.sequence += 1;
+    return {
+      type: "ghost.turn-message",
+      sessionId,
+      role: "system",
+      text: "",
+      sequence: this.sequence,
+      completedAt: new Date().toISOString()
+    };
+  }
+  createEvent(role, text, completedAt) {
+    this.sequence += 1;
+    return {
+      type: "ghost.turn-message",
+      sessionId: this.options.getSessionId(),
+      role,
+      text,
+      sequence: this.sequence,
+      ...completedAt ? { completedAt } : {}
+    };
+  }
+  enqueuePublish(event) {
+    this.publishQueue = this.publishQueue.then(() => this.publish(event)).catch((error) => {
+      this.options.log("ERROR", "Failed to publish turn message event", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+  }
+  async publish(event) {
+    const response = await fetch(`${this.options.hostBase}/internal/realtime-publish`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...this.options.authToken ? { Authorization: `Bearer ${this.options.authToken}` } : {}
+      },
+      body: JSON.stringify({
+        ghostName: this.options.ghostName,
+        event
+      })
+    });
+    if (!response.ok) {
+      throw new Error(`Host realtime publish failed with status ${response.status}.`);
+    }
+  }
+}
+
+// docker/turn-supervisor.ts
+import { randomUUID } from "node:crypto";
+
+class TurnSupervisor {
+  options;
+  queue = [];
+  current = null;
+  stopped = false;
+  draining = false;
+  constructor(options) {
+    this.options = options;
+  }
+  start() {
+    this.stopped = false;
+    this.drain();
+  }
+  async stop() {
+    this.stopped = true;
+    await this.abort();
+  }
+  async enqueue(item) {
+    if (this.current || this.queue.length > 0) {
+      if (item.originator === "schedule") {
+        return { status: "rejected", reason: "busy" };
+      }
+      const queued2 = {
+        ...item,
+        id: item.id ?? randomUUID(),
+        deliverTo: this.options.makeEventSink()
+      };
+      this.queue.push(queued2);
+      return { status: "queued", queueJobId: queued2.id, position: this.queue.length };
+    }
+    const queued = { ...item, id: item.id ?? randomUUID() };
+    this.queue.push(queued);
+    this.drain();
+    return { status: "running", turnId: queued.id };
+  }
+  currentTurn() {
+    if (!this.current) {
+      return null;
+    }
+    return {
+      turnId: this.current.item.id,
+      originator: this.current.item.originator,
+      childPid: this.current.child?.pid ?? null
+    };
+  }
+  async steer(turn) {
+    if (!this.current?.child || this.current.child.exitCode !== null || !this.current.child.stdin.writable) {
+      throw new Error("no active turn to steer");
+    }
+    this.current.child.stdin.write(this.options.createUserTurn(turn.text, turn.images));
+    return { status: "queued", pendingCount: this.queue.length };
+  }
+  async abort() {
+    this.current?.abort.abort();
+  }
+  queueSnapshot() {
+    return {
+      steering: [],
+      followUp: this.queue.map((item) => item.userTurn.text),
+      pendingCount: this.queue.length
+    };
+  }
+  clearQueue() {
+    const response = {
+      cleared: {
+        steering: [],
+        followUp: this.queue.map((item) => item.userTurn.text)
+      }
+    };
+    this.queue.length = 0;
+    return response;
+  }
+  async drain() {
+    if (this.draining || this.stopped) {
+      return;
+    }
+    this.draining = true;
+    try {
+      while (!this.current && this.queue.length > 0 && !this.stopped) {
+        const item = this.queue.shift();
+        if (!item) {
+          return;
+        }
+        const abort = new AbortController;
+        const queueDepthAtStart = this.queue.length;
+        this.current = { item, child: null, abort };
+        try {
+          const result = await this.options.runTurn(item, item.deliverTo, {
+            turnId: item.id,
+            queueDepthAtStart,
+            abortSignal: abort.signal,
+            setChild: (child) => {
+              if (this.current?.item.id === item.id) {
+                this.current.child = child;
+              }
+            },
+            clearChild: () => {
+              if (this.current?.item.id === item.id) {
+                this.current.child = null;
+              }
+            }
+          });
+          this.completeTurn(item, result, queueDepthAtStart);
+        } catch (error) {
+          this.options.log("ERROR", "Ghost turn runner failed", {
+            turn_id: item.id,
+            error: error instanceof Error ? error.message : String(error)
+          });
+          item.deliverTo.sendLine({
+            type: "aborted",
+            reason: "runner_error",
+            sessionId: this.options.getSessionId()
+          });
+          item.deliverTo.end();
+        } finally {
+          this.current = null;
+        }
+      }
+    } finally {
+      this.draining = false;
+      if (this.queue.length > 0 && !this.current && !this.stopped) {
+        this.drain();
+      }
+    }
+  }
+  completeTurn(item, result, queueDepthAtStart) {
+    const event = {
+      turnId: item.id,
+      sessionId: this.options.getSessionId(),
+      agentName: this.options.agentName,
+      originator: item.originator,
+      durationMs: result.durationMs,
+      outcome: result.outcome,
+      lastStdoutAt: result.lastStdoutAt,
+      bytesStreamed: result.bytesStreamed,
+      queueDepthAtStart
+    };
+    this.options.log("INFO", "Ghost turn completed", {
+      turn_id: event.turnId,
+      session_id: event.sessionId,
+      agent_name: event.agentName,
+      originator: event.originator,
+      duration_ms: event.durationMs,
+      outcome: event.outcome,
+      last_stdout_at: event.lastStdoutAt,
+      bytes_streamed: event.bytesStreamed,
+      queue_depth_at_start: event.queueDepthAtStart
+    });
+    this.options.publishCompletion(event);
+  }
+}
+
+// docker/turn-runner.ts
+import { spawn as nodeSpawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+var HEARTBEAT_INTERVAL_MS = 30000;
+var KILL_GRACE_MS = 5000;
+var formatTimeout = (ms) => {
+  if (ms % 60000 === 0) {
+    return `${ms / 60000}m`;
+  }
+  if (ms % 1000 === 0) {
+    return `${ms / 1000}s`;
+  }
+  return `${ms}ms`;
+};
+var timeoutMessage = (reason, idleTimeoutMs, wallTimeoutMs) => {
+  if (reason === "idle_timeout") {
+    return `Turn killed: idle ${formatTimeout(idleTimeoutMs)}`;
+  }
+  if (reason === "wallclock_timeout") {
+    return `Turn killed: wall-clock ${formatTimeout(wallTimeoutMs)}`;
+  }
+  return "Turn aborted.";
+};
+var runClaudeTurn = async (messages, sink, options) => {
+  const startedAtMs = Date.now();
+  const startedAt = new Date(startedAtMs).toISOString();
+  const { args } = await options.buildClaudeArgs(messages);
+  const child = nodeSpawn(options.claudeBinaryPath ?? process.env.GHOSTBOX_CLAUDE_BINARY_PATH ?? "claude", args, {
+    cwd: options.claudeWorkingDirectory ?? "/vault",
+    env: {
+      ...process.env,
+      CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR || "/vault/.claude"
+    },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  options.onChild(child);
+  const state = options.createStreamState();
+  const stdoutDecoder = new StringDecoder("utf8");
+  let buffer = "";
+  let receivedResult = false;
+  let killReason = null;
+  let idleTimer = null;
+  let wallTimer = null;
+  let killTimer = null;
+  let heartbeat = null;
+  let lastStdoutAtMs = null;
+  let bytesStreamed = 0;
+  let terminalEmitted = false;
+  const clearTimers = () => {
+    if (idleTimer)
+      clearTimeout(idleTimer);
+    if (wallTimer)
+      clearTimeout(wallTimer);
+    if (killTimer)
+      clearTimeout(killTimer);
+    if (heartbeat)
+      clearInterval(heartbeat);
+  };
+  const armKillTimer = (reason) => {
+    if (killTimer) {
+      clearTimeout(killTimer);
+    }
+    killTimer = setTimeout(() => {
+      if (child.exitCode === null) {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      }
+    }, KILL_GRACE_MS);
+    killTimer.unref?.();
+    options.log("ERROR", "Claude turn kill escalation armed", {
+      turn_id: options.turnId,
+      reason
+    });
+  };
+  const requestKill = (reason) => {
+    if (killReason) {
+      return;
+    }
+    killReason = reason;
+    options.log("ERROR", "Killing Claude turn", {
+      turn_id: options.turnId,
+      reason,
+      childPid: child.pid ?? 0
+    });
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      return;
+    }
+    armKillTimer(reason);
+  };
+  const terminateAfterResult = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+    if (wallTimer) {
+      clearTimeout(wallTimer);
+      wallTimer = null;
+    }
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      return;
+    }
+    armKillTimer("result");
+  };
+  const resetIdleTimer = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+    }
+    idleTimer = setTimeout(() => requestKill("idle_timeout"), options.idleTimeoutMs);
+    idleTimer.unref?.();
+  };
+  const emitTerminalLine = (line) => {
+    if (!terminalEmitted) {
+      sink.sendLine(line);
+      terminalEmitted = true;
+    }
+  };
+  const processLine = (rawLine, trailing) => {
+    const trimmed = rawLine.trim();
+    if (!trimmed) {
+      return;
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      const eventName = options.getEventName(parsed);
+      if (eventName === "result" && killReason) {
+        options.log("ERROR", "Claude result/timeout race resolved", {
+          turn_id: options.turnId,
+          winner: "timeout_marker",
+          suppressed: "result",
+          reason: killReason
+        });
+        return;
+      }
+      options.handleClaudeStreamLine(sink, parsed, state);
+      if (eventName === "result" && !receivedResult) {
+        receivedResult = true;
+        options.onResult();
+        terminateAfterResult();
+      }
+    } catch (error) {
+      options.log("ERROR", trailing ? "Failed to parse trailing Claude stream line" : "Failed to parse Claude stream line", {
+        turn_id: options.turnId,
+        error: error instanceof Error ? error.message : String(error),
+        line: trimmed
+      });
+    }
+  };
+  resetIdleTimer();
+  wallTimer = setTimeout(() => requestKill("wallclock_timeout"), options.wallTimeoutMs);
+  wallTimer.unref?.();
+  heartbeat = setInterval(() => sink.sendLine({ type: "heartbeat" }), HEARTBEAT_INTERVAL_MS);
+  options.abortSignal.addEventListener("abort", () => requestKill("host_aborted"), { once: true });
+  child.stderr.on("data", (chunk) => {
+    process.stderr.write(chunk);
+  });
+  child.stdout.on("data", (chunk) => {
+    bytesStreamed += chunk.byteLength;
+    lastStdoutAtMs = Date.now();
+    resetIdleTimer();
+    buffer += stdoutDecoder.write(chunk);
+    const lines = buffer.split(`
+`);
+    buffer = lines.pop() ?? "";
+    for (const rawLine of lines) {
+      processLine(rawLine, false);
+    }
+  });
+  for (const message of messages) {
+    child.stdin.write(options.createUserTurn(message.text, message.images));
+  }
+  child.stdin.end();
+  const closeResult = await new Promise((resolve) => {
+    child.on("error", (error) => {
+      options.log("ERROR", "Claude process error", {
+        turn_id: options.turnId,
+        error: error.message
+      });
+      resolve({ code: 1, error });
+    });
+    child.on("close", (code) => {
+      resolve({ code, error: null });
+    });
+  });
+  clearTimers();
+  options.onChildClosed();
+  buffer += stdoutDecoder.end();
+  processLine(buffer, true);
+  if (closeResult.error) {
+    throw closeResult.error;
+  }
+  let outcome = "result";
+  if (killReason === "idle_timeout" || killReason === "wallclock_timeout") {
+    outcome = killReason;
+    emitTerminalLine({
+      type: "result",
+      text: timeoutMessage(killReason, options.idleTimeoutMs, options.wallTimeoutMs),
+      sessionId: options.getSessionId()
+    });
+  } else if (killReason === "host_aborted" && !receivedResult) {
+    outcome = "host_aborted";
+    emitTerminalLine({
+      type: "aborted",
+      reason: timeoutMessage(killReason, options.idleTimeoutMs, options.wallTimeoutMs),
+      sessionId: options.getSessionId()
+    });
+  } else if ((closeResult.code ?? 0) !== 0 && !receivedResult) {
+    outcome = "subprocess_error";
+    const message = closeResult.error?.message ?? `Claude subprocess exited with code ${closeResult.code ?? 1}.`;
+    options.log("ERROR", message, {
+      turn_id: options.turnId,
+      sessionId: options.getSessionId()
+    });
+    emitTerminalLine({
+      type: "result",
+      text: message,
+      sessionId: options.getSessionId()
+    });
+  } else if (!receivedResult) {
+    emitTerminalLine({
+      type: "result",
+      text: options.getResultText(state),
+      sessionId: options.getSessionId()
+    });
+  }
+  sink.end();
+  const endedAtMs = Date.now();
+  return {
+    outcome,
+    startedAt,
+    endedAt: new Date(endedAtMs).toISOString(),
+    durationMs: endedAtMs - startedAtMs,
+    lastStdoutAt: lastStdoutAtMs ? new Date(lastStdoutAtMs).toISOString() : null,
+    bytesStreamed
+  };
+};
+
+// docker/ghost-server-claude.ts
 var CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || "/vault/.claude";
 var CLAUDE_PROJECTS_DIR = join(CLAUDE_CONFIG_DIR, "projects", "-vault");
 var CLAUDE_MCP_CONFIG_PATH = join(CLAUDE_CONFIG_DIR, ".mcp.json");
@@ -26,7 +546,6 @@ var GHOSTBOX_GHOST_NAME = process.env.GHOSTBOX_GHOST_NAME || "";
 var GHOSTBOX_IMAGE_VERSION = process.env.GHOSTBOX_IMAGE_VERSION?.trim() || null;
 var MEMORY_PATH = "/vault/MEMORY.md";
 var USER_PATH = "/vault/USER.md";
-var HEARTBEAT_INTERVAL_MS = 30000;
 var SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 var SESSION_NAME_PATTERN = /^[a-zA-Z0-9 _-]+$/;
 var SNAPSHOT_SUFFIX = ".snapshot.txt";
@@ -348,7 +867,7 @@ var readSessionNames = async () => {
 };
 var writeSessionNames = async (records) => {
   await mkdir(CLAUDE_CONFIG_DIR, { recursive: true, mode: 448 });
-  const tempPath = `${SESSION_NAMES_PATH}.${randomUUID()}.tmp`;
+  const tempPath = `${SESSION_NAMES_PATH}.${randomUUID2()}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(records, null, 2)}
 `, { encoding: "utf8", mode: 384 });
   await rename(tempPath, SESSION_NAMES_PATH);
@@ -669,7 +1188,7 @@ var parseToolInput = (state) => {
   }
   return state.currentToolInputValue ?? null;
 };
-var emitTextBlockIfNeeded = (res, state) => {
+var emitTextBlockIfNeeded = (sink, state) => {
   if (state.currentBlockType !== "text") {
     return;
   }
@@ -683,16 +1202,16 @@ var emitTextBlockIfNeeded = (res, state) => {
     state.textBuffer = "";
     return;
   }
-  sendJsonLine(res, { type: "assistant", text: state.textBuffer });
+  sink.sendLine({ type: "assistant", text: state.textBuffer });
   state.lastAssistantText = state.textBuffer;
   state.assistantFallback = state.textBuffer;
   state.textBuffer = "";
 };
-var emitToolUseIfNeeded = (res, state) => {
+var emitToolUseIfNeeded = (sink, state) => {
   if (state.currentBlockType !== "tool_use" || !state.currentToolName) {
     return;
   }
-  sendJsonLine(res, {
+  sink.sendLine({
     type: "tool_use",
     tool: state.currentToolName,
     input: parseToolInput(state)
@@ -717,14 +1236,6 @@ var createStreamState = () => ({
   currentToolInputValue: null,
   emittedAssistantForBlock: false
 });
-var persistPendingSessionSnapshot = async (sessionId) => {
-  const turn = activeTurn;
-  if (!turn || turn.snapshotPersisted || !sessionId) {
-    return;
-  }
-  await persistSessionSnapshot(sessionId, turn.snapshotPrompt);
-  turn.snapshotPersisted = true;
-};
 var applyResultUsage = (line) => {
   const usageRecord = isRecord(line.usage) ? line.usage : null;
   const inputTokens = getNumber(usageRecord?.input_tokens) ?? getNumber(usageRecord?.inputTokens) ?? getNumber(usageRecord?.prompt_tokens) ?? 0;
@@ -741,17 +1252,12 @@ var applyResultUsage = (line) => {
     updatedAt: new Date().toISOString()
   };
 };
-var handleClaudeStreamLine = (res, line, state) => {
+var handleClaudeStreamLine = (sink, line, state, persistPendingSnapshot) => {
   const eventName = getEventName(line);
   const sessionId = extractSessionId(line);
   if (sessionId) {
     currentSessionId = sessionId;
-    persistPendingSessionSnapshot(sessionId).catch((error) => {
-      log("ERROR", "Failed to persist session snapshot", {
-        sessionId,
-        error: error instanceof Error ? error.message : String(error)
-      });
-    });
+    persistPendingSnapshot(sessionId);
   }
   if (eventName === "system/init") {
     return;
@@ -775,7 +1281,7 @@ var handleClaudeStreamLine = (res, line, state) => {
         if (!output) {
           continue;
         }
-        sendJsonLine(res, { type: "tool_result", output });
+        sink.sendLine({ type: "tool_result", output });
       }
     }
     return;
@@ -783,11 +1289,11 @@ var handleClaudeStreamLine = (res, line, state) => {
   if (eventName === "result") {
     state.receivedResultEvent = true;
     if (!state.lastAssistantText && state.assistantFallback) {
-      sendJsonLine(res, { type: "assistant", text: state.assistantFallback });
+      sink.sendLine({ type: "assistant", text: state.assistantFallback });
       state.lastAssistantText = state.assistantFallback;
     }
     applyResultUsage(line);
-    sendJsonLine(res, {
+    sink.sendLine({
       type: "result",
       text: state.lastAssistantText || state.assistantFallback,
       sessionId: currentSessionId ?? ""
@@ -831,7 +1337,7 @@ var handleClaudeStreamLine = (res, line, state) => {
       if (delta.text.length === 0) {
         return;
       }
-      sendJsonLine(res, { type: "assistant", text: delta.text });
+      sink.sendLine({ type: "assistant", text: delta.text });
       state.textBuffer += delta.text;
       state.assistantFallback = state.textBuffer;
       state.lastAssistantText = state.textBuffer;
@@ -840,12 +1346,12 @@ var handleClaudeStreamLine = (res, line, state) => {
     }
     if (deltaType === "thinking_delta" && typeof delta?.thinking === "string") {
       state.thinkingBuffer += delta.thinking;
-      sendJsonLine(res, { type: "thinking", text: state.thinkingBuffer });
+      sink.sendLine({ type: "thinking", text: state.thinkingBuffer });
       return;
     }
     if (deltaType === "thinking_delta" && typeof delta?.text === "string") {
       state.thinkingBuffer += delta.text;
-      sendJsonLine(res, { type: "thinking", text: state.thinkingBuffer });
+      sink.sendLine({ type: "thinking", text: state.thinkingBuffer });
       return;
     }
     if (deltaType === "input_json_delta" && typeof delta?.partial_json === "string") {
@@ -855,12 +1361,12 @@ var handleClaudeStreamLine = (res, line, state) => {
   }
   if (streamType === "content_block_stop") {
     if (state.currentBlockType === "text") {
-      emitTextBlockIfNeeded(res, state);
+      emitTextBlockIfNeeded(sink, state);
       resetCurrentBlock(state);
       return;
     }
     if (state.currentBlockType === "tool_use") {
-      emitToolUseIfNeeded(res, state);
+      emitToolUseIfNeeded(sink, state);
       resetCurrentBlock(state);
       return;
     }
@@ -901,21 +1407,11 @@ var buildClaudeArgs = async (messages) => {
     snapshotPersisted: resumeSessionId !== null
   };
 };
-var startHeartbeat = (res) => {
-  return setInterval(() => {
-    sendJsonLine(res, { type: "heartbeat" });
-  }, HEARTBEAT_INTERVAL_MS);
-};
-var clearActiveTurn = () => {
-  if (activeTurn?.heartbeat) {
-    clearInterval(activeTurn.heartbeat);
-  }
-  activeTurn = null;
-};
 var flushMemories = async (reason) => {
   if (!currentSessionId || !await sessionFileExists(currentSessionId)) {
     return;
   }
+  const sessionId = currentSessionId;
   const flushPrompt = `This session is ending (reason: ${reason}). Before context is lost, use mcp__ghostbox__memory_write to save any facts worth remembering: user preferences, important decisions, ongoing work, names and contacts. Skip if nothing notable. Call mcp__ghostbox__memory_show when done to confirm, or just reply done if nothing to save.`;
   const controller = new AbortController;
   const timeout = setTimeout(() => controller.abort(), FLUSH_MEMORY_TIMEOUT_MS);
@@ -928,9 +1424,9 @@ var flushMemories = async (reason) => {
   });
   try {
     await new Promise((resolve, reject) => {
-      const child = nodeSpawn("claude", [
+      const child = nodeSpawn2("claude", [
         "--resume",
-        currentSessionId,
+        sessionId,
         "-p",
         flushPrompt,
         "--model",
@@ -1000,152 +1496,18 @@ var flushMemories = async (reason) => {
     }
   }
 };
-var spawnClaudeMessage = async (res, messages) => {
-  const { args, snapshotPrompt, snapshotPersisted } = await buildClaudeArgs(messages);
-  const child = nodeSpawn("claude", args, {
-    cwd: "/vault",
-    env: {
-      ...process.env,
-      CLAUDE_CONFIG_DIR
-    },
-    stdio: ["pipe", "pipe", "pipe"]
-  });
-  const state = createStreamState();
-  const stdoutDecoder = new StringDecoder("utf8");
-  const turn = {
-    child,
-    heartbeat: startHeartbeat(res),
-    buffer: "",
-    finished: false,
-    pendingResultSessionId: null,
-    snapshotPrompt,
-    snapshotPersisted
-  };
-  activeTurn = turn;
-  child.stderr.on("data", (chunk) => {
-    process.stderr.write(chunk);
-  });
-  child.stdout.on("data", (chunk) => {
-    if (activeTurn !== turn) {
-      return;
-    }
-    turn.buffer += stdoutDecoder.write(chunk);
-    const lines = turn.buffer.split(`
-`);
-    turn.buffer = lines.pop() ?? "";
-    for (const rawLine of lines) {
-      const trimmed = rawLine.trim();
-      if (!trimmed) {
-        continue;
-      }
-      try {
-        const parsed = JSON.parse(trimmed);
-        handleClaudeStreamLine(res, parsed, state);
-        if (getEventName(parsed) === "result") {
-          nudges.emit("message-complete", "result").catch((error) => {
-            log("ERROR", "Message-complete nudge failed", {
-              error: error instanceof Error ? error.message : String(error),
-              sessionId: currentSessionId ?? ""
-            });
-          });
-          turn.finished = true;
-          if (!res.writableEnded) {
-            res.end();
-          }
-          try {
-            turn.child.kill("SIGTERM");
-          } catch {}
-        }
-      } catch (error) {
-        log("ERROR", "Failed to parse Claude stream line", {
-          error: error instanceof Error ? error.message : String(error),
-          line: trimmed
-        });
-      }
-    }
-  });
-  child.on("error", (error) => {
-    log("ERROR", "Claude process error", { error: error.message });
-    if (!res.writableEnded) {
-      sendJsonLine(res, {
-        type: "result",
-        text: "Ghost server failed while processing message.",
-        sessionId: currentSessionId ?? ""
-      });
-      res.end();
-    }
-    if (activeTurn === turn) {
-      clearActiveTurn();
-    }
-  });
-  child.on("close", async (code) => {
-    turn.buffer += stdoutDecoder.end();
-    const trailingLine = turn.buffer.trim();
-    if (trailingLine && activeTurn === turn) {
-      try {
-        const parsed = JSON.parse(trailingLine);
-        handleClaudeStreamLine(res, parsed, state);
-      } catch (error) {
-        log("ERROR", "Failed to parse trailing Claude stream line", {
-          error: error instanceof Error ? error.message : String(error),
-          line: trailingLine
-        });
-      }
-    }
-    if (activeTurn === turn) {
-      await persistPendingSessionSnapshot(currentSessionId).catch((error) => {
-        log("ERROR", "Failed to persist final session snapshot", {
-          sessionId: currentSessionId ?? "",
-          error: error instanceof Error ? error.message : String(error)
-        });
-      });
-    }
-    if (turn.heartbeat) {
-      clearInterval(turn.heartbeat);
-    }
-    if (activeTurn === turn && !res.writableEnded) {
-      if ((code ?? 0) !== 0 && !state.receivedResultEvent) {
-        const message = `Claude subprocess exited with code ${code ?? 1}.`;
-        log("ERROR", message, { sessionId: currentSessionId ?? "" });
-        sendJsonLine(res, {
-          type: "result",
-          text: message,
-          sessionId: currentSessionId ?? ""
-        });
-        res.end();
-        clearActiveTurn();
-        return;
-      }
-      if (!state.lastAssistantText && state.assistantFallback) {
-        sendJsonLine(res, { type: "assistant", text: state.assistantFallback });
-      }
-      sendJsonLine(res, {
-        type: "result",
-        text: state.lastAssistantText || state.assistantFallback,
-        sessionId: currentSessionId ?? ""
-      });
-      res.end();
-    }
-    if (activeTurn === turn) {
-      clearActiveTurn();
-    }
-  });
-  for (const message of messages) {
-    child.stdin.write(createUserTurn(message.text, message.images));
-  }
-  child.stdin.end();
-};
 var runCompactCommand = async () => {
   if (!currentSessionId || !await sessionFileExists(currentSessionId)) {
     throw new Error("No active session to compact.");
   }
+  const sessionId = currentSessionId;
   await nudges.emit("pre-compact", "compact");
-  await rebuildSessionSnapshot(currentSessionId);
+  await rebuildSessionSnapshot(sessionId);
   await ensureClaudeSupportFiles();
   return new Promise((resolve, reject) => {
     const args = [
       "--resume",
-      currentSessionId,
+      sessionId,
       "-p",
       "/compact",
       "--output-format",
@@ -1159,7 +1521,7 @@ var runCompactCommand = async () => {
       "--disallowedTools",
       DISALLOWED_NATIVE_TOOLS
     ];
-    const child = nodeSpawn("claude", args, {
+    const child = nodeSpawn2("claude", args, {
       cwd: "/vault",
       env: {
         ...process.env,
@@ -1170,7 +1532,7 @@ var runCompactCommand = async () => {
     let buffer = "";
     let fallback = "";
     let lastText = "";
-    const stdoutDecoder = new StringDecoder("utf8");
+    const stdoutDecoder = new StringDecoder2("utf8");
     child.stderr.on("data", (chunk) => {
       process.stderr.write(chunk);
     });
@@ -1187,9 +1549,9 @@ var runCompactCommand = async () => {
         try {
           const line = JSON.parse(trimmed);
           const eventName = getEventName(line);
-          const sessionId = extractSessionId(line);
-          if (sessionId) {
-            currentSessionId = sessionId;
+          const sessionId2 = extractSessionId(line);
+          if (sessionId2) {
+            currentSessionId = sessionId2;
           }
           if (eventName === "assistant") {
             fallback = extractAssistantFallback(line) || fallback;
@@ -1214,9 +1576,9 @@ var runCompactCommand = async () => {
         try {
           const line = JSON.parse(trailingLine);
           const eventName = getEventName(line);
-          const sessionId = extractSessionId(line);
-          if (sessionId) {
-            currentSessionId = sessionId;
+          const sessionId2 = extractSessionId(line);
+          if (sessionId2) {
+            currentSessionId = sessionId2;
           }
           if (eventName === "assistant") {
             fallback = extractAssistantFallback(line) || fallback;
@@ -1284,7 +1646,7 @@ var handleSlashCommand = async (res, prompt) => {
     await nudges.emit("pre-new-session", "slash-command");
     await clearSessionSnapshot(currentSessionId);
     currentSessionId = null;
-    queue.messages = [];
+    supervisor.clearQueue();
     latestStats = null;
     sendAssistantResult(res, "New session started.", "");
     return true;
@@ -1301,12 +1663,118 @@ var handleSlashCommand = async (res, prompt) => {
   sendAssistantResult(res, `Unknown command: /${slash.command}`, currentSessionId ?? "");
   return true;
 };
+var parseTimeoutMs = (name, fallback) => {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    return fallback;
+  }
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+var createEventSink = () => new EventSink({
+  hostBase: GHOSTBOX_HOST_BASE,
+  ghostName: GHOSTBOX_GHOST_NAME,
+  authToken: configuredApiKeys[0] ?? null,
+  getSessionId: () => currentSessionId ?? "",
+  log
+});
+var publishTurnCompletion = (event) => {
+  fetch(`${GHOSTBOX_HOST_BASE}/internal/realtime-publish`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...configuredApiKeys[0] ? { Authorization: `Bearer ${configuredApiKeys[0]}` } : {}
+    },
+    body: JSON.stringify({
+      ghostName: GHOSTBOX_GHOST_NAME,
+      event: {
+        type: "ghost.turn-complete",
+        turnId: event.turnId,
+        sessionId: event.sessionId,
+        agentName: event.agentName,
+        originator: event.originator,
+        durationMs: event.durationMs,
+        outcome: event.outcome,
+        lastStdoutAt: event.lastStdoutAt,
+        bytesStreamed: event.bytesStreamed,
+        queueDepthAtStart: event.queueDepthAtStart
+      }
+    })
+  }).catch((error) => {
+    log("ERROR", "Failed to publish turn completion event", {
+      turn_id: event.turnId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+};
 var currentSessionId = null;
 var currentModel = getInitialModel();
-var activeTurn = null;
-var sessionOpLock = false;
-var queue = { messages: [] };
 var latestStats = null;
+var supervisor = new TurnSupervisor({
+  agentName: GHOSTBOX_GHOST_NAME,
+  makeEventSink: createEventSink,
+  createUserTurn,
+  getSessionId: () => currentSessionId ?? "",
+  publishCompletion: publishTurnCompletion,
+  log,
+  runTurn: async (item, sink, context) => {
+    let snapshotPrompt = "";
+    let snapshotPersisted = false;
+    const persistPendingSnapshot = (sessionId) => {
+      if (snapshotPersisted) {
+        return;
+      }
+      persistSessionSnapshot(sessionId, snapshotPrompt).then(() => {
+        snapshotPersisted = true;
+      }, (error) => {
+        log("ERROR", "Failed to persist session snapshot", {
+          sessionId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
+    };
+    const result = await runClaudeTurn([item.userTurn], sink, {
+      turnId: context.turnId,
+      idleTimeoutMs: parseTimeoutMs("GHOSTBOX_TURN_IDLE_TIMEOUT_MS", 8 * 60 * 1000),
+      wallTimeoutMs: parseTimeoutMs("GHOSTBOX_TURN_WALL_TIMEOUT_MS", 25 * 60 * 1000),
+      buildClaudeArgs: async (messages) => {
+        const spawnConfig = await buildClaudeArgs(messages);
+        snapshotPrompt = spawnConfig.snapshotPrompt;
+        snapshotPersisted = spawnConfig.snapshotPersisted;
+        return spawnConfig;
+      },
+      createUserTurn,
+      createStreamState,
+      handleClaudeStreamLine: (lineSink, line, state) => {
+        handleClaudeStreamLine(lineSink, line, state, persistPendingSnapshot);
+      },
+      getEventName,
+      getResultText: (state) => state.lastAssistantText || state.assistantFallback,
+      getSessionId: () => currentSessionId ?? "",
+      abortSignal: context.abortSignal,
+      onChild: context.setChild,
+      onChildClosed: context.clearChild,
+      onResult: () => {
+        nudges.emit("message-complete", "result").catch((error) => {
+          log("ERROR", "Message-complete nudge failed", {
+            error: error instanceof Error ? error.message : String(error),
+            sessionId: currentSessionId ?? ""
+          });
+        });
+      },
+      log
+    });
+    if (!snapshotPersisted && currentSessionId) {
+      await persistSessionSnapshot(currentSessionId, snapshotPrompt).catch((error) => {
+        log("ERROR", "Failed to persist final session snapshot", {
+          sessionId: currentSessionId ?? "",
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
+    }
+    return result;
+  }
+});
 nudges.register("pre-compact", async (_event, reason) => {
   await flushMemories(reason);
 });
@@ -1358,45 +1826,27 @@ var handleMessage = async (req, res) => {
   if (await handleSlashCommand(res, prompt)) {
     return;
   }
-  if (sessionOpLock) {
-    sendJsonError(res, 409, "Turn in progress, try again.");
+  const originator = body.originator === "schedule" ? "schedule" : "user";
+  const result = await supervisor.enqueue({
+    userTurn,
+    deliverTo: new HttpStreamSink(res),
+    originator
+  });
+  if (result.status === "queued") {
+    sendJson(res, 202, {
+      type: "queued",
+      queueJobId: result.queueJobId,
+      position: result.position,
+      sessionId: currentSessionId ?? ""
+    });
     return;
   }
-  if (activeTurn) {
-    if (activeTurn.finished) {
-      log("ERROR", "Force-clearing stale activeTurn (finished but child stuck)", {
-        sessionId: currentSessionId ?? "",
-        childPid: activeTurn.child.pid ?? 0
-      });
-      try {
-        activeTurn.child.kill("SIGKILL");
-      } catch {}
-      clearActiveTurn();
-    } else {
-      log("INFO", "Message queued while turn in progress", {
-        sessionId: currentSessionId ?? "",
-        queueLength: queue.messages.length + 1,
-        childPid: activeTurn.child.pid ?? 0
-      });
-      queue.messages.push(userTurn);
-      startNdjsonResponse(res);
-      sendJsonLine(res, {
-        type: "result",
-        text: "Queued for next turn.",
-        sessionId: currentSessionId ?? ""
-      });
-      res.end();
-      return;
-    }
-  }
-  const queuedMessages = [...queue.messages];
-  queue.messages = [];
-  sessionOpLock = true;
-  try {
-    startNdjsonResponse(res);
-    await spawnClaudeMessage(res, [...queuedMessages, userTurn]);
-  } finally {
-    sessionOpLock = false;
+  if (result.status === "rejected") {
+    sendJson(res, 409, {
+      type: "rejected",
+      reason: result.reason,
+      sessionId: currentSessionId ?? ""
+    });
   }
 };
 var handleSteer = async (req, res) => {
@@ -1414,30 +1864,17 @@ var handleSteer = async (req, res) => {
     sendJsonError(res, 400, imageParse.error);
     return;
   }
-  if (!activeTurn) {
-    sendJsonError(res, 400, "no active turn to steer");
-    return;
+  try {
+    sendJson(res, 200, await supervisor.steer({ text: prompt, images: imageParse.images }));
+  } catch (error) {
+    sendJsonError(res, 400, error instanceof Error ? error.message : "no active turn to steer");
   }
-  activeTurn.child.stdin.write(createUserTurn(prompt, imageParse.images));
-  sendJson(res, 200, { status: "queued", pendingCount: queue.messages.length });
 };
 var handleQueue = (res) => {
-  const response = {
-    steering: [],
-    followUp: queue.messages.map((message) => message.text),
-    pendingCount: queue.messages.length
-  };
-  sendJson(res, 200, response);
+  sendJson(res, 200, supervisor.queueSnapshot());
 };
 var handleClearQueue = (res) => {
-  const response = {
-    cleared: {
-      steering: [],
-      followUp: queue.messages.map((message) => message.text)
-    }
-  };
-  queue.messages = [];
-  sendJson(res, 200, response);
+  sendJson(res, 200, supervisor.clearQueue());
 };
 var handleTimeline = async (req, res) => {
   const timelineRequest = parseTimelineRequest(req);
@@ -1463,7 +1900,7 @@ var handleStats = async (res) => {
   });
 };
 var handleCompact = async (res) => {
-  if (activeTurn) {
+  if (supervisor.currentTurn() || supervisor.queueSnapshot().pendingCount > 0) {
     sendJsonError(res, 409, "Active turn in progress.");
     return;
   }
@@ -1473,15 +1910,14 @@ var handleCompact = async (res) => {
 var handleNew = async (res) => {
   await nudges.emit("pre-new-session", "api");
   await clearSessionSnapshot(currentSessionId);
+  await supervisor.abort();
+  supervisor.clearQueue();
   currentSessionId = null;
-  queue.messages = [];
   latestStats = null;
   sendJson(res, 200, { status: "new_session", sessionId: "" });
 };
 var handleAbort = (res) => {
-  if (activeTurn) {
-    activeTurn.child.kill("SIGTERM");
-  }
+  supervisor.abort();
   sendJson(res, 200, { status: "aborted" });
 };
 var handleTaskKill = (res) => {
@@ -1539,24 +1975,19 @@ var handleRenameSession = async (req, res) => {
     sendJsonError(res, 404, `Session "${sessionId}" not found`);
     return;
   }
-  if (activeTurn || sessionOpLock) {
+  if (supervisor.currentTurn()) {
     sendJsonError(res, 409, "Turn in progress, try again.");
     return;
   }
-  sessionOpLock = true;
-  try {
-    const sessionNames = await readSessionNames();
-    if (Object.entries(sessionNames).some(([existingId, existingName]) => existingId !== sessionId && existingName === name)) {
-      sendJsonError(res, 409, "A session with that name already exists.");
-      return;
-    }
-    await writeSessionNames({
-      ...sessionNames,
-      [sessionId]: name
-    });
-  } finally {
-    sessionOpLock = false;
+  const sessionNames = await readSessionNames();
+  if (Object.entries(sessionNames).some(([existingId, existingName]) => existingId !== sessionId && existingName === name)) {
+    sendJsonError(res, 409, "A session with that name already exists.");
+    return;
   }
+  await writeSessionNames({
+    ...sessionNames,
+    [sessionId]: name
+  });
   sendJson(res, 200, { status: "renamed", sessionId, name });
 };
 var handleDeleteSession = async (req, res) => {
